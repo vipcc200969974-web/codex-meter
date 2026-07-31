@@ -1034,7 +1034,7 @@ struct CodexSessionQuotaProvider {
             }
         }
 
-        return bestRateLimitRecord(from: records)
+        return Self.bestRateLimitRecord(from: records, now: Date())
     }
 
     private func recentJSONLFiles(under root: URL) -> [SessionFile] {
@@ -1064,29 +1064,17 @@ struct CodexSessionQuotaProvider {
             return []
         }
 
+        let now = Date()
         var records: [RateLimitRecord] = []
         for line in text.split(separator: "\n").reversed() {
             guard line.contains("\"rate_limits\"") else { continue }
-            guard let data = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = object["payload"] as? [String: Any],
-                  let rateLimits = payload["rate_limits"] as? [String: Any],
-                  Self.isAggregateCodexLimit(rateLimits),
-                  let primary = parseWindow(rateLimits["primary"]),
-                  let secondary = parseWindow(rateLimits["secondary"]),
-                  primary.windowMinutes == 300,
-                  secondary.windowMinutes == 10_080 else {
-                continue
-            }
+            guard let record = Self.parseRecord(
+                line: String(line),
+                fileModifiedAt: fileModifiedAt,
+                now: now
+            ) else { continue }
 
-            records.append(
-                RateLimitRecord(
-                    timestamp: parseDate(object["timestamp"] as? String),
-                    fileModifiedAt: fileModifiedAt,
-                    primary: primary,
-                    secondary: secondary
-                )
-            )
+            records.append(record)
             if records.count >= 40 {
                 break
             }
@@ -1095,15 +1083,85 @@ struct CodexSessionQuotaProvider {
         return records
     }
 
-    private func bestRateLimitRecord(from records: [RateLimitRecord]) -> RateLimitRecord? {
-        let now = Date().timeIntervalSince1970
-        let currentWindowRecords = records.filter { record in
-            record.primary.resetsAt > now && record.secondary.resetsAt > now
+    static func parseRecord(
+        line: String,
+        fileModifiedAt: Date,
+        now: Date
+    ) -> RateLimitRecord? {
+        guard let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = object["payload"] as? [String: Any],
+              let rateLimits = payload["rate_limits"] as? [String: Any],
+              isAggregateCodexLimit(rateLimits) else {
+            return nil
         }
 
-        return currentWindowRecords.max { lhs, rhs in
-            lhs.sortDate < rhs.sortDate
+        let windows = [
+            parseWindow(rateLimits["primary"]),
+            parseWindow(rateLimits["secondary"])
+        ].compactMap { $0 }
+        let windowSet = RateLimitWindowSet(windows: windows, now: now)
+        guard !windowSet.isEmpty else { return nil }
+
+        return RateLimitRecord(
+            timestamp: parseDate(object["timestamp"] as? String),
+            fileModifiedAt: fileModifiedAt,
+            windowSet: windowSet
+        )
+    }
+
+    static func bestRateLimitRecord(
+        from records: [RateLimitRecord],
+        now: Date
+    ) -> RateLimitRecord? {
+        let active = records.compactMap { record -> RateLimitRecord? in
+            let windows = [record.windowSet.fiveHour, record.windowSet.weekly].compactMap { $0 }
+            let windowSet = RateLimitWindowSet(windows: windows, now: now)
+            guard !windowSet.isEmpty else { return nil }
+            return RateLimitRecord(
+                timestamp: record.timestamp,
+                fileModifiedAt: record.fileModifiedAt,
+                windowSet: windowSet
+            )
         }
+        guard !active.isEmpty else { return nil }
+
+        let weeklyCandidates = active.compactMap { record in
+            record.windowSet.weekly.map { (record: record, window: $0) }
+        }
+        let latestWeekly = weeklyCandidates.max {
+            $0.record.sortDate < $1.record.sortDate
+        }
+
+        let fiveHourCandidates = active.compactMap { record in
+            record.windowSet.fiveHour.map { (record: record, window: $0) }
+        }
+        let latestFiveHour = fiveHourCandidates.max {
+            $0.record.sortDate < $1.record.sortDate
+        }
+        let bestFiveHour = latestFiveHour.flatMap { latest in
+            fiveHourCandidates
+                .filter { $0.window.resetsAt == latest.window.resetsAt }
+                .max { lhs, rhs in
+                    if lhs.window.usedPercent == rhs.window.usedPercent {
+                        return lhs.record.sortDate < rhs.record.sortDate
+                    }
+                    return lhs.window.usedPercent < rhs.window.usedPercent
+                }
+        }
+
+        let selected = [bestFiveHour, latestWeekly].compactMap { $0 }
+        let windowSet = RateLimitWindowSet(windows: selected.map(\.window), now: now)
+        guard !windowSet.isEmpty,
+              let newest = selected.max(by: { $0.record.sortDate < $1.record.sortDate }) else {
+            return nil
+        }
+
+        return RateLimitRecord(
+            timestamp: newest.record.timestamp,
+            fileModifiedAt: newest.record.fileModifiedAt,
+            windowSet: windowSet
+        )
     }
 
     private func readTailText(from url: URL, maxBytes: UInt64 = 4 * 1024 * 1024) -> String? {
@@ -1125,7 +1183,7 @@ struct CodexSessionQuotaProvider {
         return String(decoding: data, as: UTF8.self)
     }
 
-    private func parseWindow(_ value: Any?) -> RateLimitWindow? {
+    private static func parseWindow(_ value: Any?) -> RateLimitWindow? {
         guard let dictionary = value as? [String: Any],
               let usedPercent = Self.double(dictionary["used_percent"]),
               let resetsAt = Self.double(dictionary["resets_at"]) else {
@@ -1138,7 +1196,7 @@ struct CodexSessionQuotaProvider {
         )
     }
 
-    private func parseDate(_ value: String?) -> Date? {
+    private static func parseDate(_ value: String?) -> Date? {
         guard let value else { return nil }
         let fractionalFormatter = ISO8601DateFormatter()
         fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1191,11 +1249,37 @@ private struct SessionFile {
     let modifiedAt: Date
 }
 
-private struct RateLimitRecord {
+struct RateLimitRecord {
     let timestamp: Date?
     let fileModifiedAt: Date
-    let primary: RateLimitWindow
-    let secondary: RateLimitWindow
+    let windowSet: RateLimitWindowSet
+
+    init(timestamp: Date?, fileModifiedAt: Date, windowSet: RateLimitWindowSet) {
+        self.timestamp = timestamp
+        self.fileModifiedAt = fileModifiedAt
+        self.windowSet = windowSet
+    }
+
+    init(
+        timestamp: Date?,
+        fileModifiedAt: Date,
+        primary: RateLimitWindow,
+        secondary: RateLimitWindow
+    ) {
+        self.init(
+            timestamp: timestamp,
+            fileModifiedAt: fileModifiedAt,
+            windowSet: RateLimitWindowSet(windows: [primary, secondary], now: Date())
+        )
+    }
+
+    var primary: RateLimitWindow {
+        windowSet.fiveHour ?? windowSet.weekly!
+    }
+
+    var secondary: RateLimitWindow {
+        windowSet.weekly ?? windowSet.fiveHour!
+    }
 
     var sortDate: Date {
         timestamp ?? fileModifiedAt
