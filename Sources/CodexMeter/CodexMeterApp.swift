@@ -883,6 +883,15 @@ struct CompositeQuotaProvider: QuotaProvider {
 }
 
 struct CodexLogQuotaProvider {
+    private let databaseURL: URL
+
+    init(
+        databaseURL: URL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/logs_2.sqlite")
+    ) {
+        self.databaseURL = databaseURL
+    }
+
     func currentSnapshot() -> QuotaSnapshot? {
         guard let record = newestHeaderRateLimitRecord() else {
             return nil
@@ -892,8 +901,6 @@ struct CodexLogQuotaProvider {
     }
 
     private func newestHeaderRateLimitRecord() -> RateLimitRecord? {
-        let databaseURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/logs_2.sqlite")
         guard FileManager.default.fileExists(atPath: databaseURL.path) else {
             return nil
         }
@@ -970,12 +977,9 @@ struct CodexLogQuotaProvider {
             return nil
         }
 
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            return nil
-        }
-
         let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
         return try? JSONDecoder().decode([SQLiteLogRow].self, from: data)
     }
 
