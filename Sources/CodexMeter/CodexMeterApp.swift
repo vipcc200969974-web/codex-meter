@@ -1202,10 +1202,52 @@ private struct RateLimitRecord {
     }
 }
 
-private struct RateLimitWindow {
+enum QuotaWindowKind: Int, Sendable {
+    case fiveHour = 300
+    case weekly = 10_080
+
+    var displayLabel: String {
+        switch self {
+        case .fiveHour:
+            return "5 小时剩余"
+        case .weekly:
+            return "7 天剩余"
+        }
+    }
+
+    var spokenName: String {
+        switch self {
+        case .fiveHour:
+            return "五小时额度"
+        case .weekly:
+            return "七天额度"
+        }
+    }
+}
+
+struct RateLimitWindow: Sendable {
     let usedPercent: Double
     let resetsAt: Double
     let windowMinutes: Int?
+
+    var kind: QuotaWindowKind? {
+        windowMinutes.flatMap { QuotaWindowKind(rawValue: $0) }
+    }
+}
+
+struct RateLimitWindowSet: Sendable {
+    let fiveHour: RateLimitWindow?
+    let weekly: RateLimitWindow?
+
+    init(windows: [RateLimitWindow], now: Date) {
+        let active = windows.filter { $0.resetsAt > now.timeIntervalSince1970 }
+        fiveHour = active.last { $0.kind == .fiveHour }
+        weekly = active.last { $0.kind == .weekly }
+    }
+
+    var isEmpty: Bool {
+        fiveHour == nil && weekly == nil
+    }
 }
 
 struct QuotaSnapshot {
