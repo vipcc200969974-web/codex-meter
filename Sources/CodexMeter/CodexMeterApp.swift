@@ -898,53 +898,68 @@ struct CodexLogQuotaProvider {
         }
 
         let query = """
-        select ts || char(9) || feedback_log_body from logs
-        where feedback_log_body like '%x-codex-primary-used-percent%'
+        select ts, feedback_log_body from logs
+        where target = 'codex_http_client::client'
+          and feedback_log_body like '%x-codex-primary-used-percent%'
         order by ts desc, ts_nanos desc, id desc
-        limit 1;
+        limit 40;
         """
-        guard let output = runSQLite(databasePath: databaseURL.path, query: query) else {
+        guard let rows = runSQLiteRows(databasePath: databaseURL.path, query: query) else {
             return nil
         }
 
-        let parts = output.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              let timestamp = TimeInterval(parts[0]),
-              let primaryUsed = Self.headerDouble("x-codex-primary-used-percent", in: String(parts[1])),
-              let weeklyUsed = Self.headerDouble("x-codex-secondary-used-percent", in: String(parts[1])),
-              let primaryResetAt = Self.headerDouble("x-codex-primary-reset-at", in: String(parts[1])),
-              let weeklyResetAt = Self.headerDouble("x-codex-secondary-reset-at", in: String(parts[1])),
-              let primaryWindowMinutes = Self.headerInt("x-codex-primary-window-minutes", in: String(parts[1])),
-              let weeklyWindowMinutes = Self.headerInt("x-codex-secondary-window-minutes", in: String(parts[1])) else {
-            return nil
+        let now = Date()
+        for row in rows {
+            if let record = Self.parseHeaderRecord(
+                timestamp: row.ts,
+                text: row.feedbackLogBody,
+                now: now
+            ) {
+                return record
+            }
         }
+        return nil
+    }
 
-        let now = Date().timeIntervalSince1970
-        guard primaryResetAt > now, weeklyResetAt > now else {
-            return nil
-        }
+    static func parseHeaderRecord(
+        timestamp: TimeInterval,
+        text: String,
+        now: Date
+    ) -> RateLimitRecord? {
+        let windows = [
+            headerWindow(prefix: "primary", in: text),
+            headerWindow(prefix: "secondary", in: text)
+        ].compactMap { $0 }
+        let windowSet = RateLimitWindowSet(windows: windows, now: now)
+        guard !windowSet.isEmpty else { return nil }
 
+        let date = Date(timeIntervalSince1970: timestamp)
         return RateLimitRecord(
-            timestamp: Date(timeIntervalSince1970: timestamp),
-            fileModifiedAt: Date(timeIntervalSince1970: timestamp),
-            primary: RateLimitWindow(
-                usedPercent: primaryUsed,
-                resetsAt: primaryResetAt,
-                windowMinutes: primaryWindowMinutes
-            ),
-            secondary: RateLimitWindow(
-                usedPercent: weeklyUsed,
-                resetsAt: weeklyResetAt,
-                windowMinutes: weeklyWindowMinutes
-            )
+            timestamp: date,
+            fileModifiedAt: date,
+            windowSet: windowSet
         )
     }
 
-    private func runSQLite(databasePath: String, query: String) -> String? {
+    private static func headerWindow(prefix: String, in text: String) -> RateLimitWindow? {
+        guard let usedPercent = headerDouble("x-codex-\(prefix)-used-percent", in: text),
+              let resetsAt = headerDouble("x-codex-\(prefix)-reset-at", in: text),
+              let windowMinutes = headerInt("x-codex-\(prefix)-window-minutes", in: text) else {
+            return nil
+        }
+
+        return RateLimitWindow(
+            usedPercent: usedPercent,
+            resetsAt: resetsAt,
+            windowMinutes: windowMinutes
+        )
+    }
+
+    private func runSQLiteRows(databasePath: String, query: String) -> [SQLiteLogRow]? {
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        process.arguments = ["-readonly", databasePath, query]
+        process.arguments = ["-readonly", "-json", databasePath, query]
         process.standardOutput = output
         process.standardError = Pipe()
 
@@ -960,8 +975,7 @@ struct CodexLogQuotaProvider {
         }
 
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return try? JSONDecoder().decode([SQLiteLogRow].self, from: data)
     }
 
     private static func headerDouble(_ name: String, in text: String) -> Double? {
@@ -988,6 +1002,16 @@ struct CodexLogQuotaProvider {
 
     private static func percent(_ value: Double) -> Int {
         Int(value.rounded())
+    }
+
+    private struct SQLiteLogRow: Decodable {
+        let ts: Double
+        let feedbackLogBody: String
+
+        private enum CodingKeys: String, CodingKey {
+            case ts
+            case feedbackLogBody = "feedback_log_body"
+        }
     }
 }
 
