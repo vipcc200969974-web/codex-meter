@@ -109,7 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem(with snapshot: QuotaSnapshot) {
         let title = snapshot.isUnavailable ? "未同步" : "\(snapshot.percentText) | \(snapshot.shortResetText)"
-        let tooltip = snapshot.isUnavailable ? "正在等待 Codex 会话额度数据" : "5h 额度剩余 \(snapshot.remainingPercent)% ，距离额度恢复 \(snapshot.resetText)"
+        let tooltip = snapshot.isUnavailable
+            ? "正在等待 Codex 会话额度数据"
+            : "\(snapshot.mainQuotaSpokenName)剩余 \(snapshot.remainingPercent)% ，距离额度恢复 \(snapshot.resetText)"
         statusView?.update(
             title: title,
             color: snapshot.tagTextColor,
@@ -282,7 +284,7 @@ struct StatusPanelView: View {
                     Text(store.snapshot.percentText)
                         .font(.system(size: 44, weight: .bold, design: .rounded))
                         .monospacedDigit()
-                    Text("5 小时剩余")
+                    Text(store.snapshot.mainQuotaLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
@@ -301,14 +303,16 @@ struct StatusPanelView: View {
 
             QuotaProgressBar(percent: store.snapshot.displayRemainingPercent, tint: store.snapshot.tint)
 
-            Divider()
-                .padding(.vertical, 1)
+            if store.snapshot.showsWeeklySecondary {
+                Divider()
+                    .padding(.vertical, 1)
 
-            SecondaryQuotaRow(
-                title: "周额度",
-                percentText: store.snapshot.weeklyPercentText,
-                trailing: store.snapshot.weeklyResetDateText
-            )
+                SecondaryQuotaRow(
+                    title: "周额度",
+                    percentText: store.snapshot.weeklyPercentText,
+                    trailing: store.snapshot.weeklyResetDateText
+                )
+            }
         }
         .padding(14)
         .notificationInsetSurface(cornerRadius: 12)
@@ -814,7 +818,7 @@ final class QuotaStore: ObservableObject {
 
     private func speak(_ snapshot: QuotaSnapshot) {
         guard !snapshot.isUnavailable else { return }
-        let text = "Codex 五小时额度剩余 \(snapshot.remainingPercent)%，距离额度恢复 \(snapshot.resetText)。"
+        let text = "Codex \(snapshot.mainQuotaSpokenName)剩余 \(snapshot.remainingPercent)%，距离额度恢复 \(snapshot.resetText)。"
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
         utterance.rate = 0.48
@@ -827,9 +831,17 @@ final class QuotaStore: ObservableObject {
         let remaining = snapshot.remainingPercent
 
         if remaining <= 10 {
-            notifyOnce(level: 10, title: "Codex 额度接近耗尽", body: "当前 5h 剩余 \(remaining)%，建议放慢高消耗任务。")
+            notifyOnce(
+                level: 10,
+                title: "Codex 额度接近耗尽",
+                body: "当前 \(snapshot.mainQuotaSpokenName)剩余 \(remaining)%，建议放慢高消耗任务。"
+            )
         } else if remaining <= 20 {
-            notifyOnce(level: 20, title: "Codex 额度偏低", body: "当前 5h 剩余 \(remaining)%，距离额度恢复 \(snapshot.resetText)。")
+            notifyOnce(
+                level: 20,
+                title: "Codex 额度偏低",
+                body: "当前 \(snapshot.mainQuotaSpokenName)剩余 \(remaining)%，距离额度恢复 \(snapshot.resetText)。"
+            )
         }
     }
 
@@ -876,18 +888,7 @@ struct CodexLogQuotaProvider {
             return nil
         }
 
-        let now = Date()
-        let primaryUsed = Self.percent(record.primary.usedPercent)
-        let weeklyUsed = Self.percent(record.secondary.usedPercent)
-        return QuotaSnapshot(
-            remainingPercent: max(0, min(100, 100 - primaryUsed)),
-            weeklyRemainingPercent: max(0, min(100, 100 - weeklyUsed)),
-            resetDate: Date(timeIntervalSince1970: record.primary.resetsAt),
-            weeklyResetDate: Date(timeIntervalSince1970: record.secondary.resetsAt),
-            lastUpdated: now,
-            sourceName: "Codex 日志",
-            isUnavailable: false
-        )
+        return QuotaSnapshot(record: record, sourceName: "Codex 日志", lastUpdated: Date())
     }
 
     private func newestHeaderRateLimitRecord() -> RateLimitRecord? {
@@ -1000,10 +1001,6 @@ struct CodexLogQuotaProvider {
         return String(text[valueStart..<valueEnd])
     }
 
-    private static func percent(_ value: Double) -> Int {
-        Int(value.rounded())
-    }
-
     private struct SQLiteLogRow: Decodable {
         let ts: Double
         let feedbackLogBody: String
@@ -1021,21 +1018,7 @@ struct CodexSessionQuotaProvider {
             return nil
         }
 
-        let now = Date()
-        let primaryUsed = Self.percent(record.primary.usedPercent)
-        let weeklyUsed = Self.percent(record.secondary.usedPercent)
-        let primaryRemaining = max(0, min(100, 100 - primaryUsed))
-        let weeklyRemaining = max(0, min(100, 100 - weeklyUsed))
-
-        return QuotaSnapshot(
-            remainingPercent: primaryRemaining,
-            weeklyRemainingPercent: weeklyRemaining,
-            resetDate: Date(timeIntervalSince1970: record.primary.resetsAt),
-            weeklyResetDate: Date(timeIntervalSince1970: record.secondary.resetsAt),
-            lastUpdated: now,
-            sourceName: "Codex 会话",
-            isUnavailable: false
-        )
+        return QuotaSnapshot(record: record, sourceName: "Codex 会话", lastUpdated: Date())
     }
 
     private func newestRateLimitRecord() -> RateLimitRecord? {
@@ -1233,10 +1216,6 @@ struct CodexSessionQuotaProvider {
         return formatter.date(from: value)
     }
 
-    private static func percent(_ value: Double) -> Int {
-        Int(value.rounded())
-    }
-
     private static func isAggregateCodexLimit(_ rateLimits: [String: Any]) -> Bool {
         (rateLimits["limit_id"] as? String) == "codex"
     }
@@ -1358,25 +1337,92 @@ struct RateLimitWindowSet: Sendable {
     }
 }
 
+struct QuotaWindowSnapshot: Sendable {
+    let kind: QuotaWindowKind
+    let remainingPercent: Int
+    let resetDate: Date
+
+    init(kind: QuotaWindowKind, remainingPercent: Int, resetDate: Date) {
+        self.kind = kind
+        self.remainingPercent = max(0, min(100, remainingPercent))
+        self.resetDate = resetDate
+    }
+
+    init?(window: RateLimitWindow) {
+        guard let kind = window.kind else { return nil }
+        let usedPercent = Int(window.usedPercent.rounded())
+        self.init(
+            kind: kind,
+            remainingPercent: 100 - usedPercent,
+            resetDate: Date(timeIntervalSince1970: window.resetsAt)
+        )
+    }
+}
+
 struct QuotaSnapshot {
-    var remainingPercent: Int
-    var weeklyRemainingPercent: Int
-    var resetDate: Date
-    var weeklyResetDate: Date
-    var lastUpdated: Date
-    var sourceName: String
-    var isUnavailable: Bool
+    let mainWindow: QuotaWindowSnapshot?
+    let weeklyWindow: QuotaWindowSnapshot?
+    let lastUpdated: Date
+    let sourceName: String
+
+    init(record: RateLimitRecord, sourceName: String, lastUpdated: Date) {
+        let fiveHour = record.windowSet.fiveHour.flatMap(QuotaWindowSnapshot.init(window:))
+        let weekly = record.windowSet.weekly.flatMap(QuotaWindowSnapshot.init(window:))
+
+        self.mainWindow = fiveHour ?? weekly
+        self.weeklyWindow = fiveHour == nil ? nil : weekly
+        self.lastUpdated = lastUpdated
+        self.sourceName = sourceName
+    }
+
+    private init(
+        mainWindow: QuotaWindowSnapshot?,
+        weeklyWindow: QuotaWindowSnapshot?,
+        lastUpdated: Date,
+        sourceName: String
+    ) {
+        self.mainWindow = mainWindow
+        self.weeklyWindow = weeklyWindow
+        self.lastUpdated = lastUpdated
+        self.sourceName = sourceName
+    }
+
+    var isUnavailable: Bool {
+        mainWindow == nil
+    }
+
+    var remainingPercent: Int {
+        mainWindow?.remainingPercent ?? 0
+    }
+
+    var weeklyRemainingPercent: Int {
+        weeklyWindow?.remainingPercent ?? 0
+    }
+
+    var mainQuotaLabel: String {
+        mainWindow?.kind.displayLabel ?? "额度未获取"
+    }
+
+    var mainQuotaSpokenName: String {
+        mainWindow?.kind.spokenName ?? "Codex 额度"
+    }
+
+    var showsWeeklySecondary: Bool {
+        mainWindow?.kind == .fiveHour && weeklyWindow != nil
+    }
 
     var percentText: String {
-        isUnavailable ? "—" : "\(remainingPercent)%"
+        guard let mainWindow else { return "—" }
+        return "\(mainWindow.remainingPercent)%"
     }
 
     var weeklyPercentText: String {
-        isUnavailable ? "—" : "\(weeklyRemainingPercent)%"
+        guard let weeklyWindow else { return "—" }
+        return "\(weeklyWindow.remainingPercent)%"
     }
 
     var displayRemainingPercent: Int {
-        isUnavailable ? 0 : remainingPercent
+        mainWindow?.remainingPercent ?? 0
     }
 
     var usedPercent: Int {
@@ -1389,49 +1435,73 @@ struct QuotaSnapshot {
 
     static func cached() -> QuotaSnapshot? {
         let defaults = UserDefaults.standard
-        guard defaults.object(forKey: CacheKey.remainingPercent) != nil else {
+        guard defaults.object(forKey: CacheKey.mainKind) != nil,
+              defaults.object(forKey: CacheKey.mainRemainingPercent) != nil,
+              defaults.object(forKey: CacheKey.mainResetDate) != nil,
+              let mainKind = QuotaWindowKind(rawValue: defaults.integer(forKey: CacheKey.mainKind)) else {
             return nil
         }
 
+        let mainWindow = QuotaWindowSnapshot(
+            kind: mainKind,
+            remainingPercent: defaults.integer(forKey: CacheKey.mainRemainingPercent),
+            resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.mainResetDate))
+        )
+        let weeklyWindow: QuotaWindowSnapshot?
+        if defaults.object(forKey: CacheKey.weeklyRemainingPercent) != nil,
+           defaults.object(forKey: CacheKey.weeklyResetDate) != nil {
+            weeklyWindow = QuotaWindowSnapshot(
+                kind: .weekly,
+                remainingPercent: defaults.integer(forKey: CacheKey.weeklyRemainingPercent),
+                resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.weeklyResetDate))
+            )
+        } else {
+            weeklyWindow = nil
+        }
+
         return QuotaSnapshot(
-            remainingPercent: defaults.integer(forKey: CacheKey.remainingPercent),
-            weeklyRemainingPercent: defaults.integer(forKey: CacheKey.weeklyRemainingPercent),
-            resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.resetDate)),
-            weeklyResetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.weeklyResetDate)),
+            mainWindow: mainWindow,
+            weeklyWindow: mainKind == .fiveHour ? weeklyWindow : nil,
             lastUpdated: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.lastUpdated)),
-            sourceName: "本机缓存",
-            isUnavailable: false
+            sourceName: "本机缓存"
         )
     }
 
     func cache() {
-        guard !isUnavailable else { return }
+        guard let mainWindow else { return }
 
         let defaults = UserDefaults.standard
-        defaults.set(remainingPercent, forKey: CacheKey.remainingPercent)
-        defaults.set(weeklyRemainingPercent, forKey: CacheKey.weeklyRemainingPercent)
-        defaults.set(resetDate.timeIntervalSince1970, forKey: CacheKey.resetDate)
-        defaults.set(weeklyResetDate.timeIntervalSince1970, forKey: CacheKey.weeklyResetDate)
+        defaults.set(mainWindow.kind.rawValue, forKey: CacheKey.mainKind)
+        defaults.set(mainWindow.remainingPercent, forKey: CacheKey.mainRemainingPercent)
+        defaults.set(mainWindow.resetDate.timeIntervalSince1970, forKey: CacheKey.mainResetDate)
         defaults.set(lastUpdated.timeIntervalSince1970, forKey: CacheKey.lastUpdated)
+
+        if let weeklyWindow {
+            defaults.set(weeklyWindow.remainingPercent, forKey: CacheKey.weeklyRemainingPercent)
+            defaults.set(weeklyWindow.resetDate.timeIntervalSince1970, forKey: CacheKey.weeklyResetDate)
+        } else {
+            defaults.removeObject(forKey: CacheKey.weeklyRemainingPercent)
+            defaults.removeObject(forKey: CacheKey.weeklyResetDate)
+        }
     }
 
     var tint: Color {
-        guard !isUnavailable else { return .secondary }
-        return Self.tint(for: remainingPercent)
+        guard let mainWindow else { return .secondary }
+        return Self.tint(for: mainWindow.remainingPercent)
     }
 
     var tagBackgroundColor: NSColor {
-        guard !isUnavailable else { return NSColor(calibratedWhite: 1, alpha: 0.36) }
-        return Self.tagBackgroundColor(for: remainingPercent)
+        guard let mainWindow else { return NSColor(calibratedWhite: 1, alpha: 0.36) }
+        return Self.tagBackgroundColor(for: mainWindow.remainingPercent)
     }
 
     var tagTextColor: NSColor {
-        guard !isUnavailable else { return .labelColor }
-        return Self.tagTextColor(for: remainingPercent)
+        guard let mainWindow else { return .labelColor }
+        return Self.tagTextColor(for: mainWindow.remainingPercent)
     }
 
     var weeklyTint: Color {
-        Self.tint(for: weeklyRemainingPercent)
+        Self.tint(for: weeklyWindow?.remainingPercent ?? 0)
     }
 
     private static func tint(for percent: Int) -> Color {
@@ -1468,17 +1538,17 @@ struct QuotaSnapshot {
     }
 
     var resetText: String {
-        guard !isUnavailable else { return "暂无重置信息" }
+        guard let resetDate = mainWindow?.resetDate else { return "暂无重置信息" }
         return relativeResetText(for: resetDate)
     }
 
     var shortResetText: String {
-        guard !isUnavailable else { return "—" }
+        guard let resetDate = mainWindow?.resetDate else { return "—" }
         return compactResetText(for: resetDate)
     }
 
     var resetClockText: String {
-        guard !isUnavailable else { return "未同步" }
+        guard let resetDate = mainWindow?.resetDate else { return "未同步" }
         return resetDate.formatted(date: .omitted, time: .shortened)
     }
 
@@ -1488,8 +1558,8 @@ struct QuotaSnapshot {
     }
 
     var weeklyResetDateText: String {
-        guard !isUnavailable else { return "—" }
-        let dateText = weeklyResetDate.formatted(
+        guard let weeklyWindow else { return "—" }
+        let dateText = weeklyWindow.resetDate.formatted(
             Date.FormatStyle()
                 .month(.wide)
                 .day(.defaultDigits)
@@ -1527,25 +1597,22 @@ struct QuotaSnapshot {
     }
 
     static func unavailable() -> QuotaSnapshot {
-        let now = Date()
         return QuotaSnapshot(
-            remainingPercent: 0,
-            weeklyRemainingPercent: 0,
-            resetDate: now,
-            weeklyResetDate: now,
-            lastUpdated: now,
-            sourceName: "额度未获取",
-            isUnavailable: true
+            mainWindow: nil,
+            weeklyWindow: nil,
+            lastUpdated: Date(),
+            sourceName: "额度未获取"
         )
     }
 
 }
 
 private enum CacheKey {
-    static let remainingPercent = "quota.remainingPercent"
-    static let weeklyRemainingPercent = "quota.weeklyRemainingPercent"
-    static let resetDate = "quota.resetDate"
-    static let weeklyResetDate = "quota.weeklyResetDate"
+    static let mainKind = "quota.main.kind"
+    static let mainRemainingPercent = "quota.main.remainingPercent"
+    static let mainResetDate = "quota.main.resetDate"
+    static let weeklyRemainingPercent = "quota.weekly.remainingPercent"
+    static let weeklyResetDate = "quota.weekly.resetDate"
     static let lastUpdated = "quota.lastUpdated"
     static let voiceBroadcastIntervalMinutes = "voiceBroadcast.intervalMinutes"
 }
