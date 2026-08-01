@@ -27,7 +27,7 @@ private enum PanelMetrics {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let quotaStore = QuotaStore()
+    private let usageStore = UsageStore()
     private var statusItem: NSStatusItem?
     private var statusView: CompactStatusItemView?
     private var panelWindow: NSPanel?
@@ -39,14 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItem()
         configurePanelWindow()
         configureWakeRefreshObservers()
-        quotaStore.start()
+        usageStore.start()
 
-        snapshotCancellable = quotaStore.$snapshot.sink { [weak self] snapshot in
+        snapshotCancellable = usageStore.$snapshot.sink { [weak self] snapshot in
             self?.updateStatusItem(with: snapshot)
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        usageStore.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopOutsideClickMonitor()
     }
@@ -62,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.view = view
         statusView = view
 
-        updateStatusItem(with: quotaStore.snapshot)
+        updateStatusItem(with: usageStore.snapshot)
     }
 
     private func configurePanelWindow() {
@@ -79,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentViewController = NSHostingController(
-            rootView: StatusPanelView(store: quotaStore)
+            rootView: StatusPanelView(store: usageStore)
                 .frame(width: PanelMetrics.width, height: PanelMetrics.height)
         )
         self.panelWindow = panel
@@ -107,15 +108,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func updateStatusItem(with snapshot: QuotaSnapshot) {
-        let title = snapshot.isUnavailable ? "未同步" : "\(snapshot.percentText) | \(snapshot.shortResetText)"
-        let tooltip = snapshot.isUnavailable
+    private func updateStatusItem(with snapshot: UsageSnapshot) {
+        let quota = snapshot.quota
+        let title = quota.isUnavailable ? "未同步" : "\(quota.percentText) | \(quota.shortResetText)"
+        let tooltip = quota.isUnavailable
             ? "正在等待 Codex 会话额度数据"
-            : "\(snapshot.mainQuotaSpokenName)剩余 \(snapshot.remainingPercent)% ，距离额度恢复 \(snapshot.resetText)"
+            : "\(quota.mainQuotaSpokenName)剩余 \(quota.remainingPercent)% ，距离额度恢复 \(quota.resetText)"
         statusView?.update(
             title: title,
-            color: snapshot.tagTextColor,
-            backgroundColor: snapshot.tagBackgroundColor,
+            color: quota.tagTextColor,
+            backgroundColor: quota.tagBackgroundColor,
             tooltip: tooltip
         )
         statusItem?.length = statusView?.frame.width ?? NSStatusItem.variableLength
@@ -130,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             positionPanel(relativeTo: statusView)
             panelWindow.orderFrontRegardless()
             startOutsideClickMonitor()
-            quotaStore.refresh()
+            usageStore.refresh()
         }
     }
 
@@ -173,7 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshAfterSleepOrUnlock(_ notification: Notification) {
-        quotaStore.refresh()
+        usageStore.refreshAfterWakeOrUnlock()
     }
 }
 
@@ -241,7 +243,7 @@ final class CompactStatusItemView: NSView {
 }
 
 struct StatusPanelView: View {
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
 
     var body: some View {
         ZStack {
@@ -262,9 +264,9 @@ struct StatusPanelView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 8) {
-            Text("\(store.snapshot.sourceName) · \(store.snapshot.lastUpdatedText)")
+            Text("\(store.snapshot.quota.sourceName) · \(store.snapshot.quota.lastUpdatedText)")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(store.snapshot.isUnavailable ? .red : .secondary)
+                .foregroundStyle(store.snapshot.quota.isUnavailable ? .red : .secondary)
                 .lineLimit(1)
 
             Spacer()
@@ -281,10 +283,10 @@ struct StatusPanelView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(store.snapshot.percentText)
+                    Text(store.snapshot.quota.percentText)
                         .font(.system(size: 44, weight: .bold, design: .rounded))
                         .monospacedDigit()
-                    Text(store.snapshot.mainQuotaLabel)
+                    Text(store.snapshot.quota.mainQuotaLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
@@ -292,25 +294,25 @@ struct StatusPanelView: View {
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 3) {
-                    Text(store.snapshot.shortResetText)
+                    Text(store.snapshot.quota.shortResetText)
                         .font(.system(size: 23, weight: .semibold, design: .rounded))
                         .monospacedDigit()
-                    Text(store.snapshot.resetClockText)
+                    Text(store.snapshot.quota.resetClockText)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
             }
 
-            QuotaProgressBar(percent: store.snapshot.displayRemainingPercent, tint: store.snapshot.tint)
+            QuotaProgressBar(percent: store.snapshot.quota.displayRemainingPercent, tint: store.snapshot.quota.tint)
 
-            if store.snapshot.showsWeeklySecondary {
+            if store.snapshot.quota.showsWeeklySecondary {
                 Divider()
                     .padding(.vertical, 1)
 
                 SecondaryQuotaRow(
                     title: "周额度",
-                    percentText: store.snapshot.weeklyPercentText,
-                    trailing: store.snapshot.weeklyResetDateText
+                    percentText: store.snapshot.quota.weeklyPercentText,
+                    trailing: store.snapshot.quota.weeklyResetDateText
                 )
             }
         }
@@ -526,7 +528,7 @@ struct PanelIconFrame: View {
 }
 
 struct MoreActionsMenu: View {
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
     @State private var isShowingActions = false
     @State private var isPressed = false
     @State private var isHovered = false
@@ -567,7 +569,7 @@ struct MoreActionsMenu: View {
 }
 
 struct ActionsPopover: View {
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -613,7 +615,7 @@ struct ActionsPopover: View {
 
 struct BroadcastIntervalButton: View {
     let minutes: Int
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
 
     var body: some View {
         Button {
@@ -711,63 +713,318 @@ struct SecondaryQuotaRow: View {
     }
 }
 
+enum UsageFreshness: Equatable, Sendable {
+    case live
+    case stale
+    case unavailable
+}
+
+struct UsageSnapshot: Sendable {
+    let quota: QuotaSnapshot
+    let dailyTokens: DailyTokenUsage
+    let freshness: UsageFreshness
+
+    static let unavailable = UsageSnapshot(
+        quota: .unavailable(),
+        dailyTokens: .zero,
+        freshness: .unavailable
+    )
+}
+
+struct UsageLoadResult: Sendable {
+    let quota: QuotaSnapshot?
+    let dailyTokens: DailyTokenUsage?
+
+    static let empty = UsageLoadResult(quota: nil, dailyTokens: nil)
+}
+
+protocol UsageLoading: Sendable {
+    func load(now: Date) -> UsageLoadResult
+}
+
+final class LocalUsageLoader: UsageLoading, @unchecked Sendable {
+    private let quotaProvider: CompositeQuotaProvider
+    private let tokenProvider: any DailyTokenUsageProviding
+
+    init(
+        quotaProvider: CompositeQuotaProvider = CompositeQuotaProvider(),
+        tokenProvider: any DailyTokenUsageProviding = DailyTokenUsageProvider()
+    ) {
+        self.quotaProvider = quotaProvider
+        self.tokenProvider = tokenProvider
+    }
+
+    func load(now: Date) -> UsageLoadResult {
+        let quota = quotaProvider.currentObservation(now: now).map(QuotaSnapshot.init(observation:))
+        let tokens = try? tokenProvider.currentUsage(now: now)
+        return UsageLoadResult(quota: quota, dailyTokens: tokens)
+    }
+}
+
+protocol UsageScheduledTask: AnyObject, Sendable {
+    func cancel()
+}
+
 @MainActor
-final class QuotaStore: ObservableObject {
-    @Published var snapshot: QuotaSnapshot
+protocol UsageScheduling: AnyObject {
+    func schedule(
+        after delay: TimeInterval,
+        repeating interval: TimeInterval?,
+        action: @escaping @MainActor () -> Void
+    ) -> any UsageScheduledTask
+}
+
+private final class FoundationUsageScheduledTask: UsageScheduledTask, @unchecked Sendable {
+    private let lock = NSLock()
+    private var timer: Timer?
+
+    init(timer: Timer) {
+        self.timer = timer
+    }
+
+    func cancel() {
+        lock.lock()
+        let timerToInvalidate = timer
+        timer = nil
+        lock.unlock()
+        timerToInvalidate?.invalidate()
+    }
+
+    deinit {
+        cancel()
+    }
+}
+
+@MainActor
+private final class FoundationUsageScheduler: UsageScheduling {
+    func schedule(
+        after delay: TimeInterval,
+        repeating interval: TimeInterval?,
+        action: @escaping @MainActor () -> Void
+    ) -> any UsageScheduledTask {
+        let timer = Timer(
+            fire: Date().addingTimeInterval(delay),
+            interval: interval ?? 0,
+            repeats: interval != nil
+        ) { _ in
+            Task { @MainActor in
+                action()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        return FoundationUsageScheduledTask(timer: timer)
+    }
+}
+
+@MainActor
+final class UsageStore: ObservableObject {
+    @Published var snapshot: UsageSnapshot
     @Published var voiceBroadcastEnabled = false
     @Published var voiceBroadcastIntervalMinutes: Int
 
-    private var timer: Timer?
+    private var fallbackTask: (any UsageScheduledTask)?
+    private var debounceTask: (any UsageScheduledTask)?
+    private var midnightTask: (any UsageScheduledTask)?
     private var voiceTimer: Timer?
     private var isRefreshing = false
+    private var refreshPending = false
+    private var isStarted = false
+    private var lifecycleGeneration: UInt = 0
     private var speakAfterRefresh = false
     private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var notifiedLevels = Set<Int>()
-    private let provider: CompositeQuotaProvider
+    private let loader: any UsageLoading
+    private var watcher: CodexActivityWatching?
+    private let createsWatcher: Bool
+    private let debounceInterval: TimeInterval
+    private let fallbackInterval: TimeInterval
+    private let scheduler: any UsageScheduling
+    private let calendar: Calendar
+    private let now: @Sendable () -> Date
 
-    init(provider: CompositeQuotaProvider = CompositeQuotaProvider()) {
-        self.provider = provider
-        self.snapshot = QuotaSnapshot.unavailable()
+    init(
+        loader: any UsageLoading = LocalUsageLoader(),
+        watcher: CodexActivityWatching? = nil,
+        debounceInterval: TimeInterval = 0.8,
+        fallbackInterval: TimeInterval = 60,
+        scheduler: any UsageScheduling = FoundationUsageScheduler(),
+        calendar: Calendar = .autoupdatingCurrent,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
+        self.loader = loader
+        self.watcher = watcher
+        self.createsWatcher = watcher == nil
+        self.debounceInterval = debounceInterval
+        self.fallbackInterval = fallbackInterval
+        self.scheduler = scheduler
+        self.calendar = calendar
+        self.now = now
+        let cachedQuota = QuotaSnapshot.cached() ?? .unavailable()
+        self.snapshot = UsageSnapshot(
+            quota: cachedQuota,
+            dailyTokens: .zero,
+            freshness: cachedQuota.isUnavailable ? .unavailable : .stale
+        )
         let savedInterval = UserDefaults.standard.integer(forKey: CacheKey.voiceBroadcastIntervalMinutes)
         self.voiceBroadcastIntervalMinutes = Self.allowedVoiceBroadcastIntervals.contains(savedInterval) ? savedInterval : 1
     }
 
     func start() {
+        guard !isStarted else { return }
+        isStarted = true
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+
+        if watcher == nil {
+            watcher = CodexActivityWatcher { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.isStarted,
+                          self.lifecycleGeneration == generation else {
+                        return
+                    }
+                    self.scheduleRefresh()
+                }
+            }
+        }
+        watcher?.start()
         refresh()
         requestNotificationPermission()
-        guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
+        fallbackTask = scheduler.schedule(
+            after: fallbackInterval,
+            repeating: fallbackInterval
+        ) { [weak self] in
+            guard let self,
+                  self.isStarted,
+                  self.lifecycleGeneration == generation else {
+                return
             }
+            self.refreshAfterWakeOrUnlock()
+        }
+        scheduleNextLocalMidnight(generation: generation)
+    }
+
+    func stop() {
+        let wasStarted = isStarted
+        lifecycleGeneration &+= 1
+        isStarted = false
+        isRefreshing = false
+        refreshPending = false
+        debounceTask?.cancel()
+        debounceTask = nil
+        fallbackTask?.cancel()
+        fallbackTask = nil
+        midnightTask?.cancel()
+        midnightTask = nil
+        voiceTimer?.invalidate()
+        voiceTimer = nil
+        speakAfterRefresh = false
+        voiceBroadcastEnabled = false
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        if wasStarted {
+            watcher?.stop()
+        }
+        if createsWatcher {
+            watcher = nil
+        }
+    }
+
+    func scheduleRefresh() {
+        debounceTask?.cancel()
+        let generation = lifecycleGeneration
+        debounceTask = scheduler.schedule(after: debounceInterval, repeating: nil) { [weak self] in
+            guard let self, self.lifecycleGeneration == generation else {
+                return
+            }
+            self.debounceTask = nil
+            self.refresh()
+        }
+    }
+
+    func refreshAfterWakeOrUnlock() {
+        watcher?.rebind()
+        refresh()
+        if isStarted {
+            scheduleNextLocalMidnight(generation: lifecycleGeneration)
         }
     }
 
     func refresh() {
-        guard isRefreshing == false else { return }
+        guard !isRefreshing else {
+            refreshPending = true
+            return
+        }
         isRefreshing = true
-        let provider = provider
+        let loader = loader
+        let loadDate = now()
+        let generation = lifecycleGeneration
 
         refreshQueue.async { [weak self] in
-            let liveSnapshot = provider.currentObservation().map(QuotaSnapshot.init(observation:))
+            let result = loader.load(now: loadDate)
 
             DispatchQueue.main.async {
-                guard let self else { return }
-                let shouldSpeak = self.speakAfterRefresh
-                self.speakAfterRefresh = false
-                if let liveSnapshot {
-                    self.snapshot = liveSnapshot
-                    liveSnapshot.cache()
-                } else {
-                    self.snapshot = .unavailable()
+                guard let self, self.lifecycleGeneration == generation else { return }
+                let old = self.snapshot
+                let quota = result.quota ?? old.quota
+                let tokens = result.dailyTokens ?? old.dailyTokens
+                let hasFreshQuota = result.quota != nil
+                let hasFreshTokens = result.dailyTokens != nil
+                self.snapshot = UsageSnapshot(
+                    quota: quota,
+                    dailyTokens: tokens,
+                    freshness: hasFreshQuota && hasFreshTokens ? .live : (quota.isUnavailable ? .unavailable : .stale)
+                )
+                if let freshQuota = result.quota {
+                    freshQuota.cache()
                 }
                 self.isRefreshing = false
-                self.evaluateNotifications()
-                if shouldSpeak, self.voiceBroadcastEnabled {
-                    self.speak(self.snapshot)
+                self.finishRefreshSideEffects()
+                if self.refreshPending {
+                    self.refreshPending = false
+                    self.refresh()
                 }
             }
+        }
+    }
+
+    private func scheduleNextLocalMidnight(generation: UInt) {
+        midnightTask?.cancel()
+        let current = now()
+        let startOfToday = calendar.startOfDay(for: current)
+        guard let nextMidnight = calendar.date(byAdding: .day, value: 1, to: startOfToday) else {
+            midnightTask = nil
+            return
+        }
+        let delay = max(nextMidnight.timeIntervalSince(current), 0)
+        midnightTask = scheduler.schedule(after: delay, repeating: nil) { [weak self] in
+            guard let self,
+                  self.isStarted,
+                  self.lifecycleGeneration == generation else {
+                return
+            }
+            self.midnightTask = nil
+            self.refresh()
+            self.scheduleNextLocalMidnight(generation: generation)
+        }
+    }
+
+    isolated deinit {
+        debounceTask?.cancel()
+        fallbackTask?.cancel()
+        midnightTask?.cancel()
+        voiceTimer?.invalidate()
+        if isStarted {
+            watcher?.stop()
+        }
+    }
+
+    private func finishRefreshSideEffects() {
+        let shouldSpeak = speakAfterRefresh
+        speakAfterRefresh = false
+        evaluateNotifications(snapshot.quota)
+        if shouldSpeak, voiceBroadcastEnabled {
+            speak(snapshot.quota)
         }
     }
 
@@ -787,9 +1044,15 @@ final class QuotaStore: ObservableObject {
 
     private func scheduleVoiceTimer() {
         voiceTimer?.invalidate()
+        let generation = lifecycleGeneration
         voiceTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(voiceBroadcastIntervalMinutes * 60), repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.requestVoiceBroadcast()
+                guard let self,
+                      self.lifecycleGeneration == generation,
+                      self.voiceBroadcastEnabled else {
+                    return
+                }
+                self.requestVoiceBroadcast()
             }
         }
     }
@@ -826,7 +1089,7 @@ final class QuotaStore: ObservableObject {
         speechSynthesizer.speak(utterance)
     }
 
-    private func evaluateNotifications() {
+    private func evaluateNotifications(_ snapshot: QuotaSnapshot) {
         guard !snapshot.isUnavailable else { return }
         let remaining = snapshot.remainingPercent
 
@@ -846,6 +1109,7 @@ final class QuotaStore: ObservableObject {
     }
 
     private func notifyOnce(level: Int, title: String, body: String) {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         guard notifiedLevels.insert(level).inserted else { return }
 
         let content = UNMutableNotificationContent()
@@ -863,6 +1127,7 @@ final class QuotaStore: ObservableObject {
     }
 
     private func requestNotificationPermission() {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
