@@ -316,6 +316,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         var offset: UInt64 = 0
         var partial = Data()
         var usage = DailyTokenUsage.zero
+        var needsBoundaryValidation = false
     }
 
     private enum CursorKey: Hashable {
@@ -349,6 +350,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
     private let fileReader: any DailyTokenFileReading
     private let cacheURL: URL?
     private let rootsFingerprint: String
+    private let stateLock = NSLock()
     private var dayInterval: DateInterval?
     private var cursors: [CursorKey: FileCursor] = [:]
 
@@ -373,6 +375,9 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
     }
 
     func currentUsage(now: Date) throws -> DailyTokenUsage {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
         let interval = localDay(containing: now)
         if dayInterval != interval {
             dayInterval = interval
@@ -412,7 +417,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
               cache.schemaVersion == Self.cacheSchemaVersion,
               cache.dayStart == interval.start,
               cache.rootsFingerprint == rootsFingerprint,
-              cache.cursors.allSatisfy({ Self.isValid($0.usage, inside: interval) }) else {
+              Self.areValid(cache.cursors, inside: interval) else {
             return
         }
 
@@ -426,10 +431,35 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             loaded[key] = FileCursor(
                 url: URL(fileURLWithPath: persisted.path),
                 offset: persisted.completeLineOffset,
-                usage: persisted.usage
+                usage: persisted.usage,
+                needsBoundaryValidation: true
             )
         }
         cursors = loaded
+    }
+
+    private static func areValid(
+        _ cursors: [PersistentCursor],
+        inside interval: DateInterval
+    ) -> Bool {
+        var aggregateValues = [Int64](repeating: 0, count: 5)
+        for cursor in cursors {
+            let usage = cursor.usage
+            guard isValid(usage, inside: interval) else { return false }
+            let values = [
+                usage.totalTokens,
+                usage.cachedInputTokens,
+                usage.nonCachedInputTokens,
+                usage.outputTokens,
+                usage.reasoningOutputTokens
+            ]
+            for index in values.indices {
+                let (sum, overflow) = aggregateValues[index].addingReportingOverflow(values[index])
+                guard !overflow else { return false }
+                aggregateValues[index] = sum
+            }
+        }
+        return true
     }
 
     private static func isValid(_ usage: DailyTokenUsage, inside interval: DateInterval) -> Bool {
@@ -440,8 +470,19 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             usage.outputTokens,
             usage.reasoningOutputTokens
         ]
-        guard values.allSatisfy({ $0 >= 0 }) else { return false }
-        guard let latest = usage.latestEventAt else { return true }
+        guard values.allSatisfy({ $0 >= 0 && $0 < Int64.max }) else { return false }
+        guard usage.reasoningOutputTokens <= usage.outputTokens else { return false }
+        let (inputTokens, inputOverflow) = usage.cachedInputTokens.addingReportingOverflow(
+            usage.nonCachedInputTokens
+        )
+        let (components, componentOverflow) = inputTokens.addingReportingOverflow(usage.outputTokens)
+        guard !inputOverflow, !componentOverflow, components <= usage.totalTokens else {
+            return false
+        }
+        if usage.totalTokens == 0 {
+            return usage.latestEventAt == nil
+        }
+        guard let latest = usage.latestEventAt else { return false }
         return latest >= interval.start && latest < interval.end
     }
 
@@ -574,11 +615,15 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         var cursor = cursors[key] ?? FileCursor(url: url)
         cursor.url = url
         let fileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        if fileSize < cursor.offset {
+        if fileSize < cursor.offset || (
+            cursor.needsBoundaryValidation
+                && !isCompleteLineBoundary(cursor.offset, in: url, fileSize: fileSize)
+        ) {
             cursor.offset = 0
             cursor.partial = Data()
             cursor.usage = .zero
         }
+        cursor.needsBoundaryValidation = false
 
         let readStart = cursor.offset
         let newData: Data
@@ -602,5 +647,22 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         cursor.offset = readStart + UInt64(newData.count)
         cursors[key] = cursor
         return key
+    }
+
+    private func isCompleteLineBoundary(
+        _ offset: UInt64,
+        in url: URL,
+        fileSize: UInt64
+    ) -> Bool {
+        guard offset > 0 else { return true }
+        guard offset <= fileSize else { return false }
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: offset - 1)
+            return try handle.read(upToCount: 1) == Data([0x0A])
+        } catch {
+            return false
+        }
     }
 }

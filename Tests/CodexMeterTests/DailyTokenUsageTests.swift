@@ -63,6 +63,92 @@ private final class RecordingDailyTokenFileReader: DailyTokenFileReading, @unche
     }
 }
 
+private final class BlockingCountingDailyTokenFileReader: DailyTokenFileReading, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var activeReads = 0
+    private var maximumActiveReads = 0
+    private var readCount = 0
+    private var firstReadReleased = false
+
+    func read(from url: URL, offset: UInt64) throws -> Data {
+        condition.lock()
+        activeReads += 1
+        maximumActiveReads = max(maximumActiveReads, activeReads)
+        readCount += 1
+        let ordinal = readCount
+        condition.broadcast()
+        while ordinal == 1, !firstReadReleased {
+            condition.wait()
+        }
+        condition.unlock()
+        defer {
+            condition.lock()
+            activeReads -= 1
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        return try handle.readToEnd() ?? Data()
+    }
+
+    func waitForReadCount(_ expected: Int, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while readCount < expected {
+            guard condition.wait(until: deadline) else { return false }
+        }
+        return true
+    }
+
+    func releaseFirstRead() {
+        condition.lock()
+        firstReadReleased = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    var maxActiveReads: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return maximumActiveReads
+    }
+
+    var totalReadCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return readCount
+    }
+}
+
+private final class LockedDailyTokenResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var usages: [DailyTokenUsage] = []
+    private var failures = 0
+
+    func record(_ body: () throws -> DailyTokenUsage) {
+        do {
+            let usage = try body()
+            lock.lock()
+            usages.append(usage)
+            lock.unlock()
+        } catch {
+            lock.lock()
+            failures += 1
+            lock.unlock()
+        }
+    }
+
+    var snapshot: (usages: [DailyTokenUsage], failures: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (usages, failures)
+    }
+}
+
 private final class CountingDailyTokenEventDecoder: DailyTokenEventDecoding {
     private let base: any DailyTokenEventDecoding
     private(set) var decodeCount = 0
@@ -107,6 +193,40 @@ final class DailyTokenUsageTests: XCTestCase {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 8 * 3_600)!
         return calendar
+    }
+
+    private func restartedUsageAfterMutatingCachedUsage(
+        _ mutation: (inout [String: Any]) throws -> Void
+    ) throws -> (usage: DailyTokenUsage, readOffsets: [UInt64]) {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-corrupt-aggregate.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 120)
+        try mutateJSONCache(at: cache) { object in
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            var usage = try XCTUnwrap(cursors[0]["usage"] as? [String: Any])
+            try mutation(&usage)
+            cursors[0]["usage"] = usage
+            object["cursors"] = cursors
+        }
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+        return (try restarted.currentUsage(now: now), reader.offsets)
     }
 
     func testParsesStructuredTokenCountAndSeparatesCachedInput() throws {
@@ -385,6 +505,53 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 330)
     }
 
+    func testConcurrentCurrentUsageCallsSerializeTheFullProviderTransition() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-concurrent.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let reader = BlockingCountingDailyTokenFileReader()
+        let provider = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let results = LockedDailyTokenResults()
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "daily-token-concurrency", attributes: .concurrent)
+
+        group.enter()
+        queue.async {
+            results.record { try provider.currentUsage(now: now) }
+            group.leave()
+        }
+        XCTAssertTrue(reader.waitForReadCount(1, timeout: 2))
+
+        let secondCallStarted = DispatchSemaphore(value: 0)
+        group.enter()
+        queue.async {
+            secondCallStarted.signal()
+            results.record { try provider.currentUsage(now: now) }
+            group.leave()
+        }
+        XCTAssertEqual(secondCallStarted.wait(timeout: .now() + 2), .success)
+        let secondReadEnteredBeforeRelease = reader.waitForReadCount(2, timeout: 0.5)
+        reader.releaseFirstRead()
+        XCTAssertEqual(group.wait(timeout: .now() + 2), .success)
+
+        XCTAssertFalse(secondReadEnteredBeforeRelease)
+        XCTAssertEqual(reader.maxActiveReads, 1)
+        XCTAssertEqual(reader.totalReadCount, 1)
+        XCTAssertEqual(results.snapshot.failures, 0)
+        XCTAssertEqual(results.snapshot.usages.map(\.totalTokens).sorted(), [100, 100])
+    }
+
     func testRestartedProviderUsesPersistentAggregateWithoutReadingUnchangedBytes() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let root = base.appendingPathComponent("sessions")
@@ -427,8 +594,11 @@ final class DailyTokenUsageTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: base) }
         let file = root.appendingPathComponent("rollout-partial.jsonl")
         let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
-        let partial = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}},"content":"PRIVATE_TAIL_SENTINEL"}}"#
-        let split = partial.index(partial.startIndex, offsetBy: partial.count / 2)
+        let sentinel = "PRIVATE_TAIL_SENTINEL"
+        let partial = #"{"content":"\#(sentinel)","timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        let sentinelRange = try XCTUnwrap(partial.range(of: sentinel))
+        let split = partial.index(sentinelRange.upperBound, offsetBy: 1)
+        XCTAssertTrue(String(partial[..<split]).contains(sentinel))
         let completePrefix = Data((first + "\n").utf8)
         try (completePrefix + Data(partial[..<split].utf8)).write(to: file)
         let reader = RecordingDailyTokenFileReader()
@@ -443,7 +613,7 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try firstProvider.currentUsage(now: now).totalTokens, 100)
         XCTAssertFalse(
             String(decoding: try Data(contentsOf: cache), as: UTF8.self)
-                .contains("PRIVATE_TAIL_SENTINEL")
+                .contains(sentinel)
         )
 
         let handle = try FileHandle(forWritingTo: file)
@@ -529,6 +699,33 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
         let serialized = try Data(contentsOf: cache)
         XCTAssertFalse(String(decoding: serialized, as: UTF8.self).contains(sentinel))
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: serialized) as? [String: Any]
+        )
+        XCTAssertEqual(
+            Set(object.keys),
+            ["schemaVersion", "dayStart", "rootsFingerprint", "cursors"]
+        )
+        let cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+        let cursor = try XCTUnwrap(cursors.first)
+        XCTAssertEqual(
+            Set(cursor.keys),
+            ["path", "basename", "identity", "completeLineOffset", "usage"]
+        )
+        let identity = try XCTUnwrap(cursor["identity"] as? [String: Any])
+        XCTAssertEqual(Set(identity.keys), ["systemNumber", "fileNumber"])
+        let usage = try XCTUnwrap(cursor["usage"] as? [String: Any])
+        XCTAssertEqual(
+            Set(usage.keys),
+            [
+                "totalTokens",
+                "cachedInputTokens",
+                "nonCachedInputTokens",
+                "outputTokens",
+                "reasoningOutputTokens",
+                "latestEventAt"
+            ]
+        )
     }
 
     func testRestartedProviderRejectsCacheFromWrongLocalDay() throws {
@@ -588,6 +785,122 @@ final class DailyTokenUsageTests: XCTestCase {
 
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
         XCTAssertGreaterThan(reader.totalBytesRead, 0)
+    }
+
+    func testRestartedProviderRejectsCachedReasoningGreaterThanOutput() throws {
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["reasoningOutputTokens"] = 21
+        }
+
+        XCTAssertEqual(result.usage.totalTokens, 120)
+        XCTAssertEqual(result.usage.reasoningOutputTokens, 5)
+        XCTAssertEqual(result.readOffsets, [0])
+    }
+
+    func testRestartedProviderRejectsCachedComponentsExceedingTotal() throws {
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["cachedInputTokens"] = 80
+        }
+
+        XCTAssertEqual(result.usage.totalTokens, 120)
+        XCTAssertEqual(result.usage.cachedInputTokens, 40)
+        XCTAssertEqual(result.readOffsets, [0])
+    }
+
+    func testRestartedProviderRejectsPositiveCachedUsageWithoutLatestEvent() throws {
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["latestEventAt"] = NSNull()
+        }
+
+        XCTAssertEqual(result.usage.totalTokens, 120)
+        XCTAssertNotNil(result.usage.latestEventAt)
+        XCTAssertEqual(result.readOffsets, [0])
+    }
+
+    func testRestartedProviderRejectsExtremeCachedAggregate() throws {
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["totalTokens"] = Int64.max
+        }
+
+        XCTAssertEqual(result.usage.totalTokens, 120)
+        XCTAssertEqual(result.readOffsets, [0])
+    }
+
+    func testRestartedProviderRejectsCachedAggregateThatOverflowsAcrossFiles() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        try (first + "\n").write(
+            to: root.appendingPathComponent("rollout-overflow-a.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try (second + "\n").write(
+            to: root.appendingPathComponent("rollout-overflow-b.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 300)
+        try mutateJSONCache(at: cache) { object in
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            for index in cursors.indices {
+                var usage = try XCTUnwrap(cursors[index]["usage"] as? [String: Any])
+                usage["totalTokens"] = Int64.max / 2 + 1
+                cursors[index]["usage"] = usage
+            }
+            object["cursors"] = cursors
+        }
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(reader.offsets.sorted(), [0, 0])
+    }
+
+    func testRestartedProviderRejectsNegativeCachedAggregateComponent() throws {
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["cachedInputTokens"] = -1
+        }
+
+        XCTAssertEqual(result.usage.cachedInputTokens, 40)
+        XCTAssertEqual(result.readOffsets, [0])
+    }
+
+    func testRestartedProviderRejectsCachedLatestEventOutsideLocalDay() throws {
+        let outsideDay = ISO8601DateFormatter().date(from: "2026-07-31T15:59:59Z")!
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["latestEventAt"] = outsideDay.timeIntervalSinceReferenceDate
+        }
+
+        XCTAssertEqual(
+            result.usage.latestEventAt,
+            ISO8601DateFormatter().date(from: "2026-08-01T02:00:00Z")
+        )
+        XCTAssertEqual(result.readOffsets, [0])
+    }
+
+    func testRestartedProviderRejectsOverflowingCachedComponentSum() throws {
+        let result = try restartedUsageAfterMutatingCachedUsage { usage in
+            usage["cachedInputTokens"] = Int64.max - 5
+            usage["nonCachedInputTokens"] = 10
+            usage["outputTokens"] = 0
+            usage["reasoningOutputTokens"] = 0
+            usage["totalTokens"] = Int64.max - 1
+        }
+
+        XCTAssertEqual(result.usage.totalTokens, 120)
+        XCTAssertEqual(result.readOffsets, [0])
     }
 
     func testRestartedProviderRejectsCacheForDifferentRoots() throws {
@@ -674,6 +987,41 @@ final class DailyTokenUsageTests: XCTestCase {
         )
 
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertEqual(reader.offsets, [0])
+    }
+
+    func testRestartedProviderRebuildsCursorWithInRangeMidLineCachedOffset() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-mid-line-offset.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        let firstData = Data((first + "\n").utf8)
+        try (first + "\n" + second + "\n").write(to: file, atomically: false, encoding: .utf8)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 300)
+        let midLineOffset = firstData.count + 10
+        try mutateJSONCache(at: cache) { object in
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            cursors[0]["completeLineOffset"] = midLineOffset
+            var usage = try XCTUnwrap(cursors[0]["usage"] as? [String: Any])
+            usage["totalTokens"] = 100
+            cursors[0]["usage"] = usage
+            object["cursors"] = cursors
+        }
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
         XCTAssertEqual(reader.offsets, [0])
     }
 
