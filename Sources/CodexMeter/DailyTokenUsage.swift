@@ -111,8 +111,23 @@ protocol DailyTokenUsageProviding: AnyObject, Sendable {
 }
 
 final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
+    private struct FileIdentity: Equatable {
+        let systemNumber: UInt64
+        let fileNumber: UInt64
+
+        init?(attributes: [FileAttributeKey: Any]) {
+            guard let systemNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
+                  let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value else {
+                return nil
+            }
+            self.systemNumber = systemNumber
+            self.fileNumber = fileNumber
+        }
+    }
+
     private struct FileCursor {
         var url: URL
+        var identity: FileIdentity?
         var offset: UInt64 = 0
         var partial = Data()
         var usage = DailyTokenUsage.zero
@@ -193,23 +208,27 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         cursor.url = url
 
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        let identity = FileIdentity(attributes: attributes)
         let fileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        if fileSize < cursor.offset {
+        let wasReplaced = cursor.identity != nil && identity != nil && cursor.identity != identity
+        if wasReplaced || fileSize < cursor.offset {
             cursor.offset = 0
             cursor.partial = Data()
             cursor.usage = .zero
         }
+        cursor.identity = identity
 
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        try handle.seek(toOffset: cursor.offset)
+        let readStart = cursor.offset
+        try handle.seek(toOffset: readStart)
         let newData = try handle.readToEnd() ?? Data()
 
         var combined = cursor.partial
         combined.append(newData)
         let chunks = combined.split(separator: 0x0A, omittingEmptySubsequences: false)
         let endsWithNewline = combined.last == 0x0A
-        let complete = endsWithNewline ? chunks.dropLast() : chunks.dropLast()
+        let complete = chunks.dropLast()
         cursor.partial = endsWithNewline ? Data() : (chunks.last.map { Data($0) } ?? Data())
         for bytes in complete where !bytes.isEmpty {
             let line = String(decoding: bytes, as: UTF8.self)
@@ -217,7 +236,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
                 cursor.usage = cursor.usage + event.usage
             }
         }
-        cursor.offset = fileSize
+        cursor.offset = readStart + UInt64(newData.count)
         cursors[key] = cursor
     }
 }

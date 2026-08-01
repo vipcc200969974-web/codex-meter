@@ -2,6 +2,31 @@ import Foundation
 import XCTest
 @testable import CodexMeter
 
+private final class AppendingAfterStatFileManager: FileManager, @unchecked Sendable {
+    private let target: URL
+    private let appendedData: Data
+    private var didAppend = false
+
+    init(target: URL, appendedData: Data) {
+        self.target = target
+        self.appendedData = appendedData
+        super.init()
+    }
+
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+        let attributes = try super.attributesOfItem(atPath: path)
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        guard url == target.resolvingSymlinksInPath(), !didAppend else { return attributes }
+
+        let handle = try FileHandle(forWritingTo: target)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: appendedData)
+        didAppend = true
+        return attributes
+    }
+}
+
 final class DailyTokenUsageTests: XCTestCase {
     private var calendar: Calendar {
         var calendar = Calendar(identifier: .gregorian)
@@ -98,6 +123,49 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 330)
     }
 
+    func testProviderAdvancesCursorByBytesActuallyReadWhenFileGrowsAfterStat() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("rollout-growing.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let appended = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        try (first + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let fileManager = AppendingAfterStatFileManager(
+            target: file,
+            appendedData: Data((appended + "\n").utf8)
+        )
+        let provider = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileManager: fileManager
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 300)
+    }
+
+    func testProviderRebuildsUsageWhenFileIsReplacedByLargerFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("rollout-replaced.jsonl")
+        let replacement = root.appendingPathComponent("replacement.tmp")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let replacementLine = #"{"timestamp":"2026-08-01T02:10:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":225,"cached_input_tokens":25,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":250}}}}"#
+        try (first + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
+
+        try (replacementLine + "\n").write(to: replacement, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.moveItem(at: replacement, to: file)
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 250)
+    }
+
     func testProviderResetsAtLocalMidnight() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -107,9 +175,58 @@ final class DailyTokenUsageTests: XCTestCase {
         let after = #"{"timestamp":"2026-07-31T16:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":180,"cached_input_tokens":160,"output_tokens":20,"total_tokens":200}}}}"#
         try (before + "\n" + after + "\n").write(to: file, atomically: true, encoding: .utf8)
         let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
-        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let beforeMidnight = ISO8601DateFormatter().date(from: "2026-07-31T15:59:59Z")!
+        let afterMidnight = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
 
-        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 200)
+        XCTAssertEqual(try provider.currentUsage(now: beforeMidnight).totalTokens, 100)
+        XCTAssertEqual(try provider.currentUsage(now: afterMidnight).totalTokens, 200)
+    }
+
+    func testProviderRebuildsUsageAfterSameFileIsTruncated() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("rollout-truncated.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        let replacement = #"{"timestamp":"2026-08-01T02:10:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":400}}}}"#
+        try (first + "\n" + second + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 300)
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data((replacement + "\n").utf8))
+        try handle.close()
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 400)
+    }
+
+    func testProviderPreservesCursorWhenRolloutMovesFromActiveToArchive() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let active = base.appendingPathComponent("sessions")
+        let archived = base.appendingPathComponent("archived")
+        try FileManager.default.createDirectory(at: active, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let activeFile = active.appendingPathComponent("rollout-moved.jsonl")
+        let archivedFile = archived.appendingPathComponent("rollout-moved.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let appended = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        try (first + "\n").write(to: activeFile, atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [active, archived], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
+
+        try FileManager.default.moveItem(at: activeFile, to: archivedFile)
+        let handle = try FileHandle(forWritingTo: archivedFile)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((appended + "\n").utf8))
+        try handle.close()
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 300)
     }
 
     func testProviderDeduplicatesSameRolloutFilenameAcrossRoots() throws {
