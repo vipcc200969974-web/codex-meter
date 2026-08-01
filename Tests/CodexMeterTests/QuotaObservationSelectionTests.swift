@@ -38,7 +38,29 @@ final class QuotaObservationSelectionTests: XCTestCase {
         let result = try XCTUnwrap(CompositeQuotaProvider.merge([olderHigh, newerZero], now: now))
 
         XCTAssertEqual(result.windowSet.fiveHour?.usedPercent, 42)
-        XCTAssertEqual(result.observedAt, olderHigh.observedAt)
+        XCTAssertEqual(result.observedAt, newerZero.observedAt)
+    }
+
+    func testLaterArrivalWithStaleResetCannotReplaceNewerReset() throws {
+        let newerReset = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 7, resetsAt: 2_000, windowMinutes: 300),
+            observedAt: Date(timeIntervalSince1970: 1_100),
+            sourceName: "Codex 日志"
+        )
+        let laterStaleArrival = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 91, resetsAt: 1_500, windowMinutes: 300),
+            observedAt: Date(timeIntervalSince1970: 1_200),
+            sourceName: "Codex 会话"
+        )
+
+        let result = try XCTUnwrap(CompositeQuotaProvider.merge(
+            [newerReset, laterStaleArrival],
+            now: now
+        ))
+
+        XCTAssertEqual(result.windowSet.fiveHour?.resetsAt, 2_000)
+        XCTAssertEqual(result.windowSet.fiveHour?.usedPercent, 7)
+        XCTAssertEqual(result.observedAt, newerReset.observedAt)
     }
 
     func testSnapshotUsesSourceObservationTime() throws {

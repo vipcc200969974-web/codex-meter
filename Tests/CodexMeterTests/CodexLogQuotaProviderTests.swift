@@ -35,9 +35,10 @@ final class CodexLogQuotaProviderTests: XCTestCase {
 
         let header = #"{"x-codex-primary-used-percent": "35", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
             + String(repeating: "x", count: 4_096)
+        let firstTimestamp = Int(Date().timeIntervalSince1970) - 39
         let inserts = (0..<40).map { index in
             "insert into logs (ts, ts_nanos, target, feedback_log_body) "
-                + "values (\(2_000 + index), 0, 'codex_http_client::client', '\(header)')"
+                + "values (\(firstTimestamp + index), 0, 'codex_http_client::client', '\(header)')"
         }.joined(separator: ";")
         try runSQLite(
             databaseURL: databaseURL,
@@ -63,20 +64,21 @@ final class CodexLogQuotaProviderTests: XCTestCase {
         XCTAssertEqual(snapshot?.remainingPercent, 65)
     }
 
-    func testScansBoundedSQLiteHistoryForHighestWeeklyUsageAndLatestObservation() throws {
+    func testScansMoreThanFortySameResetRowsForHighestWeeklyUsageAndLatestObservation() throws {
         let databaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: databaseURL) }
 
-        let reset = 4_102_444_800
-        let outOfBoundHeader = #"{"x-codex-primary-used-percent": "99", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
-        let boundaryHighHeader = #"{"x-codex-primary-used-percent": "61", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
+        let oldestTimestamp = Int(Date().timeIntervalSince1970) - 64
+        let highHeader = #"{"x-codex-primary-used-percent": "61", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
+        let outOfLookbackHeader = #"{"x-codex-primary-used-percent": "99", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
         let transientZeroHeader = #"{"x-codex-primary-used-percent": "0", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
-        let boundedRows = [
-            "insert into logs (ts, ts_nanos, target, feedback_log_body) values (1999, 0, 'codex_http_client::client', '\(outOfBoundHeader)')",
-            "insert into logs (ts, ts_nanos, target, feedback_log_body) values (2000, 0, 'codex_http_client::client', '\(boundaryHighHeader)')"
-        ] + (2_001...2_039).map { timestamp in
-            "insert into logs (ts, ts_nanos, target, feedback_log_body) values (\(timestamp), 0, 'codex_http_client::client', '\(transientZeroHeader)')"
+        let outOfLookbackRow = "insert into logs (ts, ts_nanos, target, feedback_log_body) "
+            + "values (\(oldestTimestamp - 626_401), 0, 'codex_http_client::client', '\(outOfLookbackHeader)')"
+        let currentRows = (0..<65).map { index in
+            let header = index == 0 ? highHeader : transientZeroHeader
+            return "insert into logs (ts, ts_nanos, target, feedback_log_body) "
+                + "values (\(oldestTimestamp + index), 0, 'codex_http_client::client', '\(header)')"
         }
         try runSQLite(
             databaseURL: databaseURL,
@@ -88,7 +90,7 @@ final class CodexLogQuotaProviderTests: XCTestCase {
                 target text not null,
                 feedback_log_body text
             );
-            \(boundedRows.joined(separator: ";"));
+            \(([outOfLookbackRow] + currentRows).joined(separator: ";"));
             """
         )
 
@@ -99,8 +101,41 @@ final class CodexLogQuotaProviderTests: XCTestCase {
         )
 
         XCTAssertEqual(weekly.window.usedPercent, 61)
-        XCTAssertEqual(weekly.window.resetsAt, Double(reset))
-        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 2_039))
+        XCTAssertEqual(weekly.window.resetsAt, 4_102_444_800)
+        XCTAssertEqual(
+            weekly.observedAt,
+            Date(timeIntervalSince1970: TimeInterval(oldestTimestamp + 64))
+        )
+    }
+
+    func testReadsSecondaryOnlyQuotaHeaderFromSQLite() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let secondaryHeader = #"{"x-codex-secondary-used-percent": "27", "x-codex-secondary-window-minutes": "10080", "x-codex-secondary-reset-at": "4102444800"}"#
+        try runSQLite(
+            databaseURL: databaseURL,
+            query: """
+            create table logs (
+                id integer primary key autoincrement,
+                ts integer not null,
+                ts_nanos integer not null,
+                target text not null,
+                feedback_log_body text
+            );
+            insert into logs (ts, ts_nanos, target, feedback_log_body)
+            values (\(timestamp), 0, 'codex_http_client::client', '\(secondaryHeader)');
+            """
+        )
+
+        let observations = CodexLogQuotaProvider(databaseURL: databaseURL)
+            .currentWindowObservations()
+        let weekly = try XCTUnwrap(observations.first { $0.window.kind == .weekly })
+
+        XCTAssertEqual(weekly.window.usedPercent, 27)
+        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: TimeInterval(timestamp)))
     }
 
     private func runSQLite(databaseURL: URL, query: String) throws {
