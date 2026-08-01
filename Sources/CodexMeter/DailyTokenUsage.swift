@@ -105,3 +105,119 @@ enum TokenCountFormatter {
         return value.formatted(.number.grouping(.automatic))
     }
 }
+
+protocol DailyTokenUsageProviding: AnyObject, Sendable {
+    func currentUsage(now: Date) throws -> DailyTokenUsage
+}
+
+final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
+    private struct FileCursor {
+        var url: URL
+        var offset: UInt64 = 0
+        var partial = Data()
+        var usage = DailyTokenUsage.zero
+    }
+
+    private let roots: [URL]
+    private var calendar: Calendar
+    private let fileManager: FileManager
+    private var dayInterval: DateInterval?
+    private var cursors: [String: FileCursor] = [:]
+
+    init(
+        roots: [URL] = [
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
+        ],
+        calendar: Calendar = .autoupdatingCurrent,
+        fileManager: FileManager = .default
+    ) {
+        self.roots = roots
+        self.calendar = calendar
+        self.fileManager = fileManager
+    }
+
+    func currentUsage(now: Date) throws -> DailyTokenUsage {
+        let interval = localDay(containing: now)
+        if dayInterval != interval {
+            dayInterval = interval
+            cursors.removeAll()
+        }
+
+        for url in try discoverCandidateFiles(since: interval.start) {
+            try updateCursor(for: url, interval: interval)
+        }
+        return cursors.values.reduce(.zero) { $0 + $1.usage }
+    }
+
+    private func localDay(containing date: Date) -> DateInterval {
+        let start = calendar.startOfDay(for: date)
+        let end = calendar.date(byAdding: .day, value: 1, to: start)!
+        return DateInterval(start: start, end: end)
+    }
+
+    private func discoverCandidateFiles(since start: Date) throws -> [URL] {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey]
+        var candidates: [(url: URL, modifiedAt: Date)] = []
+
+        for root in roots {
+            guard let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: keys,
+                options: []
+            ) else {
+                continue
+            }
+
+            for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+                let values = try url.resourceValues(forKeys: Set(keys))
+                guard values.isRegularFile == true,
+                      let modifiedAt = values.contentModificationDate,
+                      modifiedAt >= start else {
+                    continue
+                }
+                candidates.append((url, modifiedAt))
+            }
+        }
+
+        candidates.sort { $0.modifiedAt > $1.modifiedAt }
+        var seen = Set<String>()
+        return candidates.compactMap { candidate in
+            seen.insert(candidate.url.lastPathComponent).inserted ? candidate.url : nil
+        }
+    }
+
+    private func updateCursor(for url: URL, interval: DateInterval) throws {
+        let key = url.lastPathComponent
+        var cursor = cursors[key] ?? FileCursor(url: url)
+        cursor.url = url
+
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        if fileSize < cursor.offset {
+            cursor.offset = 0
+            cursor.partial = Data()
+            cursor.usage = .zero
+        }
+
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: cursor.offset)
+        let newData = try handle.readToEnd() ?? Data()
+
+        var combined = cursor.partial
+        combined.append(newData)
+        let chunks = combined.split(separator: 0x0A, omittingEmptySubsequences: false)
+        let endsWithNewline = combined.last == 0x0A
+        let complete = endsWithNewline ? chunks.dropLast() : chunks.dropLast()
+        cursor.partial = endsWithNewline ? Data() : (chunks.last.map { Data($0) } ?? Data())
+        for bytes in complete where !bytes.isEmpty {
+            let line = String(decoding: bytes, as: UTF8.self)
+            if let event = DailyTokenLogParser.parse(line: line, inside: interval) {
+                cursor.usage = cursor.usage + event.usage
+            }
+        }
+        cursor.offset = fileSize
+        cursors[key] = cursor
+    }
+}

@@ -70,4 +70,61 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(TokenCountFormatter.compact(7_986_313), "798.6万")
         XCTAssertEqual(TokenCountFormatter.compact(100_000_000), "1.0亿")
     }
+
+    func testProviderReadsOnlyNewCompleteLinesWithoutDoubleCounting() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("rollout-test.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"reasoning_output_tokens":2,"total_tokens":110}}}}"#
+        try (first + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 110)
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 110)
+
+        let partial = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"cached_input_tokens":100,"output_tokens":20,"reasoning_output_tokens":4,"total_tokens":220}}}}"#
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(partial.prefix(partial.count / 2).utf8))
+        try handle.close()
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 110)
+
+        let finish = try FileHandle(forWritingTo: file)
+        try finish.seekToEnd()
+        try finish.write(contentsOf: Data((String(partial.suffix(partial.count - partial.count / 2)) + "\n").utf8))
+        try finish.close()
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 330)
+    }
+
+    func testProviderResetsAtLocalMidnight() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("rollout-midnight.jsonl")
+        let before = #"{"timestamp":"2026-07-31T15:59:59Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":90,"cached_input_tokens":80,"output_tokens":10,"total_tokens":100}}}}"#
+        let after = #"{"timestamp":"2026-07-31T16:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":180,"cached_input_tokens":160,"output_tokens":20,"total_tokens":200}}}}"#
+        try (before + "\n" + after + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 200)
+    }
+
+    func testProviderDeduplicatesSameRolloutFilenameAcrossRoots() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let active = base.appendingPathComponent("sessions")
+        let archived = base.appendingPathComponent("archived")
+        try FileManager.default.createDirectory(at: active, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":90,"cached_input_tokens":80,"output_tokens":10,"total_tokens":100}}}}"#
+        try (line + "\n").write(to: active.appendingPathComponent("rollout-same.jsonl"), atomically: true, encoding: .utf8)
+        try (line + "\n").write(to: archived.appendingPathComponent("rollout-same.jsonl"), atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [active, archived], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
+    }
 }
