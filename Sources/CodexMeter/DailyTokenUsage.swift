@@ -33,8 +33,15 @@ struct DailyTokenUsage: Equatable, Sendable {
     var outputFraction: Double { fraction(outputTokens) }
 
     private func fraction(_ value: Int64) -> Double {
+        guard compositionDenominator > 0 else { return 0 }
+        return min(max(Double(value), 0) / compositionDenominator, 1)
+    }
+
+    private var compositionDenominator: Double {
         guard totalTokens > 0 else { return 0 }
-        return min(max(Double(value) / Double(totalTokens), 0), 1)
+        let components = [cachedInputTokens, nonCachedInputTokens, outputTokens]
+            .reduce(0.0) { $0 + max(Double($1), 0) }
+        return max(Double(totalTokens), components)
     }
 }
 

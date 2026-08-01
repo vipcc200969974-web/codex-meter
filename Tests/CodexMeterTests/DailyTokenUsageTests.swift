@@ -89,6 +89,38 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual((first + second).reasoningOutputTokens, 30)
     }
 
+    func testCompositionFractionsUseTotalWithoutReasoningDuplication() {
+        let usage = DailyTokenUsage(
+            totalTokens: 1_000,
+            cachedInputTokens: 700,
+            nonCachedInputTokens: 200,
+            outputTokens: 100,
+            reasoningOutputTokens: 40,
+            latestEventAt: nil
+        )
+
+        XCTAssertEqual(usage.cachedFraction, 0.7, accuracy: 0.0001)
+        XCTAssertEqual(usage.nonCachedFraction, 0.2, accuracy: 0.0001)
+        XCTAssertEqual(usage.outputFraction, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(usage.cachedFraction + usage.nonCachedFraction + usage.outputFraction, 1, accuracy: 0.0001)
+    }
+
+    func testCompositionFractionsNormalizeInconsistentComponentTotals() {
+        let usage = DailyTokenUsage(
+            totalTokens: 100,
+            cachedInputTokens: 100,
+            nonCachedInputTokens: 50,
+            outputTokens: 50,
+            reasoningOutputTokens: 25,
+            latestEventAt: nil
+        )
+
+        XCTAssertEqual(usage.cachedFraction, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(usage.nonCachedFraction, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(usage.outputFraction, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(usage.cachedFraction + usage.nonCachedFraction + usage.outputFraction, 1, accuracy: 0.0001)
+    }
+
     func testCompactChineseFormatting() {
         XCTAssertEqual(TokenCountFormatter.compact(9_999), "9,999")
         XCTAssertEqual(TokenCountFormatter.compact(10_000), "1.0万")

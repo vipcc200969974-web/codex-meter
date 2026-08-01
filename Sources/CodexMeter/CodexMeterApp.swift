@@ -17,7 +17,7 @@ struct CodexMeterApp: App {
 
 private enum PanelMetrics {
     static let cardWidth: CGFloat = 360
-    static let cardHeight: CGFloat = 220
+    static let cardHeight: CGFloat = 340
     static let windowPadding: CGFloat = 14
     static let width: CGFloat = cardWidth + windowPadding * 2
     static let height: CGFloat = cardHeight + windowPadding * 2
@@ -253,6 +253,7 @@ struct StatusPanelView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     header
                     quotaOverview
+                    dailyTokenOverview
                 }
                 .padding(18)
             }
@@ -264,9 +265,9 @@ struct StatusPanelView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 8) {
-            Text("\(store.snapshot.quota.sourceName) · \(store.snapshot.quota.lastUpdatedText)")
+            Text(headerStatusText)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(store.snapshot.quota.isUnavailable ? .red : .secondary)
+                .foregroundStyle(headerStatusColor)
                 .lineLimit(1)
 
             Spacer()
@@ -277,6 +278,18 @@ struct StatusPanelView: View {
 
             MoreActionsMenu(store: store)
         }
+    }
+
+    private var headerStatusText: String {
+        let quota = store.snapshot.quota
+        let status = "\(quota.sourceName) · \(quota.lastUpdatedText)"
+        return store.snapshot.freshness == .stale ? "\(status) · 暂未更新" : status
+    }
+
+    private var headerStatusColor: Color {
+        if store.snapshot.quota.isUnavailable { return .red }
+        if store.snapshot.freshness == .stale { return .orange }
+        return .secondary
     }
 
     private var quotaOverview: some View {
@@ -320,6 +333,109 @@ struct StatusPanelView: View {
         .notificationInsetSurface(cornerRadius: 12)
     }
 
+    private var dailyTokenOverview: some View {
+        DailyTokenUsageCard(usage: store.snapshot.dailyTokens)
+            .padding(14)
+            .notificationInsetSurface(cornerRadius: 12)
+    }
+}
+
+struct DailyTokenUsageCard: View {
+    let usage: DailyTokenUsage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("今日 Token")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(usage.totalTokens == 0 ? "今日暂无使用" : TokenCountFormatter.compact(usage.totalTokens))
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+            }
+
+            TokenCompositionBar(usage: usage)
+
+            HStack(spacing: 12) {
+                TokenMetric(label: "缓存", value: usage.cachedInputTokens, color: .cyan)
+                TokenMetric(label: "非缓存", value: usage.nonCachedInputTokens, color: .purple)
+                TokenMetric(label: "输出", value: usage.outputTokens, color: .orange)
+            }
+
+            Text("推理 \(TokenCountFormatter.compact(usage.reasoningOutputTokens))（已包含在输出中）")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("今日 Token 使用")
+    }
+}
+
+struct TokenCompositionBar: View {
+    let usage: DailyTokenUsage
+
+    var body: some View {
+        GeometryReader { geometry in
+            let availableWidth = geometry.size.width.isFinite ? max(geometry.size.width, 0) : 0
+
+            if usage.totalTokens > 0 {
+                ZStack(alignment: .leading) {
+                    Color.secondary.opacity(0.15)
+
+                    HStack(spacing: 0) {
+                        Rectangle()
+                            .fill(Color.cyan)
+                            .frame(width: availableWidth * usage.cachedFraction)
+                        Rectangle()
+                            .fill(Color.purple)
+                            .frame(width: availableWidth * usage.nonCachedFraction)
+                        Rectangle()
+                            .fill(Color.orange)
+                            .frame(width: availableWidth * usage.outputFraction)
+                    }
+                }
+                .clipShape(Capsule())
+            } else {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.15))
+            }
+        }
+        .frame(height: 7)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Token 构成")
+        .accessibilityValue(compositionAccessibilityValue)
+    }
+
+    private var compositionAccessibilityValue: String {
+        "缓存 \(TokenCountFormatter.compact(usage.cachedInputTokens))，非缓存 \(TokenCountFormatter.compact(usage.nonCachedInputTokens))，输出 \(TokenCountFormatter.compact(usage.outputTokens))"
+    }
+}
+
+struct TokenMetric: View {
+    let label: String
+    let value: Int64
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(TokenCountFormatter.compact(value))
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(TokenCountFormatter.compact(value))
+    }
 }
 
 struct PanelGlassBackground: View {
