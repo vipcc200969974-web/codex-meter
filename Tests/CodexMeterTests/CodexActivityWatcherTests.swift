@@ -171,6 +171,10 @@ final class CodexActivityWatcherTests: XCTestCase {
         XCTAssertEqual(Darwin.rename(replacement.path, file.path), 0)
         wait(for: [replaced], timeout: 3)
 
+        // The first barrier lets the active event handler return; the second
+        // drains the automatic recovery it enqueues after `onChange`.
+        watcher.waitUntilIdleForTesting()
+        watcher.waitUntilIdleForTesting()
         watcher.rebind()
         watcher.waitUntilIdleForTesting()
         changes.setNext(appended)

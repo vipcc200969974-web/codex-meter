@@ -132,10 +132,7 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
 
             let pathBindingChanged = !event.intersection([.rename, .delete, .revoke]).isEmpty
             if pathBindingChanged || (isDirectory && event.contains(.write)) {
-                self.queue.async { [weak self] in
-                    guard let self, self.isRunning else { return }
-                    self.bindAll()
-                }
+                self.rebind()
             }
         }
         source.setCancelHandler {
