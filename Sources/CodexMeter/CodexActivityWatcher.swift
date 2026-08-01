@@ -23,12 +23,15 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
     private let paths: CodexActivityPaths
     private var calendar: Calendar
     private let queue = DispatchQueue(label: "com.codexmeter.activity-watcher", qos: .utility)
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let now: () -> Date
     private let onChange: () -> Void
     private var sources: [DispatchSourceFileSystemObject] = []
     private var descriptors: [Int32] = []
     private var isRunning = false
 
+    /// Creates a watcher whose `onChange` callback runs synchronously on the
+    /// watcher's private serial queue. Lifecycle methods are callback-safe.
     init(
         paths: CodexActivityPaths = .live,
         calendar: Calendar = .autoupdatingCurrent,
@@ -39,10 +42,12 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
         self.calendar = calendar
         self.now = now
         self.onChange = onChange
+        queue.setSpecific(key: queueKey, value: 1)
     }
 
+    /// Performs the initial binding before returning.
     func start() {
-        queue.sync {
+        synchronouslyOnQueue {
             isRunning = true
             bindAll()
         }
@@ -56,7 +61,7 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
     }
 
     func stop() {
-        queue.sync {
+        synchronouslyOnQueue {
             isRunning = false
             tearDown()
         }
@@ -139,6 +144,14 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
     private func directoryExists(at url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private func synchronouslyOnQueue(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            operation()
+        } else {
+            queue.sync(execute: operation)
+        }
     }
 
     private func tearDown() {
