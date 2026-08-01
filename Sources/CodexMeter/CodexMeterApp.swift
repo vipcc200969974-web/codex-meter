@@ -905,23 +905,54 @@ struct CompositeQuotaProvider: Sendable {
         }
         let selected = QuotaWindowKind.allCases.compactMap { kind -> ObservedRateLimitWindow? in
             let forKind = supported.filter { $0.window.kind == kind }
-            guard let newest = forKind.max(by: { $0.observedAt < $1.observedAt }) else { return nil }
+            guard let newest = forKind.max(by: observationPrecedes) else { return nil }
             return forKind
                 .filter { $0.window.resetsAt == newest.window.resetsAt }
                 .max {
                     if $0.window.usedPercent == $1.window.usedPercent {
-                        return $0.observedAt < $1.observedAt
+                        return observationPrecedes($0, $1)
                     }
                     return $0.window.usedPercent < $1.window.usedPercent
                 }
         }
-        guard let newest = selected.max(by: { $0.observedAt < $1.observedAt }) else { return nil }
+        guard let newest = selected.max(by: observationPrecedes) else { return nil }
         let sourceNames = Set(selected.map(\.sourceName))
         return QuotaObservation(
             windowSet: RateLimitWindowSet(windows: selected.map(\.window), now: now),
             observedAt: newest.observedAt,
             sourceName: sourceNames.count == 1 ? newest.sourceName : "本机日志"
         )
+    }
+
+    private static func observationPrecedes(
+        _ lhs: ObservedRateLimitWindow,
+        _ rhs: ObservedRateLimitWindow
+    ) -> Bool {
+        // Total preference: observation time, reset epoch, explicit source priority, then source name.
+        if lhs.observedAt != rhs.observedAt {
+            return lhs.observedAt < rhs.observedAt
+        }
+        if lhs.window.resetsAt != rhs.window.resetsAt {
+            return lhs.window.resetsAt < rhs.window.resetsAt
+        }
+
+        let lhsPriority = sourcePriority(lhs.sourceName)
+        let rhsPriority = sourcePriority(rhs.sourceName)
+        if lhsPriority != rhsPriority {
+            return lhsPriority < rhsPriority
+        }
+        return lhs.sourceName < rhs.sourceName
+    }
+
+    private static func sourcePriority(_ sourceName: String) -> Int {
+        switch sourceName {
+        case "Codex 日志":
+            return 2
+        case "Codex 会话":
+            return 1
+        default:
+            return 0
+        }
     }
 }
 
@@ -1179,7 +1210,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         let selected = bestRateLimitWindows(from: records, now: now)
         let windowSet = RateLimitWindowSet(windows: selected.map(\.window), now: now)
         guard !windowSet.isEmpty,
-              let newest = selected.max(by: { $0.record.sortDate < $1.record.sortDate }) else {
+              let newest = selected.max(by: sessionSelectionPrecedes) else {
             return nil
         }
 
@@ -1209,28 +1240,38 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         let weeklyCandidates = active.compactMap { record in
             record.windowSet.weekly.map { (record: record, window: $0) }
         }
-        let latestWeekly = weeklyCandidates.max {
-            $0.record.sortDate < $1.record.sortDate
-        }
+        let latestWeekly = weeklyCandidates.max(by: sessionSelectionPrecedes)
 
         let fiveHourCandidates = active.compactMap { record in
             record.windowSet.fiveHour.map { (record: record, window: $0) }
         }
-        let latestFiveHour = fiveHourCandidates.max {
-            $0.record.sortDate < $1.record.sortDate
-        }
+        let latestFiveHour = fiveHourCandidates.max(by: sessionSelectionPrecedes)
         let bestFiveHour = latestFiveHour.flatMap { latest in
             fiveHourCandidates
                 .filter { $0.window.resetsAt == latest.window.resetsAt }
                 .max { lhs, rhs in
                     if lhs.window.usedPercent == rhs.window.usedPercent {
-                        return lhs.record.sortDate < rhs.record.sortDate
+                        return sessionSelectionPrecedes(lhs, rhs)
                     }
                     return lhs.window.usedPercent < rhs.window.usedPercent
                 }
         }
 
         return [bestFiveHour, latestWeekly].compactMap { $0 }
+    }
+
+    private static func sessionSelectionPrecedes(
+        _ lhs: (record: RateLimitRecord, window: RateLimitWindow),
+        _ rhs: (record: RateLimitRecord, window: RateLimitWindow)
+    ) -> Bool {
+        // Session candidates share a source; usage is the stable final tie-break inside one reset window.
+        if lhs.record.sortDate != rhs.record.sortDate {
+            return lhs.record.sortDate < rhs.record.sortDate
+        }
+        if lhs.window.resetsAt != rhs.window.resetsAt {
+            return lhs.window.resetsAt < rhs.window.resetsAt
+        }
+        return lhs.window.usedPercent < rhs.window.usedPercent
     }
 
     private func readTailText(from url: URL, maxBytes: UInt64 = 4 * 1024 * 1024) -> String? {

@@ -53,4 +53,73 @@ final class QuotaObservationSelectionTests: XCTestCase {
 
         XCTAssertEqual(QuotaSnapshot(observation: observation).lastUpdated, observedAt)
     }
+
+    func testEqualTimestampChoosesLaterResetEpochRegardlessOfInputOrder() throws {
+        let observedAt = Date(timeIntervalSince1970: 1_200)
+        let earlierReset = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 80, resetsAt: 1_500, windowMinutes: 300),
+            observedAt: observedAt,
+            sourceName: "Codex 日志"
+        )
+        let laterReset = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 5, resetsAt: 2_000, windowMinutes: 300),
+            observedAt: observedAt,
+            sourceName: "Codex 会话"
+        )
+
+        for candidates in [[earlierReset, laterReset], [laterReset, earlierReset]] {
+            let result = try XCTUnwrap(CompositeQuotaProvider.merge(candidates, now: now))
+
+            XCTAssertEqual(result.windowSet.fiveHour?.resetsAt, 2_000)
+            XCTAssertEqual(result.windowSet.fiveHour?.usedPercent, 5)
+        }
+    }
+
+    func testEqualTimestampAndResetUsesStableSourcePriorityRegardlessOfInputOrder() throws {
+        let observedAt = Date(timeIntervalSince1970: 1_200)
+        let session = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 20, resetsAt: 2_000, windowMinutes: 300),
+            observedAt: observedAt,
+            sourceName: "Codex 会话"
+        )
+        let log = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 20, resetsAt: 2_000, windowMinutes: 300),
+            observedAt: observedAt,
+            sourceName: "Codex 日志"
+        )
+
+        for candidates in [[session, log], [log, session]] {
+            let result = try XCTUnwrap(CompositeQuotaProvider.merge(candidates, now: now))
+
+            XCTAssertEqual(result.sourceName, "Codex 日志")
+        }
+    }
+
+    func testSessionEqualTimestampChoosesLaterResetEpoch() throws {
+        let observedAt = Date(timeIntervalSince1970: 1_200)
+        let earlierReset = RateLimitRecord(
+            timestamp: observedAt,
+            fileModifiedAt: observedAt,
+            windowSet: RateLimitWindowSet(windows: [
+                RateLimitWindow(usedPercent: 80, resetsAt: 1_500, windowMinutes: 300)
+            ], now: now)
+        )
+        let laterReset = RateLimitRecord(
+            timestamp: observedAt,
+            fileModifiedAt: observedAt,
+            windowSet: RateLimitWindowSet(windows: [
+                RateLimitWindow(usedPercent: 5, resetsAt: 2_000, windowMinutes: 300)
+            ], now: now)
+        )
+
+        for records in [[earlierReset, laterReset], [laterReset, earlierReset]] {
+            let result = try XCTUnwrap(CodexSessionQuotaProvider.bestRateLimitRecord(
+                from: records,
+                now: now
+            ))
+
+            XCTAssertEqual(result.windowSet.fiveHour?.resetsAt, 2_000)
+            XCTAssertEqual(result.windowSet.fiveHour?.usedPercent, 5)
+        }
+    }
 }
