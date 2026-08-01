@@ -54,7 +54,35 @@ protocol DailyTokenEventDecoding {
     func decodeTokenEvent(from data: Data) -> DailyTokenEvent?
 }
 
+protocol DailyTokenTimestampParsing: AnyObject, Sendable {
+    func parse(_ value: String) -> Date?
+}
+
+final class CachedDailyTokenTimestampParser: DailyTokenTimestampParsing, @unchecked Sendable {
+    static let shared = CachedDailyTokenTimestampParser()
+
+    private let lock = NSLock()
+    private let fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private let wholeSeconds = ISO8601DateFormatter()
+
+    func parse(_ value: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return fractional.date(from: value) ?? wholeSeconds.date(from: value)
+    }
+}
+
 struct JSONDailyTokenEventDecoder: DailyTokenEventDecoding, Sendable {
+    let timestampParser: any DailyTokenTimestampParsing
+
+    init(timestampParser: any DailyTokenTimestampParsing = CachedDailyTokenTimestampParser.shared) {
+        self.timestampParser = timestampParser
+    }
+
     private struct Envelope: Decodable {
         let timestamp: String
         let payload: Payload
@@ -121,7 +149,7 @@ struct JSONDailyTokenEventDecoder: DailyTokenEventDecoding, Sendable {
               envelope.payload.type == "token_count",
               let last = envelope.payload.info?.lastTokenUsage,
               last.totalTokens > 0,
-              let timestamp = DailyTokenTimestampParser.parse(envelope.timestamp) else {
+              let timestamp = timestampParser.parse(envelope.timestamp) else {
             return nil
         }
 
@@ -136,30 +164,6 @@ struct JSONDailyTokenEventDecoder: DailyTokenEventDecoding, Sendable {
                 latestEventAt: timestamp
             )
         )
-    }
-}
-
-private enum DailyTokenTimestampParser {
-    private final class FormatterCache: @unchecked Sendable {
-        private let lock = NSLock()
-        private let fractional: ISO8601DateFormatter = {
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            return formatter
-        }()
-        private let wholeSeconds = ISO8601DateFormatter()
-
-        func parse(_ value: String) -> Date? {
-            lock.lock()
-            defer { lock.unlock() }
-            return fractional.date(from: value) ?? wholeSeconds.date(from: value)
-        }
-    }
-
-    private static let formatters = FormatterCache()
-
-    static func parse(_ value: String) -> Date? {
-        formatters.parse(value)
     }
 }
 
@@ -194,21 +198,11 @@ enum DailyTokenLogParser {
         decoder: any DailyTokenEventDecoding
     ) -> [DailyTokenEvent] {
         var events: [DailyTokenEvent] = []
-        var searchStart = data.startIndex
-
-        while searchStart < data.endIndex,
-              let match = DailyTokenLineDiscriminator.firstMatch(
-                in: data,
-                range: searchStart..<data.endIndex
-              ),
-              let lineEnd = data[match.upperBound...].firstIndex(of: 0x0A) {
-            let lineStart = data[..<match.lowerBound].lastIndex(of: 0x0A)
-                .map { data.index(after: $0) } ?? data.startIndex
-            let line = data.subdata(in: lineStart..<lineEnd)
+        for lineRange in DailyTokenLineDiscriminator.completeCandidateLineRanges(in: data) {
+            let line = data.subdata(in: lineRange)
             if let event = decodeCandidate(data: line, inside: interval, decoder: decoder) {
                 events.append(event)
             }
-            searchStart = data.index(after: lineEnd)
         }
 
         return events
@@ -238,14 +232,31 @@ enum DailyTokenLogParser {
 }
 
 private enum DailyTokenLineDiscriminator {
-    private static let compactTokenCountType = Data(#""type":"token_count""#.utf8)
+    private static let rawTokenCount = Data("token_count".utf8)
+    private static let unicodeEscape = Data(#"\u"#.utf8)
 
     static func isTokenCount(_ data: Data) -> Bool {
-        firstMatch(in: data, range: data.startIndex..<data.endIndex) != nil
+        data.range(of: rawTokenCount) != nil || data.range(of: unicodeEscape) != nil
     }
 
-    static func firstMatch(in data: Data, range: Range<Data.Index>) -> Range<Data.Index>? {
-        data.range(of: compactTokenCountType, options: [], in: range)
+    static func completeCandidateLineRanges(in data: Data) -> [Range<Data.Index>] {
+        var lineRanges = Set<Range<Data.Index>>()
+        for needle in [rawTokenCount, unicodeEscape] {
+            var searchStart = data.startIndex
+            while searchStart < data.endIndex,
+                  let match = data.range(
+                    of: needle,
+                    options: [],
+                    in: searchStart..<data.endIndex
+                  ),
+                  let lineEnd = data[match.upperBound...].firstIndex(of: 0x0A) {
+                let lineStart = data[..<match.lowerBound].lastIndex(of: 0x0A)
+                    .map { data.index(after: $0) } ?? data.startIndex
+                lineRanges.insert(lineStart..<lineEnd)
+                searchStart = data.index(after: lineEnd)
+            }
+        }
+        return lineRanges.sorted { $0.lowerBound < $1.lowerBound }
     }
 }
 
@@ -266,11 +277,6 @@ protocol DailyTokenUsageProviding: AnyObject, Sendable {
 }
 
 final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
-    enum DiscoveryLayout {
-        case recursive
-        case codexDefault
-    }
-
     private enum DiscoveryError: Error {
         case rootIsNotDirectory(URL)
         case cannotEnumerateRoot(URL)
@@ -308,7 +314,6 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
     }
 
     private let roots: [URL]
-    private let discoveryLayout: DiscoveryLayout
     private var calendar: Calendar
     private let fileManager: FileManager
     private var dayInterval: DateInterval?
@@ -317,15 +322,13 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
     init(
         roots: [URL]? = nil,
         calendar: Calendar = .autoupdatingCurrent,
-        fileManager: FileManager = .default,
-        discoveryLayout: DiscoveryLayout? = nil
+        fileManager: FileManager = .default
     ) {
         let defaultRoots = [
             fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
             fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
         ]
         self.roots = roots ?? defaultRoots
-        self.discoveryLayout = discoveryLayout ?? (roots == nil ? .codexDefault : .recursive)
         self.calendar = calendar
         self.fileManager = fileManager
     }
@@ -353,50 +356,14 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
 
     private func discoverCandidateFiles(since start: Date) throws -> [URL] {
         var candidates: [Candidate] = []
-        switch discoveryLayout {
-        case .recursive:
-            for root in roots {
-                try appendRecursiveCandidates(from: root, since: start, to: &candidates)
-            }
-        case .codexDefault:
-            try appendDefaultLayoutCandidates(since: start, to: &candidates)
+        for root in roots {
+            try appendRecursiveCandidates(from: root, since: start, to: &candidates)
         }
 
         candidates.sort { $0.modifiedAt > $1.modifiedAt }
         var seen = Set<String>()
         return candidates.compactMap { candidate in
             seen.insert(candidate.url.lastPathComponent).inserted ? candidate.url : nil
-        }
-    }
-
-    private func appendDefaultLayoutCandidates(
-        since start: Date,
-        to candidates: inout [Candidate]
-    ) throws {
-        guard !roots.isEmpty else { return }
-        let previousStart = calendar.date(byAdding: .day, value: -1, to: start)!
-        let relevantDates = [start, previousStart]
-
-        let sessionsRoot = roots[0]
-        if try directoryExists(at: sessionsRoot) {
-            for date in relevantDates {
-                let directory = sessionsRoot.appendingPathComponent(dayPath(for: date))
-                try appendRecursiveCandidates(from: directory, since: start, to: &candidates)
-            }
-        }
-
-        guard roots.count > 1 else { return }
-        let archivedRoot = roots[1]
-        guard try directoryExists(at: archivedRoot) else { return }
-        let relevantPrefixes = relevantDates.map { "rollout-\(dayStamp(for: $0))" }
-        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey]
-        let urls = try fileManager.contentsOfDirectory(
-            at: archivedRoot,
-            includingPropertiesForKeys: keys,
-            options: []
-        )
-        for url in urls where relevantPrefixes.contains(where: url.lastPathComponent.hasPrefix) {
-            try appendCandidate(url, since: start, keys: keys, to: &candidates)
         }
     }
 
@@ -460,16 +427,6 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             throw DiscoveryError.rootIsNotDirectory(url)
         }
         return true
-    }
-
-    private func dayPath(for date: Date) -> String {
-        let components = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d/%02d/%02d", components.year!, components.month!, components.day!)
-    }
-
-    private func dayStamp(for date: Date) -> String {
-        let components = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", components.year!, components.month!, components.day!)
     }
 
     private func updateCursor(for url: URL, interval: DateInterval) throws -> CursorKey {

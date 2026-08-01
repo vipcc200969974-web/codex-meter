@@ -57,6 +57,20 @@ private final class CountingDailyTokenEventDecoder: DailyTokenEventDecoding {
     }
 }
 
+private final class RecordingDailyTokenTimestampParser: DailyTokenTimestampParsing, @unchecked Sendable {
+    private let result: Date
+    private(set) var parsedValues: [String] = []
+
+    init(result: Date) {
+        self.result = result
+    }
+
+    func parse(_ value: String) -> Date? {
+        parsedValues.append(value)
+        return result
+    }
+}
+
 final class DailyTokenUsageTests: XCTestCase {
     private var calendar: Calendar {
         var calendar = Calendar(identifier: .gregorian)
@@ -76,6 +90,48 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(event.usage.nonCachedInputTokens, 200)
         XCTAssertEqual(event.usage.outputTokens, 100)
         XCTAssertEqual(event.usage.reasoningOutputTokens, 20)
+    }
+
+    func testParsesTokenCountWithValidJSONWhitespace() throws {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type" : "token_count","info":{"last_token_usage":{"total_tokens":10}}}}"#
+
+        let event = try XCTUnwrap(DailyTokenLogParser.parse(line: line, inside: interval))
+
+        XCTAssertEqual(event.usage.totalTokens, 10)
+    }
+
+    func testParsesUnicodeEscapedTokenCountType() throws {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_\u0063ount","info":{"last_token_usage":{"total_tokens":20}}}}"#
+
+        let event = try XCTUnwrap(DailyTokenLogParser.parse(line: line, inside: interval))
+
+        XCTAssertEqual(event.usage.totalTokens, 20)
+    }
+
+    func testJSONTokenDecodersReuseSharedTimestampParserIdentity() {
+        let first = JSONDailyTokenEventDecoder()
+        let second = JSONDailyTokenEventDecoder()
+
+        XCTAssertEqual(
+            ObjectIdentifier(first.timestampParser as AnyObject),
+            ObjectIdentifier(second.timestampParser as AnyObject)
+        )
+    }
+
+    func testJSONTokenDecoderUsesInjectedTimestampParser() throws {
+        let expectedDate = Date(timeIntervalSince1970: 123)
+        let timestampParser = RecordingDailyTokenTimestampParser(result: expectedDate)
+        let decoder = JSONDailyTokenEventDecoder(timestampParser: timestampParser)
+        let line = #"{"timestamp":"injected-date","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":20}}}}"#
+
+        let event = try XCTUnwrap(decoder.decodeTokenEvent(from: Data(line.utf8)))
+
+        XCTAssertEqual(event.timestamp, expectedDate)
+        XCTAssertEqual(timestampParser.parsedValues, ["injected-date"])
     }
 
     func testRejectsNonTokenEventAndEventOutsideToday() {
@@ -146,6 +202,46 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(decoder.decodeCount, 2)
         XCTAssertEqual(events.reduce(0) { $0 + $1.usage.totalTokens }, 24)
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+    }
+
+    func testBatchParserStructurallyRejectsPromptCandidatesAndKeepsPartialBoundary() {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let whitespaceToken = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type" : "token_count","info":{"last_token_usage":{"total_tokens":10}}}}"#
+        let escapedToken = #"{"timestamp":"2026-08-01T02:01:00Z","payload":{"type":"token_\u0063ount","info":{"last_token_usage":{"total_tokens":20}}}}"#
+        let literalPrompt = #"{"timestamp":"2026-08-01T02:02:00Z","payload":{"type":"message","content":"private prompt says token_count"}}"#
+        let escapedPrompt = #"{"timestamp":"2026-08-01T02:03:00Z","payload":{"type":"message","content":"private prompt says token_\u0063ount"}}"#
+        let partialToken = #"{"timestamp":"2026-08-01T02:04:00Z","payload":{"type":"token_\u0063ount","info":{"last_token_usage":{"total_tokens":40}}}}"#
+        let buffer = Data(
+            ([whitespaceToken, escapedToken, literalPrompt, escapedPrompt].joined(separator: "\n")
+                + "\n" + partialToken).utf8
+        )
+        let decoder = CountingDailyTokenEventDecoder()
+
+        let events = DailyTokenLogParser.parseCompleteLines(
+            in: buffer,
+            inside: interval,
+            decoder: decoder
+        )
+
+        XCTAssertEqual(events.map(\.usage.totalTokens), [10, 20])
+        XCTAssertEqual(decoder.decodeCount, 4)
+    }
+
+    func testBatchSemanticCandidateScanStaysLinearAtScale() {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let privateText = String(repeating: "unrelated private payload ", count: 400)
+        let unrelated = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"message","content":"\#(privateText)"}}"#
+        let token = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":1}}}}"#
+        let group = token + "\n" + unrelated + "\n"
+        let buffer = Data(String(repeating: group, count: 500).utf8)
+        let startedAt = Date()
+
+        let events = DailyTokenLogParser.parseCompleteLines(in: buffer, inside: interval)
+
+        XCTAssertEqual(events.count, 500)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.25)
     }
 
     func testRejectsTokenEventAtIntervalEnd() {
@@ -466,7 +562,7 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
     }
 
-    func testDefaultLayoutIncludesPreviousLocalDayCrossMidnightFiles() throws {
+    func testProviderIncludesPreviousLocalDayCrossMidnightFiles() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let sessions = base.appendingPathComponent("sessions")
         let archived = base.appendingPathComponent("archived_sessions")
@@ -488,15 +584,14 @@ final class DailyTokenUsageTests: XCTestCase {
         )
         let provider = DailyTokenUsageProvider(
             roots: [sessions, archived],
-            calendar: calendar,
-            discoveryLayout: .codexDefault
+            calendar: calendar
         )
         let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
 
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 300)
     }
 
-    func testDefaultLayoutExcludesPathsOlderThanPreviousLocalDay() throws {
+    func testProviderIncludesTodaysEventFromOlderStartedFiles() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let sessions = base.appendingPathComponent("sessions")
         let archived = base.appendingPathComponent("archived_sessions")
@@ -515,13 +610,22 @@ final class DailyTokenUsageTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
+        try (currentDayEvent + "\n").write(
+            to: olderSessions.appendingPathComponent("rollout-2026-07-30T23-00-session.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try (currentDayEvent + "\n").write(
+            to: archived.appendingPathComponent("rollout-2026-07-30T23-30-archive.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
         let provider = DailyTokenUsageProvider(
             roots: [sessions, archived],
-            calendar: calendar,
-            discoveryLayout: .codexDefault
+            calendar: calendar
         )
         let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
 
-        XCTAssertEqual(try provider.currentUsage(now: now), .zero)
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 200)
     }
 }
