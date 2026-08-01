@@ -33,6 +33,14 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertNil(DailyTokenLogParser.parse(line: yesterday, inside: interval))
     }
 
+    func testRejectsTokenEventAtIntervalEnd() {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let atTomorrowMidnight = #"{"timestamp":"2026-08-01T16:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":10}}}}"#
+
+        XCTAssertNil(DailyTokenLogParser.parse(line: atTomorrowMidnight, inside: interval))
+    }
+
     func testUsageAdditionDoesNotAddReasoningTwice() {
         let first = DailyTokenUsage(
             totalTokens: 1_100,
