@@ -106,16 +106,12 @@ final class CodexActivityWatcherTests: XCTestCase {
         wait(for: [changed], timeout: 3)
     }
 
-    func testRebindRecoversWhenCurrentDayDirectoryAppears() throws {
+    func testRebindRecoversWhenCodexRootAppears() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let sessionsRoot = root.appendingPathComponent("sessions")
         let archived = root.appendingPathComponent("archived_sessions")
-        try FileManager.default.createDirectory(at: sessionsRoot, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let dayAppeared = expectation(description: "missing day creation emitted change")
         let appended = expectation(description: "rebound session file emitted change")
-        let changes = ChangeRecorder(next: dayAppeared)
         let watcher = CodexActivityWatcher(
             paths: CodexActivityPaths(
                 codexRoot: root,
@@ -124,20 +120,19 @@ final class CodexActivityWatcherTests: XCTestCase {
             ),
             calendar: shanghaiCalendar(),
             now: { self.fixedNow },
-            onChange: { changes.record() }
+            onChange: { appended.fulfill() }
         )
         watcher.start()
         defer { watcher.stop() }
 
         let sessions = sessionsRoot.appendingPathComponent("2042/08/01")
         try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
         let file = sessions.appendingPathComponent("rollout-appeared.jsonl")
         try Data().write(to: file)
-        wait(for: [dayAppeared], timeout: 3)
 
         watcher.rebind()
-        watcher.start()
-        changes.setNext(appended)
+        watcher.waitUntilIdleForTesting()
         let handle = try FileHandle(forWritingTo: file)
         try handle.write(contentsOf: Data("{}\n".utf8))
         try handle.close()
@@ -177,8 +172,7 @@ final class CodexActivityWatcherTests: XCTestCase {
         wait(for: [replaced], timeout: 3)
 
         watcher.rebind()
-        watcher.stop()
-        watcher.start()
+        watcher.waitUntilIdleForTesting()
         changes.setNext(appended)
         let handle = try FileHandle(forWritingTo: file)
         try handle.write(contentsOf: Data("{}\n".utf8))

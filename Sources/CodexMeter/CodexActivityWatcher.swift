@@ -67,6 +67,11 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
         }
     }
 
+    /// Internal synchronization seam for deterministic filesystem watcher tests.
+    func waitUntilIdleForTesting() {
+        synchronouslyOnQueue {}
+    }
+
     private func bindAll() {
         tearDown()
 
