@@ -278,6 +278,7 @@ protocol DailyTokenUsageProviding: AnyObject, Sendable {
 
 protocol DailyTokenFileReading: Sendable {
     func read(from url: URL, offset: UInt64) throws -> Data
+    func readByte(from url: URL, offset: UInt64) throws -> UInt8?
 }
 
 struct FileHandleDailyTokenFileReader: DailyTokenFileReading {
@@ -287,6 +288,17 @@ struct FileHandleDailyTokenFileReader: DailyTokenFileReading {
         try handle.seek(toOffset: offset)
         return try handle.readToEnd() ?? Data()
     }
+
+    func readByte(from url: URL, offset: UInt64) throws -> UInt8? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        return try handle.read(upToCount: 1)?.first
+    }
+}
+
+enum DailyTokenUsageProviderError: Error, Equatable {
+    case aggregateOverflow
 }
 
 final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
@@ -317,6 +329,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         var partial = Data()
         var usage = DailyTokenUsage.zero
         var needsBoundaryValidation = false
+        var loadedFromCache = false
     }
 
     private enum CursorKey: Hashable {
@@ -390,7 +403,10 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             discoveredKeys.insert(try updateCursor(for: url, interval: interval))
         }
         cursors = cursors.filter { discoveredKeys.contains($0.key) }
-        let usage = cursors.values.reduce(.zero) { $0 + $1.usage }
+        var usage = DailyTokenUsage.zero
+        for cursor in cursors.values {
+            usage = try Self.adding(usage, cursor.usage)
+        }
         saveCache(for: interval)
         return usage
     }
@@ -432,7 +448,8 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
                 url: URL(fileURLWithPath: persisted.path),
                 offset: persisted.completeLineOffset,
                 usage: persisted.usage,
-                needsBoundaryValidation: true
+                needsBoundaryValidation: true,
+                loadedFromCache: true
             )
         }
         cursors = loaded
@@ -484,6 +501,30 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         }
         guard let latest = usage.latestEventAt else { return false }
         return latest >= interval.start && latest < interval.end
+    }
+
+    private static func adding(_ lhs: DailyTokenUsage, _ rhs: DailyTokenUsage) throws
+        -> DailyTokenUsage {
+        DailyTokenUsage(
+            totalTokens: try adding(lhs.totalTokens, rhs.totalTokens),
+            cachedInputTokens: try adding(lhs.cachedInputTokens, rhs.cachedInputTokens),
+            nonCachedInputTokens: try adding(
+                lhs.nonCachedInputTokens,
+                rhs.nonCachedInputTokens
+            ),
+            outputTokens: try adding(lhs.outputTokens, rhs.outputTokens),
+            reasoningOutputTokens: try adding(
+                lhs.reasoningOutputTokens,
+                rhs.reasoningOutputTokens
+            ),
+            latestEventAt: [lhs.latestEventAt, rhs.latestEventAt].compactMap { $0 }.max()
+        )
+    }
+
+    private static func adding(_ lhs: Int64, _ rhs: Int64) throws -> Int64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        guard !overflow else { throw DailyTokenUsageProviderError.aggregateOverflow }
+        return sum
     }
 
     private func saveCache(for interval: DateInterval) {
@@ -622,9 +663,27 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             cursor.offset = 0
             cursor.partial = Data()
             cursor.usage = .zero
+            cursor.loadedFromCache = false
         }
         cursor.needsBoundaryValidation = false
 
+        do {
+            try refreshCursor(&cursor, from: url, fileSize: fileSize, interval: interval)
+        } catch DailyTokenUsageProviderError.aggregateOverflow where cursor.loadedFromCache {
+            cursor = FileCursor(url: url)
+            try refreshCursor(&cursor, from: url, fileSize: fileSize, interval: interval)
+        }
+        cursor.loadedFromCache = false
+        cursors[key] = cursor
+        return key
+    }
+
+    private func refreshCursor(
+        _ cursor: inout FileCursor,
+        from url: URL,
+        fileSize: UInt64,
+        interval: DateInterval
+    ) throws {
         let readStart = cursor.offset
         let newData: Data
         if fileSize == readStart, cursor.partial.isEmpty {
@@ -642,11 +701,9 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             cursor.partial = combined
         }
         for event in DailyTokenLogParser.parseCompleteLines(in: combined, inside: interval) {
-            cursor.usage = cursor.usage + event.usage
+            cursor.usage = try Self.adding(cursor.usage, event.usage)
         }
         cursor.offset = readStart + UInt64(newData.count)
-        cursors[key] = cursor
-        return key
     }
 
     private func isCompleteLineBoundary(
@@ -657,10 +714,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         guard offset > 0 else { return true }
         guard offset <= fileSize else { return false }
         do {
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
-            try handle.seek(toOffset: offset - 1)
-            return try handle.read(upToCount: 1) == Data([0x0A])
+            return try fileReader.readByte(from: url, offset: offset - 1) == 0x0A
         } catch {
             return false
         }

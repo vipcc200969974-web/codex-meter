@@ -46,6 +46,8 @@ private final class RootMetadataErrorFileManager: FileManager, @unchecked Sendab
 private final class RecordingDailyTokenFileReader: DailyTokenFileReading, @unchecked Sendable {
     private(set) var totalBytesRead = 0
     private(set) var offsets: [UInt64] = []
+    private(set) var boundaryBytesRead = 0
+    private(set) var boundaryByteOffsets: [UInt64] = []
 
     func read(from url: URL, offset: UInt64) throws -> Data {
         let handle = try FileHandle(forReadingFrom: url)
@@ -57,9 +59,21 @@ private final class RecordingDailyTokenFileReader: DailyTokenFileReading, @unche
         return data
     }
 
+    func readByte(from url: URL, offset: UInt64) throws -> UInt8? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        let data = try handle.read(upToCount: 1) ?? Data()
+        boundaryBytesRead += data.count
+        boundaryByteOffsets.append(offset)
+        return data.first
+    }
+
     func reset() {
         totalBytesRead = 0
         offsets = []
+        boundaryBytesRead = 0
+        boundaryByteOffsets = []
     }
 }
 
@@ -92,6 +106,13 @@ private final class BlockingCountingDailyTokenFileReader: DailyTokenFileReading,
         defer { try? handle.close() }
         try handle.seek(toOffset: offset)
         return try handle.readToEnd() ?? Data()
+    }
+
+    func readByte(from url: URL, offset: UInt64) throws -> UInt8? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        return try handle.read(upToCount: 1)?.first
     }
 
     func waitForReadCount(_ expected: Int, timeout: TimeInterval) -> Bool {
@@ -584,6 +605,8 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
         XCTAssertEqual(reader.totalBytesRead, 0)
         XCTAssertTrue(reader.offsets.isEmpty)
+        XCTAssertEqual(reader.boundaryBytesRead, 1)
+        XCTAssertEqual(reader.boundaryByteOffsets, [UInt64(Data((line + "\n").utf8).count - 1)])
     }
 
     func testRestartedProviderRereadsUnterminatedTailFromCompleteLineBoundary() throws {
@@ -632,6 +655,8 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
         XCTAssertEqual(reader.offsets, [UInt64(completePrefix.count)])
         XCTAssertEqual(reader.totalBytesRead, Data((partial + "\n").utf8).count)
+        XCTAssertEqual(reader.boundaryBytesRead, 1)
+        XCTAssertEqual(reader.boundaryByteOffsets, [UInt64(completePrefix.count - 1)])
     }
 
     func testRestartedProviderReadsOnlyBytesAppendedAfterCachedBoundary() throws {
@@ -671,9 +696,92 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
         XCTAssertEqual(reader.offsets, [UInt64(firstData.count)])
         XCTAssertEqual(reader.totalBytesRead, appendedData.count)
+        XCTAssertEqual(reader.boundaryBytesRead, 1)
+        XCTAssertEqual(reader.boundaryByteOffsets, [UInt64(firstData.count - 1)])
         reader.reset()
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
         XCTAssertEqual(reader.totalBytesRead, 0)
+        XCTAssertEqual(reader.boundaryBytesRead, 0)
+    }
+
+    func testRestartedProviderRebuildsNearLimitCachedCursorWhenValidAppendWouldOverflow() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-near-limit-cache.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let appended = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        let firstData = Data((first + "\n").utf8)
+        let appendedData = Data((appended + "\n").utf8)
+        try firstData.write(to: file)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        try mutateJSONCache(at: cache) { object in
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            var usage = try XCTUnwrap(cursors[0]["usage"] as? [String: Any])
+            usage["totalTokens"] = Int64.max - 100
+            cursors[0]["usage"] = usage
+            object["cursors"] = cursors
+        }
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: appendedData)
+        try handle.close()
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(reader.offsets, [UInt64(firstData.count), 0])
+        XCTAssertEqual(reader.totalBytesRead, appendedData.count + firstData.count + appendedData.count)
+        XCTAssertEqual(reader.boundaryBytesRead, 1)
+        XCTAssertEqual(reader.boundaryByteOffsets, [UInt64(firstData.count - 1)])
+    }
+
+    func testProviderThrowsInsteadOfTrappingWhenOneFileAggregateOverflows() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":9223372036854775806}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":2}}}}"#
+        try (first + "\n" + second + "\n").write(
+            to: root.appendingPathComponent("rollout-file-overflow.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertThrowsError(try provider.currentUsage(now: now)) { error in
+            XCTAssertEqual(error as? DailyTokenUsageProviderError, .aggregateOverflow)
+        }
+    }
+
+    func testProviderThrowsInsteadOfTrappingWhenPostUpdateCrossFileAggregateOverflows() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":4611686018427387904}}}}"#
+        for name in ["a", "b"] {
+            try (line + "\n").write(
+                to: root.appendingPathComponent("rollout-cross-file-overflow-\(name).jsonl"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertThrowsError(try provider.currentUsage(now: now)) { error in
+            XCTAssertEqual(error as? DailyTokenUsageProviderError, .aggregateOverflow)
+        }
     }
 
     func testSerializedCacheDoesNotContainPrivateSourceSentinel() throws {
@@ -1023,6 +1131,8 @@ final class DailyTokenUsageTests: XCTestCase {
 
         XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
         XCTAssertEqual(reader.offsets, [0])
+        XCTAssertEqual(reader.boundaryBytesRead, 1)
+        XCTAssertEqual(reader.boundaryByteOffsets, [UInt64(midLineOffset - 1)])
     }
 
     func testRestartedProviderRebuildsWhenCachedPathHasNewFilesystemIdentity() throws {
