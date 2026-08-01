@@ -1361,21 +1361,22 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
     }
 
     func currentWindowObservations() -> [ObservedRateLimitWindow] {
-        guard let record = newestHeaderRateLimitRecord() else { return [] }
-        return [record.windowSet.fiveHour, record.windowSet.weekly]
-            .compactMap { $0 }
-            .map {
-                ObservedRateLimitWindow(
-                    window: $0,
-                    observedAt: record.sortDate,
-                    sourceName: "Codex 日志"
-                )
-            }
+        let now = Date()
+        return RateLimitWindowReducer.bestWindows(
+            from: recentHeaderRateLimitRecords(now: now),
+            now: now
+        ).map {
+            ObservedRateLimitWindow(
+                window: $0.window,
+                observedAt: $0.record.sortDate,
+                sourceName: "Codex 日志"
+            )
+        }
     }
 
-    private func newestHeaderRateLimitRecord() -> RateLimitRecord? {
+    private func recentHeaderRateLimitRecords(now: Date) -> [RateLimitRecord] {
         guard FileManager.default.fileExists(atPath: databaseURL.path) else {
-            return nil
+            return []
         }
 
         let query = """
@@ -1386,20 +1387,16 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
         limit 40;
         """
         guard let rows = runSQLiteRows(databasePath: databaseURL.path, query: query) else {
-            return nil
+            return []
         }
 
-        let now = Date()
-        for row in rows {
-            if let record = Self.parseHeaderRecord(
+        return rows.compactMap { row in
+            Self.parseHeaderRecord(
                 timestamp: row.ts,
                 text: row.feedbackLogBody,
                 now: now
-            ) {
-                return record
-            }
+            )
         }
-        return nil
     }
 
     static func parseHeaderRecord(
@@ -1490,9 +1487,26 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
 }
 
 struct CodexSessionQuotaProvider: QuotaObservationProviding {
+    private let roots: [URL]
+    private let now: @Sendable () -> Date
+
+    init(
+        roots: [URL]? = nil,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.roots = roots ?? [
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
+        ]
+        self.now = now
+    }
+
     func currentWindowObservations() -> [ObservedRateLimitWindow] {
-        let now = Date()
-        return Self.bestRateLimitWindows(from: recentRateLimitRecords(), now: now).map {
+        let currentDate = now()
+        return RateLimitWindowReducer.bestWindows(
+            from: recentRateLimitRecords(now: currentDate),
+            now: currentDate
+        ).map {
             ObservedRateLimitWindow(
                 window: $0.window,
                 observedAt: $0.record.sortDate,
@@ -1501,21 +1515,20 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         }
     }
 
-    private func recentRateLimitRecords() -> [RateLimitRecord] {
-        let roots = [
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
-        ]
-
+    private func recentRateLimitRecords(now: Date) -> [RateLimitRecord] {
         let files = roots.flatMap { recentJSONLFiles(under: $0) }
             .sorted { $0.modifiedAt > $1.modifiedAt }
             .prefix(80)
 
         var records: [RateLimitRecord] = []
         for file in files {
-            records.append(contentsOf: rateLimitRecords(in: file.url, fileModifiedAt: file.modifiedAt))
+            records.append(contentsOf: rateLimitRecords(
+                in: file.url,
+                fileModifiedAt: file.modifiedAt,
+                now: now
+            ))
             if let newestRecord = records.map(\.sortDate).max(),
-               Date().timeIntervalSince(newestRecord) < 15 * 60,
+               now.timeIntervalSince(newestRecord) < 15 * 60,
                file.modifiedAt < newestRecord.addingTimeInterval(-15 * 60) {
                 break
             }
@@ -1546,12 +1559,11 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         return files
     }
 
-    private func rateLimitRecords(in url: URL, fileModifiedAt: Date) -> [RateLimitRecord] {
+    private func rateLimitRecords(in url: URL, fileModifiedAt: Date, now: Date) -> [RateLimitRecord] {
         guard let text = readTailText(from: url) else {
             return []
         }
 
-        let now = Date()
         var records: [RateLimitRecord] = []
         for line in text.split(separator: "\n").reversed() {
             guard line.contains("\"rate_limits\"") else { continue }
@@ -1601,10 +1613,10 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         from records: [RateLimitRecord],
         now: Date
     ) -> RateLimitRecord? {
-        let selected = bestRateLimitWindows(from: records, now: now)
+        let selected = RateLimitWindowReducer.bestWindows(from: records, now: now)
         let windowSet = RateLimitWindowSet(windows: selected.map(\.window), now: now)
         guard !windowSet.isEmpty,
-              let newest = selected.max(by: sessionSelectionPrecedes) else {
+              let newest = selected.max(by: RateLimitWindowReducer.selectionPrecedes) else {
             return nil
         }
 
@@ -1613,59 +1625,6 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             fileModifiedAt: newest.record.fileModifiedAt,
             windowSet: windowSet
         )
-    }
-
-    private static func bestRateLimitWindows(
-        from records: [RateLimitRecord],
-        now: Date
-    ) -> [(record: RateLimitRecord, window: RateLimitWindow)] {
-        let active = records.compactMap { record -> RateLimitRecord? in
-            let windows = [record.windowSet.fiveHour, record.windowSet.weekly].compactMap { $0 }
-            let windowSet = RateLimitWindowSet(windows: windows, now: now)
-            guard !windowSet.isEmpty else { return nil }
-            return RateLimitRecord(
-                timestamp: record.timestamp,
-                fileModifiedAt: record.fileModifiedAt,
-                windowSet: windowSet
-            )
-        }
-        guard !active.isEmpty else { return [] }
-
-        let weeklyCandidates = active.compactMap { record in
-            record.windowSet.weekly.map { (record: record, window: $0) }
-        }
-        let latestWeekly = weeklyCandidates.max(by: sessionSelectionPrecedes)
-
-        let fiveHourCandidates = active.compactMap { record in
-            record.windowSet.fiveHour.map { (record: record, window: $0) }
-        }
-        let latestFiveHour = fiveHourCandidates.max(by: sessionSelectionPrecedes)
-        let bestFiveHour = latestFiveHour.flatMap { latest in
-            fiveHourCandidates
-                .filter { $0.window.resetsAt == latest.window.resetsAt }
-                .max { lhs, rhs in
-                    if lhs.window.usedPercent == rhs.window.usedPercent {
-                        return sessionSelectionPrecedes(lhs, rhs)
-                    }
-                    return lhs.window.usedPercent < rhs.window.usedPercent
-                }
-        }
-
-        return [bestFiveHour, latestWeekly].compactMap { $0 }
-    }
-
-    private static func sessionSelectionPrecedes(
-        _ lhs: (record: RateLimitRecord, window: RateLimitWindow),
-        _ rhs: (record: RateLimitRecord, window: RateLimitWindow)
-    ) -> Bool {
-        // Session candidates share a source; usage is the stable final tie-break inside one reset window.
-        if lhs.record.sortDate != rhs.record.sortDate {
-            return lhs.record.sortDate < rhs.record.sortDate
-        }
-        if lhs.window.resetsAt != rhs.window.resetsAt {
-            return lhs.window.resetsAt < rhs.window.resetsAt
-        }
-        return lhs.window.usedPercent < rhs.window.usedPercent
     }
 
     private func readTailText(from url: URL, maxBytes: UInt64 = 4 * 1024 * 1024) -> String? {
@@ -1741,6 +1700,52 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             return Int(string)
         }
         return nil
+    }
+}
+
+private enum RateLimitWindowReducer {
+    typealias Candidate = (record: RateLimitRecord, window: RateLimitWindow)
+
+    static func bestWindows(
+        from records: [RateLimitRecord],
+        now: Date
+    ) -> [Candidate] {
+        let active = records.flatMap { record in
+            [record.windowSet.fiveHour, record.windowSet.weekly]
+                .compactMap { window in
+                    window.map { (record: record, window: $0) }
+                }
+        }.filter {
+            $0.window.kind != nil && $0.window.resetsAt > now.timeIntervalSince1970
+        }
+
+        return QuotaWindowKind.allCases.compactMap { kind in
+            let candidates = active.filter { $0.window.kind == kind }
+            guard let latest = candidates.max(by: selectionPrecedes) else { return nil }
+            let sameReset = candidates.filter { $0.window.resetsAt == latest.window.resetsAt }
+            guard let highestUsage = sameReset.max(by: usagePrecedes),
+                  let latestObservation = sameReset.max(by: selectionPrecedes) else {
+                return nil
+            }
+            return (record: latestObservation.record, window: highestUsage.window)
+        }
+    }
+
+    static func selectionPrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
+        if lhs.record.sortDate != rhs.record.sortDate {
+            return lhs.record.sortDate < rhs.record.sortDate
+        }
+        if lhs.window.resetsAt != rhs.window.resetsAt {
+            return lhs.window.resetsAt < rhs.window.resetsAt
+        }
+        return lhs.window.usedPercent < rhs.window.usedPercent
+    }
+
+    private static func usagePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
+        if lhs.window.usedPercent != rhs.window.usedPercent {
+            return lhs.window.usedPercent < rhs.window.usedPercent
+        }
+        return selectionPrecedes(lhs, rhs)
     }
 }
 

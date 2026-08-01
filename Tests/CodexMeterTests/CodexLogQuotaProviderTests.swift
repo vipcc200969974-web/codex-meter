@@ -63,6 +63,46 @@ final class CodexLogQuotaProviderTests: XCTestCase {
         XCTAssertEqual(snapshot?.remainingPercent, 65)
     }
 
+    func testScansBoundedSQLiteHistoryForHighestWeeklyUsageAndLatestObservation() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+
+        let reset = 4_102_444_800
+        let outOfBoundHeader = #"{"x-codex-primary-used-percent": "99", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
+        let boundaryHighHeader = #"{"x-codex-primary-used-percent": "61", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
+        let transientZeroHeader = #"{"x-codex-primary-used-percent": "0", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "4102444800"}"#
+        let boundedRows = [
+            "insert into logs (ts, ts_nanos, target, feedback_log_body) values (1999, 0, 'codex_http_client::client', '\(outOfBoundHeader)')",
+            "insert into logs (ts, ts_nanos, target, feedback_log_body) values (2000, 0, 'codex_http_client::client', '\(boundaryHighHeader)')"
+        ] + (2_001...2_039).map { timestamp in
+            "insert into logs (ts, ts_nanos, target, feedback_log_body) values (\(timestamp), 0, 'codex_http_client::client', '\(transientZeroHeader)')"
+        }
+        try runSQLite(
+            databaseURL: databaseURL,
+            query: """
+            create table logs (
+                id integer primary key autoincrement,
+                ts integer not null,
+                ts_nanos integer not null,
+                target text not null,
+                feedback_log_body text
+            );
+            \(boundedRows.joined(separator: ";"));
+            """
+        )
+
+        let weekly = try XCTUnwrap(
+            CodexLogQuotaProvider(databaseURL: databaseURL)
+                .currentWindowObservations()
+                .first { $0.window.kind == .weekly }
+        )
+
+        XCTAssertEqual(weekly.window.usedPercent, 61)
+        XCTAssertEqual(weekly.window.resetsAt, Double(reset))
+        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 2_039))
+    }
+
     private func runSQLite(databaseURL: URL, query: String) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
