@@ -816,6 +816,8 @@ private final class FoundationUsageScheduler: UsageScheduling {
     }
 }
 
+typealias UsageWatcherFactory = (_ onChange: @escaping () -> Void) -> any CodexActivityWatching
+
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var snapshot: UsageSnapshot
@@ -830,6 +832,7 @@ final class UsageStore: ObservableObject {
     private var refreshPending = false
     private var isStarted = false
     private var lifecycleGeneration: UInt = 0
+    private var debounceGeneration: UInt = 0
     private var speakAfterRefresh = false
     private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
     private let speechSynthesizer = AVSpeechSynthesizer()
@@ -842,6 +845,7 @@ final class UsageStore: ObservableObject {
     private let scheduler: any UsageScheduling
     private let calendar: Calendar
     private let now: @Sendable () -> Date
+    private let watcherFactory: UsageWatcherFactory
 
     init(
         loader: any UsageLoading = LocalUsageLoader(),
@@ -850,7 +854,10 @@ final class UsageStore: ObservableObject {
         fallbackInterval: TimeInterval = 60,
         scheduler: any UsageScheduling = FoundationUsageScheduler(),
         calendar: Calendar = .autoupdatingCurrent,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        watcherFactory: @escaping UsageWatcherFactory = {
+            CodexActivityWatcher(onChange: $0)
+        }
     ) {
         self.loader = loader
         self.watcher = watcher
@@ -860,6 +867,7 @@ final class UsageStore: ObservableObject {
         self.scheduler = scheduler
         self.calendar = calendar
         self.now = now
+        self.watcherFactory = watcherFactory
         let cachedQuota = QuotaSnapshot.cached() ?? .unavailable()
         self.snapshot = UsageSnapshot(
             quota: cachedQuota,
@@ -877,7 +885,7 @@ final class UsageStore: ObservableObject {
         let generation = lifecycleGeneration
 
         if watcher == nil {
-            watcher = CodexActivityWatcher { [weak self] in
+            watcher = watcherFactory { [weak self] in
                 DispatchQueue.main.async {
                     guard let self,
                           self.isStarted,
@@ -908,6 +916,7 @@ final class UsageStore: ObservableObject {
     func stop() {
         let wasStarted = isStarted
         lifecycleGeneration &+= 1
+        debounceGeneration &+= 1
         isStarted = false
         isRefreshing = false
         refreshPending = false
@@ -933,8 +942,12 @@ final class UsageStore: ObservableObject {
     func scheduleRefresh() {
         debounceTask?.cancel()
         let generation = lifecycleGeneration
+        debounceGeneration &+= 1
+        let scheduledDebounceGeneration = debounceGeneration
         debounceTask = scheduler.schedule(after: debounceInterval, repeating: nil) { [weak self] in
-            guard let self, self.lifecycleGeneration == generation else {
+            guard let self,
+                  self.lifecycleGeneration == generation,
+                  self.debounceGeneration == scheduledDebounceGeneration else {
                 return
             }
             self.debounceTask = nil
