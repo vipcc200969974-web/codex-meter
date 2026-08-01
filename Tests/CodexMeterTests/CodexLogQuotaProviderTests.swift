@@ -53,7 +53,11 @@ final class CodexLogQuotaProviderTests: XCTestCase {
             """
         )
 
-        let snapshot = CodexLogQuotaProvider(databaseURL: databaseURL).currentSnapshot()
+        let observation = CompositeQuotaProvider.merge(
+            CodexLogQuotaProvider(databaseURL: databaseURL).currentWindowObservations(),
+            now: now
+        )
+        let snapshot = observation.map(QuotaSnapshot.init(observation:))
 
         XCTAssertEqual(snapshot?.mainQuotaLabel, "7 天剩余")
         XCTAssertEqual(snapshot?.remainingPercent, 65)

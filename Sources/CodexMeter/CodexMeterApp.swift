@@ -724,9 +724,9 @@ final class QuotaStore: ObservableObject {
     private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var notifiedLevels = Set<Int>()
-    private let provider: QuotaProvider
+    private let provider: CompositeQuotaProvider
 
-    init(provider: QuotaProvider = CompositeQuotaProvider()) {
+    init(provider: CompositeQuotaProvider = CompositeQuotaProvider()) {
         self.provider = provider
         self.snapshot = QuotaSnapshot.unavailable()
         let savedInterval = UserDefaults.standard.integer(forKey: CacheKey.voiceBroadcastIntervalMinutes)
@@ -750,7 +750,7 @@ final class QuotaStore: ObservableObject {
         let provider = provider
 
         refreshQueue.async { [weak self] in
-            let liveSnapshot = provider.currentSnapshot()
+            let liveSnapshot = provider.currentObservation().map(QuotaSnapshot.init(observation:))
 
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -869,20 +869,63 @@ final class QuotaStore: ObservableObject {
     private static let allowedVoiceBroadcastIntervals = [1, 5, 10]
 }
 
-protocol QuotaProvider: Sendable {
-    func currentSnapshot() -> QuotaSnapshot?
+struct ObservedRateLimitWindow: Sendable {
+    let window: RateLimitWindow
+    let observedAt: Date
+    let sourceName: String
 }
 
-struct CompositeQuotaProvider: QuotaProvider {
-    private let logProvider = CodexLogQuotaProvider()
-    private let realProvider = CodexSessionQuotaProvider()
+struct QuotaObservation: Sendable {
+    let windowSet: RateLimitWindowSet
+    let observedAt: Date
+    let sourceName: String
+}
 
-    func currentSnapshot() -> QuotaSnapshot? {
-        logProvider.currentSnapshot() ?? realProvider.currentSnapshot()
+protocol QuotaObservationProviding: Sendable {
+    func currentWindowObservations() -> [ObservedRateLimitWindow]
+}
+
+struct CompositeQuotaProvider: Sendable {
+    private let providers: [any QuotaObservationProviding]
+
+    init(providers: [any QuotaObservationProviding] = [
+        CodexLogQuotaProvider(),
+        CodexSessionQuotaProvider()
+    ]) {
+        self.providers = providers
+    }
+
+    func currentObservation(now: Date = Date()) -> QuotaObservation? {
+        Self.merge(providers.flatMap { $0.currentWindowObservations() }, now: now)
+    }
+
+    static func merge(_ candidates: [ObservedRateLimitWindow], now: Date) -> QuotaObservation? {
+        let supported = candidates.filter {
+            $0.window.kind != nil && $0.window.resetsAt > now.timeIntervalSince1970
+        }
+        let selected = QuotaWindowKind.allCases.compactMap { kind -> ObservedRateLimitWindow? in
+            let forKind = supported.filter { $0.window.kind == kind }
+            guard let newest = forKind.max(by: { $0.observedAt < $1.observedAt }) else { return nil }
+            return forKind
+                .filter { $0.window.resetsAt == newest.window.resetsAt }
+                .max {
+                    if $0.window.usedPercent == $1.window.usedPercent {
+                        return $0.observedAt < $1.observedAt
+                    }
+                    return $0.window.usedPercent < $1.window.usedPercent
+                }
+        }
+        guard let newest = selected.max(by: { $0.observedAt < $1.observedAt }) else { return nil }
+        let sourceNames = Set(selected.map(\.sourceName))
+        return QuotaObservation(
+            windowSet: RateLimitWindowSet(windows: selected.map(\.window), now: now),
+            observedAt: newest.observedAt,
+            sourceName: sourceNames.count == 1 ? newest.sourceName : "本机日志"
+        )
     }
 }
 
-struct CodexLogQuotaProvider {
+struct CodexLogQuotaProvider: QuotaObservationProviding {
     private let databaseURL: URL
 
     init(
@@ -892,12 +935,17 @@ struct CodexLogQuotaProvider {
         self.databaseURL = databaseURL
     }
 
-    func currentSnapshot() -> QuotaSnapshot? {
-        guard let record = newestHeaderRateLimitRecord() else {
-            return nil
-        }
-
-        return QuotaSnapshot(record: record, sourceName: "Codex 日志", lastUpdated: Date())
+    func currentWindowObservations() -> [ObservedRateLimitWindow] {
+        guard let record = newestHeaderRateLimitRecord() else { return [] }
+        return [record.windowSet.fiveHour, record.windowSet.weekly]
+            .compactMap { $0 }
+            .map {
+                ObservedRateLimitWindow(
+                    window: $0,
+                    observedAt: record.sortDate,
+                    sourceName: "Codex 日志"
+                )
+            }
     }
 
     private func newestHeaderRateLimitRecord() -> RateLimitRecord? {
@@ -1016,16 +1064,19 @@ struct CodexLogQuotaProvider {
     }
 }
 
-struct CodexSessionQuotaProvider {
-    func currentSnapshot() -> QuotaSnapshot? {
-        guard let record = newestRateLimitRecord() else {
-            return nil
+struct CodexSessionQuotaProvider: QuotaObservationProviding {
+    func currentWindowObservations() -> [ObservedRateLimitWindow] {
+        let now = Date()
+        return Self.bestRateLimitWindows(from: recentRateLimitRecords(), now: now).map {
+            ObservedRateLimitWindow(
+                window: $0.window,
+                observedAt: $0.record.sortDate,
+                sourceName: "Codex 会话"
+            )
         }
-
-        return QuotaSnapshot(record: record, sourceName: "Codex 会话", lastUpdated: Date())
     }
 
-    private func newestRateLimitRecord() -> RateLimitRecord? {
+    private func recentRateLimitRecords() -> [RateLimitRecord] {
         let roots = [
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
@@ -1045,7 +1096,7 @@ struct CodexSessionQuotaProvider {
             }
         }
 
-        return Self.bestRateLimitRecord(from: records, now: Date())
+        return records
     }
 
     private func recentJSONLFiles(under root: URL) -> [SessionFile] {
@@ -1125,6 +1176,24 @@ struct CodexSessionQuotaProvider {
         from records: [RateLimitRecord],
         now: Date
     ) -> RateLimitRecord? {
+        let selected = bestRateLimitWindows(from: records, now: now)
+        let windowSet = RateLimitWindowSet(windows: selected.map(\.window), now: now)
+        guard !windowSet.isEmpty,
+              let newest = selected.max(by: { $0.record.sortDate < $1.record.sortDate }) else {
+            return nil
+        }
+
+        return RateLimitRecord(
+            timestamp: newest.record.timestamp,
+            fileModifiedAt: newest.record.fileModifiedAt,
+            windowSet: windowSet
+        )
+    }
+
+    private static func bestRateLimitWindows(
+        from records: [RateLimitRecord],
+        now: Date
+    ) -> [(record: RateLimitRecord, window: RateLimitWindow)] {
         let active = records.compactMap { record -> RateLimitRecord? in
             let windows = [record.windowSet.fiveHour, record.windowSet.weekly].compactMap { $0 }
             let windowSet = RateLimitWindowSet(windows: windows, now: now)
@@ -1135,7 +1204,7 @@ struct CodexSessionQuotaProvider {
                 windowSet: windowSet
             )
         }
-        guard !active.isEmpty else { return nil }
+        guard !active.isEmpty else { return [] }
 
         let weeklyCandidates = active.compactMap { record in
             record.windowSet.weekly.map { (record: record, window: $0) }
@@ -1161,18 +1230,7 @@ struct CodexSessionQuotaProvider {
                 }
         }
 
-        let selected = [bestFiveHour, latestWeekly].compactMap { $0 }
-        let windowSet = RateLimitWindowSet(windows: selected.map(\.window), now: now)
-        guard !windowSet.isEmpty,
-              let newest = selected.max(by: { $0.record.sortDate < $1.record.sortDate }) else {
-            return nil
-        }
-
-        return RateLimitRecord(
-            timestamp: newest.record.timestamp,
-            fileModifiedAt: newest.record.fileModifiedAt,
-            windowSet: windowSet
-        )
+        return [bestFiveHour, latestWeekly].compactMap { $0 }
     }
 
     private func readTailText(from url: URL, maxBytes: UInt64 = 4 * 1024 * 1024) -> String? {
@@ -1293,7 +1351,7 @@ struct RateLimitRecord {
     }
 }
 
-enum QuotaWindowKind: Int, Sendable {
+enum QuotaWindowKind: Int, CaseIterable, Sendable {
     case fiveHour = 300
     case weekly = 10_080
 
@@ -1363,7 +1421,7 @@ struct QuotaWindowSnapshot: Sendable {
     }
 }
 
-struct QuotaSnapshot {
+struct QuotaSnapshot: Sendable {
     let mainWindow: QuotaWindowSnapshot?
     let weeklyWindow: QuotaWindowSnapshot?
     let lastUpdated: Date
@@ -1377,6 +1435,18 @@ struct QuotaSnapshot {
         self.weeklyWindow = fiveHour == nil ? nil : weekly
         self.lastUpdated = lastUpdated
         self.sourceName = sourceName
+    }
+
+    init(observation: QuotaObservation) {
+        self.init(
+            record: RateLimitRecord(
+                timestamp: observation.observedAt,
+                fileModifiedAt: observation.observedAt,
+                windowSet: observation.windowSet
+            ),
+            sourceName: observation.sourceName,
+            lastUpdated: observation.observedAt
+        )
     }
 
     private init(

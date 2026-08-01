@@ -51,5 +51,6 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         )
 
         XCTAssertEqual(result?.windowSet.fiveHour?.usedPercent, 42)
+        XCTAssertEqual(result?.sortDate, older.sortDate)
     }
 }
