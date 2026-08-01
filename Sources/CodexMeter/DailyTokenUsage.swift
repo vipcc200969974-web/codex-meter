@@ -50,54 +50,202 @@ struct DailyTokenEvent: Equatable, Sendable {
     let usage: DailyTokenUsage
 }
 
-enum DailyTokenLogParser {
-    static func parse(line: String, inside interval: DateInterval) -> DailyTokenEvent? {
-        guard let data = line.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let timestampText = object["timestamp"] as? String,
-              let timestamp = parseDate(timestampText),
-              timestamp >= interval.start,
-              timestamp < interval.end,
-              let payload = object["payload"] as? [String: Any],
-              payload["type"] as? String == "token_count",
-              let info = payload["info"] as? [String: Any],
-              let last = info["last_token_usage"] as? [String: Any] else {
-            return nil
+protocol DailyTokenEventDecoding {
+    func decodeTokenEvent(from data: Data) -> DailyTokenEvent?
+}
+
+struct JSONDailyTokenEventDecoder: DailyTokenEventDecoding, Sendable {
+    private struct Envelope: Decodable {
+        let timestamp: String
+        let payload: Payload
+    }
+
+    private struct Payload: Decodable {
+        let type: String
+        let info: Info?
+    }
+
+    private struct Info: Decodable {
+        let lastTokenUsage: LastTokenUsage?
+
+        private enum CodingKeys: String, CodingKey {
+            case lastTokenUsage = "last_token_usage"
+        }
+    }
+
+    private struct LastTokenUsage: Decodable {
+        let inputTokens: Int64
+        let cachedInputTokens: Int64
+        let outputTokens: Int64
+        let reasoningOutputTokens: Int64
+        let totalTokens: Int64
+
+        private enum CodingKeys: String, CodingKey {
+            case inputTokens = "input_tokens"
+            case cachedInputTokens = "cached_input_tokens"
+            case outputTokens = "output_tokens"
+            case reasoningOutputTokens = "reasoning_output_tokens"
+            case totalTokens = "total_tokens"
         }
 
-        let input = int64(last["input_tokens"])
-        let cached = int64(last["cached_input_tokens"])
-        let output = int64(last["output_tokens"])
-        let total = int64(last["total_tokens"])
-        let reasoning = int64(last["reasoning_output_tokens"])
-        guard total > 0 else { return nil }
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            inputTokens = Self.metric(.inputTokens, from: values)
+            cachedInputTokens = Self.metric(.cachedInputTokens, from: values)
+            outputTokens = Self.metric(.outputTokens, from: values)
+            reasoningOutputTokens = Self.metric(.reasoningOutputTokens, from: values)
+            totalTokens = Self.metric(.totalTokens, from: values)
+        }
+
+        private static func metric(
+            _ key: CodingKeys,
+            from values: KeyedDecodingContainer<CodingKeys>
+        ) -> Int64 {
+            if let value = try? values.decode(Int64.self, forKey: key) {
+                return max(value, 0)
+            }
+            if let value = try? values.decode(Double.self, forKey: key), value.isFinite {
+                guard value > 0 else { return 0 }
+                return value >= Double(Int64.max) ? Int64.max : Int64(value)
+            }
+            if let value = try? values.decode(String.self, forKey: key),
+               let number = Int64(value) {
+                return max(number, 0)
+            }
+            return 0
+        }
+    }
+
+    func decodeTokenEvent(from data: Data) -> DailyTokenEvent? {
+        guard let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+              envelope.payload.type == "token_count",
+              let last = envelope.payload.info?.lastTokenUsage,
+              last.totalTokens > 0,
+              let timestamp = DailyTokenTimestampParser.parse(envelope.timestamp) else {
+            return nil
+        }
 
         return DailyTokenEvent(
             timestamp: timestamp,
             usage: DailyTokenUsage(
-                totalTokens: total,
-                cachedInputTokens: cached,
-                nonCachedInputTokens: max(input - cached, 0),
-                outputTokens: output,
-                reasoningOutputTokens: reasoning,
+                totalTokens: last.totalTokens,
+                cachedInputTokens: last.cachedInputTokens,
+                nonCachedInputTokens: max(last.inputTokens - last.cachedInputTokens, 0),
+                outputTokens: last.outputTokens,
+                reasoningOutputTokens: last.reasoningOutputTokens,
                 latestEventAt: timestamp
             )
         )
     }
+}
 
-    private static func int64(_ value: Any?) -> Int64 {
-        if let value = value as? Int64 { return max(value, 0) }
-        if let value = value as? Int { return Int64(max(value, 0)) }
-        if let value = value as? Double { return Int64(max(value, 0)) }
-        if let value = value as? String, let number = Int64(value) { return max(number, 0) }
-        return 0
+private enum DailyTokenTimestampParser {
+    private final class FormatterCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private let fractional: ISO8601DateFormatter = {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return formatter
+        }()
+        private let wholeSeconds = ISO8601DateFormatter()
+
+        func parse(_ value: String) -> Date? {
+            lock.lock()
+            defer { lock.unlock() }
+            return fractional.date(from: value) ?? wholeSeconds.date(from: value)
+        }
     }
 
-    private static func parseDate(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) { return date }
-        return ISO8601DateFormatter().date(from: value)
+    private static let formatters = FormatterCache()
+
+    static func parse(_ value: String) -> Date? {
+        formatters.parse(value)
+    }
+}
+
+enum DailyTokenLogParser {
+    private static let decoder = JSONDailyTokenEventDecoder()
+
+    static func parse(line: String, inside interval: DateInterval) -> DailyTokenEvent? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        return parse(data: data, inside: interval, decoder: decoder)
+    }
+
+    static func parse(
+        line: String,
+        inside interval: DateInterval,
+        decoder: any DailyTokenEventDecoding
+    ) -> DailyTokenEvent? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        return parse(data: data, inside: interval, decoder: decoder)
+    }
+
+    static func parse(data: Data, inside interval: DateInterval) -> DailyTokenEvent? {
+        parse(data: data, inside: interval, decoder: decoder)
+    }
+
+    static func parseCompleteLines(in data: Data, inside interval: DateInterval) -> [DailyTokenEvent] {
+        parseCompleteLines(in: data, inside: interval, decoder: decoder)
+    }
+
+    static func parseCompleteLines(
+        in data: Data,
+        inside interval: DateInterval,
+        decoder: any DailyTokenEventDecoding
+    ) -> [DailyTokenEvent] {
+        var events: [DailyTokenEvent] = []
+        var searchStart = data.startIndex
+
+        while searchStart < data.endIndex,
+              let match = DailyTokenLineDiscriminator.firstMatch(
+                in: data,
+                range: searchStart..<data.endIndex
+              ),
+              let lineEnd = data[match.upperBound...].firstIndex(of: 0x0A) {
+            let lineStart = data[..<match.lowerBound].lastIndex(of: 0x0A)
+                .map { data.index(after: $0) } ?? data.startIndex
+            let line = data.subdata(in: lineStart..<lineEnd)
+            if let event = decodeCandidate(data: line, inside: interval, decoder: decoder) {
+                events.append(event)
+            }
+            searchStart = data.index(after: lineEnd)
+        }
+
+        return events
+    }
+
+    private static func parse(
+        data: Data,
+        inside interval: DateInterval,
+        decoder: any DailyTokenEventDecoding
+    ) -> DailyTokenEvent? {
+        guard DailyTokenLineDiscriminator.isTokenCount(data) else { return nil }
+        return decodeCandidate(data: data, inside: interval, decoder: decoder)
+    }
+
+    private static func decodeCandidate(
+        data: Data,
+        inside interval: DateInterval,
+        decoder: any DailyTokenEventDecoding
+    ) -> DailyTokenEvent? {
+        guard let event = decoder.decodeTokenEvent(from: data),
+              event.timestamp >= interval.start,
+              event.timestamp < interval.end else {
+            return nil
+        }
+        return event
+    }
+}
+
+private enum DailyTokenLineDiscriminator {
+    private static let compactTokenCountType = Data(#""type":"token_count""#.utf8)
+
+    static func isTokenCount(_ data: Data) -> Bool {
+        firstMatch(in: data, range: data.startIndex..<data.endIndex) != nil
+    }
+
+    static func firstMatch(in data: Data, range: Range<Data.Index>) -> Range<Data.Index>? {
+        data.range(of: compactTokenCountType, options: [], in: range)
     }
 }
 
@@ -118,7 +266,17 @@ protocol DailyTokenUsageProviding: AnyObject, Sendable {
 }
 
 final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
-    private struct FileIdentity: Equatable {
+    enum DiscoveryLayout {
+        case recursive
+        case codexDefault
+    }
+
+    private enum DiscoveryError: Error {
+        case rootIsNotDirectory(URL)
+        case cannotEnumerateRoot(URL)
+    }
+
+    private struct FileIdentity: Hashable {
         let systemNumber: UInt64
         let fileNumber: UInt64
 
@@ -134,27 +292,40 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
 
     private struct FileCursor {
         var url: URL
-        var identity: FileIdentity?
         var offset: UInt64 = 0
         var partial = Data()
         var usage = DailyTokenUsage.zero
     }
 
+    private enum CursorKey: Hashable {
+        case identity(FileIdentity)
+        case basename(String)
+    }
+
+    private struct Candidate {
+        let url: URL
+        let modifiedAt: Date
+    }
+
     private let roots: [URL]
+    private let discoveryLayout: DiscoveryLayout
     private var calendar: Calendar
     private let fileManager: FileManager
     private var dayInterval: DateInterval?
-    private var cursors: [String: FileCursor] = [:]
+    private var cursors: [CursorKey: FileCursor] = [:]
 
     init(
-        roots: [URL] = [
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
-        ],
+        roots: [URL]? = nil,
         calendar: Calendar = .autoupdatingCurrent,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        discoveryLayout: DiscoveryLayout? = nil
     ) {
-        self.roots = roots
+        let defaultRoots = [
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
+        ]
+        self.roots = roots ?? defaultRoots
+        self.discoveryLayout = discoveryLayout ?? (roots == nil ? .codexDefault : .recursive)
         self.calendar = calendar
         self.fileManager = fileManager
     }
@@ -166,9 +337,11 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             cursors.removeAll()
         }
 
+        var discoveredKeys = Set<CursorKey>()
         for url in try discoverCandidateFiles(since: interval.start) {
-            try updateCursor(for: url, interval: interval)
+            discoveredKeys.insert(try updateCursor(for: url, interval: interval))
         }
+        cursors = cursors.filter { discoveredKeys.contains($0.key) }
         return cursors.values.reduce(.zero) { $0 + $1.usage }
     }
 
@@ -179,27 +352,14 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
     }
 
     private func discoverCandidateFiles(since start: Date) throws -> [URL] {
-        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey]
-        var candidates: [(url: URL, modifiedAt: Date)] = []
-
-        for root in roots {
-            guard let enumerator = fileManager.enumerator(
-                at: root,
-                includingPropertiesForKeys: keys,
-                options: []
-            ) else {
-                continue
+        var candidates: [Candidate] = []
+        switch discoveryLayout {
+        case .recursive:
+            for root in roots {
+                try appendRecursiveCandidates(from: root, since: start, to: &candidates)
             }
-
-            for case let url as URL in enumerator where url.pathExtension == "jsonl" {
-                let values = try url.resourceValues(forKeys: Set(keys))
-                guard values.isRegularFile == true,
-                      let modifiedAt = values.contentModificationDate,
-                      modifiedAt >= start else {
-                    continue
-                }
-                candidates.append((url, modifiedAt))
-            }
+        case .codexDefault:
+            try appendDefaultLayoutCandidates(since: start, to: &candidates)
         }
 
         candidates.sort { $0.modifiedAt > $1.modifiedAt }
@@ -209,21 +369,121 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         }
     }
 
-    private func updateCursor(for url: URL, interval: DateInterval) throws {
-        let key = url.lastPathComponent
-        var cursor = cursors[key] ?? FileCursor(url: url)
-        cursor.url = url
+    private func appendDefaultLayoutCandidates(
+        since start: Date,
+        to candidates: inout [Candidate]
+    ) throws {
+        guard !roots.isEmpty else { return }
+        let previousStart = calendar.date(byAdding: .day, value: -1, to: start)!
+        let relevantDates = [start, previousStart]
 
+        let sessionsRoot = roots[0]
+        if try directoryExists(at: sessionsRoot) {
+            for date in relevantDates {
+                let directory = sessionsRoot.appendingPathComponent(dayPath(for: date))
+                try appendRecursiveCandidates(from: directory, since: start, to: &candidates)
+            }
+        }
+
+        guard roots.count > 1 else { return }
+        let archivedRoot = roots[1]
+        guard try directoryExists(at: archivedRoot) else { return }
+        let relevantPrefixes = relevantDates.map { "rollout-\(dayStamp(for: $0))" }
+        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey]
+        let urls = try fileManager.contentsOfDirectory(
+            at: archivedRoot,
+            includingPropertiesForKeys: keys,
+            options: []
+        )
+        for url in urls where relevantPrefixes.contains(where: url.lastPathComponent.hasPrefix) {
+            try appendCandidate(url, since: start, keys: keys, to: &candidates)
+        }
+    }
+
+    private func appendRecursiveCandidates(
+        from root: URL,
+        since start: Date,
+        to candidates: inout [Candidate]
+    ) throws {
+        guard try directoryExists(at: root) else { return }
+        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey]
+
+        var traversalError: Error?
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [],
+            errorHandler: { _, error in
+                traversalError = error
+                return false
+            }
+        ) else {
+            throw DiscoveryError.cannotEnumerateRoot(root)
+        }
+
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            try appendCandidate(url, since: start, keys: keys, to: &candidates)
+        }
+        if let traversalError {
+            throw traversalError
+        }
+    }
+
+    private func appendCandidate(
+        _ url: URL,
+        since start: Date,
+        keys: [URLResourceKey],
+        to candidates: inout [Candidate]
+    ) throws {
+        let values = try url.resourceValues(forKeys: Set(keys))
+        guard values.isRegularFile == true,
+              let modifiedAt = values.contentModificationDate,
+              modifiedAt >= start else {
+            return
+        }
+        candidates.append(Candidate(url: url, modifiedAt: modifiedAt))
+    }
+
+    private func directoryExists(at url: URL) throws -> Bool {
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try fileManager.attributesOfItem(atPath: url.path)
+        } catch {
+            let cocoaError = error as NSError
+            if cocoaError.domain == NSCocoaErrorDomain,
+               [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(cocoaError.code) {
+                return false
+            }
+            throw error
+        }
+        guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+            throw DiscoveryError.rootIsNotDirectory(url)
+        }
+        return true
+    }
+
+    private func dayPath(for date: Date) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d/%02d/%02d", components.year!, components.month!, components.day!)
+    }
+
+    private func dayStamp(for date: Date) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", components.year!, components.month!, components.day!)
+    }
+
+    private func updateCursor(for url: URL, interval: DateInterval) throws -> CursorKey {
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
         let identity = FileIdentity(attributes: attributes)
+        let key = identity.map(CursorKey.identity) ?? .basename(url.lastPathComponent)
+        var cursor = cursors[key] ?? FileCursor(url: url)
+        cursor.url = url
         let fileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        let wasReplaced = cursor.identity != nil && identity != nil && cursor.identity != identity
-        if wasReplaced || fileSize < cursor.offset {
+        if fileSize < cursor.offset {
             cursor.offset = 0
             cursor.partial = Data()
             cursor.usage = .zero
         }
-        cursor.identity = identity
 
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -233,17 +493,17 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
 
         var combined = cursor.partial
         combined.append(newData)
-        let chunks = combined.split(separator: 0x0A, omittingEmptySubsequences: false)
-        let endsWithNewline = combined.last == 0x0A
-        let complete = chunks.dropLast()
-        cursor.partial = endsWithNewline ? Data() : (chunks.last.map { Data($0) } ?? Data())
-        for bytes in complete where !bytes.isEmpty {
-            let line = String(decoding: bytes, as: UTF8.self)
-            if let event = DailyTokenLogParser.parse(line: line, inside: interval) {
-                cursor.usage = cursor.usage + event.usage
-            }
+        if let finalNewline = combined.lastIndex(of: 0x0A) {
+            let partialStart = combined.index(after: finalNewline)
+            cursor.partial = Data(combined[partialStart...])
+        } else {
+            cursor.partial = combined
+        }
+        for event in DailyTokenLogParser.parseCompleteLines(in: combined, inside: interval) {
+            cursor.usage = cursor.usage + event.usage
         }
         cursor.offset = readStart + UInt64(newData.count)
         cursors[key] = cursor
+        return key
     }
 }
