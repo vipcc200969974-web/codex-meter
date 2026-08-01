@@ -43,6 +43,26 @@ private final class RootMetadataErrorFileManager: FileManager, @unchecked Sendab
     }
 }
 
+private final class RecordingDailyTokenFileReader: DailyTokenFileReading, @unchecked Sendable {
+    private(set) var totalBytesRead = 0
+    private(set) var offsets: [UInt64] = []
+
+    func read(from url: URL, offset: UInt64) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        let data = try handle.readToEnd() ?? Data()
+        totalBytesRead += data.count
+        offsets.append(offset)
+        return data
+    }
+
+    func reset() {
+        totalBytesRead = 0
+        offsets = []
+    }
+}
+
 private final class CountingDailyTokenEventDecoder: DailyTokenEventDecoding {
     private let base: any DailyTokenEventDecoding
     private(set) var decodeCount = 0
@@ -69,6 +89,17 @@ private final class RecordingDailyTokenTimestampParser: DailyTokenTimestampParsi
         parsedValues.append(value)
         return result
     }
+}
+
+private func mutateJSONCache(
+    at url: URL,
+    _ mutation: (inout [String: Any]) throws -> Void
+) throws {
+    var object = try XCTUnwrap(
+        try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+    )
+    try mutation(&object)
+    try JSONSerialization.data(withJSONObject: object).write(to: url, options: .atomic)
 }
 
 final class DailyTokenUsageTests: XCTestCase {
@@ -228,6 +259,19 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(decoder.decodeCount, 4)
     }
 
+    func testNonTokenPayloadWithTokenMarkersAndUsageMetricsCountsZero() {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"message","content":"literal token_count and escaped token_\u0063ount","info":{"last_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":100,"reasoning_output_tokens":20,"total_tokens":1000}}}}"#
+
+        let events = DailyTokenLogParser.parseCompleteLines(
+            in: Data((line + "\n").utf8),
+            inside: interval
+        )
+
+        XCTAssertEqual(events.reduce(0) { $0 + $1.usage.totalTokens }, 0)
+    }
+
     func testBatchSemanticCandidateScanStaysLinearAtScale() {
         let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
         let interval = DateInterval(start: start, duration: 86_400)
@@ -339,6 +383,432 @@ final class DailyTokenUsageTests: XCTestCase {
         try finish.write(contentsOf: Data((String(partial.suffix(partial.count - partial.count / 2)) + "\n").utf8))
         try finish.close()
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 330)
+    }
+
+    func testRestartedProviderUsesPersistentAggregateWithoutReadingUnchangedBytes() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-cached.jsonl")
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":90,"cached_input_tokens":80,"output_tokens":10,"reasoning_output_tokens":2,"total_tokens":100}}}}"#
+        try (line + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let reader = RecordingDailyTokenFileReader()
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        let first = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+        XCTAssertEqual(try first.currentUsage(now: now).totalTokens, 100)
+        XCTAssertGreaterThan(reader.totalBytesRead, 0)
+
+        reader.reset()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertEqual(reader.totalBytesRead, 0)
+        XCTAssertTrue(reader.offsets.isEmpty)
+    }
+
+    func testRestartedProviderRereadsUnterminatedTailFromCompleteLineBoundary() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-partial.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let partial = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}},"content":"PRIVATE_TAIL_SENTINEL"}}"#
+        let split = partial.index(partial.startIndex, offsetBy: partial.count / 2)
+        let completePrefix = Data((first + "\n").utf8)
+        try (completePrefix + Data(partial[..<split].utf8)).write(to: file)
+        let reader = RecordingDailyTokenFileReader()
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        let firstProvider = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+        XCTAssertEqual(try firstProvider.currentUsage(now: now).totalTokens, 100)
+        XCTAssertFalse(
+            String(decoding: try Data(contentsOf: cache), as: UTF8.self)
+                .contains("PRIVATE_TAIL_SENTINEL")
+        )
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((String(partial[split...]) + "\n").utf8))
+        try handle.close()
+        reader.reset()
+
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(reader.offsets, [UInt64(completePrefix.count)])
+        XCTAssertEqual(reader.totalBytesRead, Data((partial + "\n").utf8).count)
+    }
+
+    func testRestartedProviderReadsOnlyBytesAppendedAfterCachedBoundary() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-appended.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let appended = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        let firstData = Data((first + "\n").utf8)
+        let appendedData = Data((appended + "\n").utf8)
+        try firstData.write(to: file)
+        let reader = RecordingDailyTokenFileReader()
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: appendedData)
+        try handle.close()
+        reader.reset()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(reader.offsets, [UInt64(firstData.count)])
+        XCTAssertEqual(reader.totalBytesRead, appendedData.count)
+        reader.reset()
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(reader.totalBytesRead, 0)
+    }
+
+    func testSerializedCacheDoesNotContainPrivateSourceSentinel() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let sentinel = "PRIVATE_PROMPT_REPLY_AUTH_SENTINEL"
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}},"content":"\#(sentinel)"}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-private.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let provider = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
+        let serialized = try Data(contentsOf: cache)
+        XCTAssertFalse(String(decoding: serialized, as: UTF8.self).contains(sentinel))
+    }
+
+    func testRestartedProviderRejectsCacheFromWrongLocalDay() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-day.jsonl")
+        let previous = #"{"timestamp":"2026-07-31T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let today = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        try (previous + "\n").write(to: file, atomically: false, encoding: .utf8)
+        let previousNow = ISO8601DateFormatter().date(from: "2026-07-31T03:00:00Z")!
+        let todayNow = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: previousNow).totalTokens, 100)
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data((today + "\n").utf8))
+        try handle.close()
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: todayNow).totalTokens, 200)
+        XCTAssertGreaterThan(reader.totalBytesRead, 0)
+    }
+
+    func testRestartedProviderRebuildsFromLogsWhenCacheIsCorrupt() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-corrupt.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        try Data("not valid cache data".utf8).write(to: cache)
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertGreaterThan(reader.totalBytesRead, 0)
+    }
+
+    func testRestartedProviderRejectsCacheForDifferentRoots() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let nestedRoot = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: nestedRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: nestedRoot.appendingPathComponent("rollout-roots.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [base], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [nestedRoot],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertGreaterThan(reader.totalBytesRead, 0)
+    }
+
+    func testRestartedProviderRejectsUnknownCacheSchema() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-schema.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        try mutateJSONCache(at: cache) { $0["schemaVersion"] = 999 }
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertGreaterThan(reader.totalBytesRead, 0)
+    }
+
+    func testRestartedProviderRebuildsCursorWithImpossibleCachedOffset() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-offset.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        try mutateJSONCache(at: cache) { object in
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            cursors[0]["completeLineOffset"] = 9_999_999
+            object["cursors"] = cursors
+        }
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertEqual(reader.offsets, [0])
+    }
+
+    func testRestartedProviderRebuildsWhenCachedPathHasNewFilesystemIdentity() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-identity.jsonl")
+        let replacement = base.appendingPathComponent("replacement.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":225,"cached_input_tokens":25,"output_tokens":25,"total_tokens":250}}}}"#
+        try (first + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        try (second + "\n").write(to: replacement, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.moveItem(at: replacement, to: file)
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 250)
+        XCTAssertEqual(reader.offsets, [0])
+    }
+
+    func testRestartedProviderRebuildsWhenCachedFileWasTruncated() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = root.appendingPathComponent("rollout-truncated-cache.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        let replacement = #"{"timestamp":"2026-08-01T02:10:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":400}}}}"#
+        try (first + "\n" + second + "\n").write(to: file, atomically: false, encoding: .utf8)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 300)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data((replacement + "\n").utf8))
+        try handle.close()
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 400)
+        XCTAssertEqual(reader.offsets, [0])
+    }
+
+    func testRestartedProviderPrunesDisappearedCursorAndCountsNewFile() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let original = root.appendingPathComponent("rollout-disappeared.jsonl")
+        let newFile = root.appendingPathComponent("rollout-new.jsonl")
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        try (first + "\n").write(to: original, atomically: true, encoding: .utf8)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 100)
+        try FileManager.default.removeItem(at: original)
+        try (second + "\n").write(to: newFile, atomically: true, encoding: .utf8)
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 200)
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 200)
+    }
+
+    func testCacheWriteFailureDoesNotDiscardComputedLiveUsage() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let blockedParent = base.appendingPathComponent("not-a-directory")
+        let cache = blockedParent.appendingPathComponent("daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("blocking file".utf8).write(to: blockedParent)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-write-failure.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let provider = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 100)
+        XCTAssertEqual(try Data(contentsOf: blockedParent), Data("blocking file".utf8))
+    }
+
+    func testCustomRootsDoNotUseProductionCacheByDefault() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        try (line + "\n").write(
+            to: root.appendingPathComponent("rollout-custom-root.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let first = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        XCTAssertEqual(try first.currentUsage(now: now).totalTokens, 100)
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 100)
+        XCTAssertGreaterThan(reader.totalBytesRead, 0)
     }
 
     func testProviderTreatsMissingRootAsLegitimateEmptyFirstRun() throws {

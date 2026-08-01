@@ -1,6 +1,6 @@
 import Foundation
 
-struct DailyTokenUsage: Equatable, Sendable {
+struct DailyTokenUsage: Codable, Equatable, Sendable {
     var totalTokens: Int64
     var cachedInputTokens: Int64
     var nonCachedInputTokens: Int64
@@ -276,13 +276,28 @@ protocol DailyTokenUsageProviding: AnyObject, Sendable {
     func currentUsage(now: Date) throws -> DailyTokenUsage
 }
 
+protocol DailyTokenFileReading: Sendable {
+    func read(from url: URL, offset: UInt64) throws -> Data
+}
+
+struct FileHandleDailyTokenFileReader: DailyTokenFileReading {
+    func read(from url: URL, offset: UInt64) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        return try handle.readToEnd() ?? Data()
+    }
+}
+
 final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
+    private static let cacheSchemaVersion = 1
+
     private enum DiscoveryError: Error {
         case rootIsNotDirectory(URL)
         case cannotEnumerateRoot(URL)
     }
 
-    private struct FileIdentity: Hashable {
+    private struct FileIdentity: Codable, Hashable {
         let systemNumber: UInt64
         let fileNumber: UInt64
 
@@ -313,24 +328,48 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         let modifiedAt: Date
     }
 
+    private struct PersistentCache: Codable {
+        let schemaVersion: Int
+        let dayStart: Date
+        let rootsFingerprint: String
+        let cursors: [PersistentCursor]
+    }
+
+    private struct PersistentCursor: Codable {
+        let path: String
+        let basename: String
+        let identity: FileIdentity?
+        let completeLineOffset: UInt64
+        let usage: DailyTokenUsage
+    }
+
     private let roots: [URL]
     private var calendar: Calendar
     private let fileManager: FileManager
+    private let fileReader: any DailyTokenFileReading
+    private let cacheURL: URL?
+    private let rootsFingerprint: String
     private var dayInterval: DateInterval?
     private var cursors: [CursorKey: FileCursor] = [:]
 
     init(
         roots: [URL]? = nil,
         calendar: Calendar = .autoupdatingCurrent,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        fileReader: any DailyTokenFileReading = FileHandleDailyTokenFileReader(),
+        cacheURL: URL? = nil
     ) {
         let defaultRoots = [
             fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
             fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
         ]
-        self.roots = roots ?? defaultRoots
+        let resolvedRoots = roots ?? defaultRoots
+        self.roots = resolvedRoots
         self.calendar = calendar
         self.fileManager = fileManager
+        self.fileReader = fileReader
+        self.cacheURL = cacheURL ?? (roots == nil ? Self.defaultCacheURL(fileManager: fileManager) : nil)
+        self.rootsFingerprint = Self.fingerprint(for: resolvedRoots)
     }
 
     func currentUsage(now: Date) throws -> DailyTokenUsage {
@@ -338,6 +377,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         if dayInterval != interval {
             dayInterval = interval
             cursors.removeAll()
+            loadCache(for: interval)
         }
 
         var discoveredKeys = Set<CursorKey>()
@@ -345,7 +385,105 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             discoveredKeys.insert(try updateCursor(for: url, interval: interval))
         }
         cursors = cursors.filter { discoveredKeys.contains($0.key) }
-        return cursors.values.reduce(.zero) { $0 + $1.usage }
+        let usage = cursors.values.reduce(.zero) { $0 + $1.usage }
+        saveCache(for: interval)
+        return usage
+    }
+
+    private static func defaultCacheURL(fileManager: FileManager) -> URL? {
+        fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Codex Meter", isDirectory: true)
+            .appendingPathComponent("daily-token-cursors.json")
+    }
+
+    private static func fingerprint(for roots: [URL]) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in roots.map({ $0.standardizedFileURL.path }).joined(separator: "\0").utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    private func loadCache(for interval: DateInterval) {
+        guard let cacheURL,
+              let data = try? Data(contentsOf: cacheURL),
+              let cache = try? JSONDecoder().decode(PersistentCache.self, from: data),
+              cache.schemaVersion == Self.cacheSchemaVersion,
+              cache.dayStart == interval.start,
+              cache.rootsFingerprint == rootsFingerprint,
+              cache.cursors.allSatisfy({ Self.isValid($0.usage, inside: interval) }) else {
+            return
+        }
+
+        var loaded: [CursorKey: FileCursor] = [:]
+        for persisted in cache.cursors {
+            let key = persisted.identity.map(CursorKey.identity) ?? .basename(persisted.basename)
+            guard loaded[key] == nil else {
+                cursors.removeAll()
+                return
+            }
+            loaded[key] = FileCursor(
+                url: URL(fileURLWithPath: persisted.path),
+                offset: persisted.completeLineOffset,
+                usage: persisted.usage
+            )
+        }
+        cursors = loaded
+    }
+
+    private static func isValid(_ usage: DailyTokenUsage, inside interval: DateInterval) -> Bool {
+        let values = [
+            usage.totalTokens,
+            usage.cachedInputTokens,
+            usage.nonCachedInputTokens,
+            usage.outputTokens,
+            usage.reasoningOutputTokens
+        ]
+        guard values.allSatisfy({ $0 >= 0 }) else { return false }
+        guard let latest = usage.latestEventAt else { return true }
+        return latest >= interval.start && latest < interval.end
+    }
+
+    private func saveCache(for interval: DateInterval) {
+        guard let cacheURL else { return }
+        let persisted = cursors.map { key, cursor in
+            let identity: FileIdentity?
+            let basename: String
+            switch key {
+            case let .identity(value):
+                identity = value
+                basename = cursor.url.lastPathComponent
+            case let .basename(value):
+                identity = nil
+                basename = value
+            }
+            return PersistentCursor(
+                path: cursor.url.path,
+                basename: basename,
+                identity: identity,
+                completeLineOffset: cursor.offset - UInt64(cursor.partial.count),
+                usage: cursor.usage
+            )
+        }
+        let cache = PersistentCache(
+            schemaVersion: Self.cacheSchemaVersion,
+            dayStart: interval.start,
+            rootsFingerprint: rootsFingerprint,
+            cursors: persisted
+        )
+
+        do {
+            try fileManager.createDirectory(
+                at: cacheURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            try encoder.encode(cache).write(to: cacheURL, options: .atomic)
+        } catch {
+            // Persistence is an optimization; live usage remains authoritative.
+        }
     }
 
     private func localDay(containing date: Date) -> DateInterval {
@@ -442,11 +580,13 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             cursor.usage = .zero
         }
 
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
         let readStart = cursor.offset
-        try handle.seek(toOffset: readStart)
-        let newData = try handle.readToEnd() ?? Data()
+        let newData: Data
+        if fileSize == readStart, cursor.partial.isEmpty {
+            newData = Data()
+        } else {
+            newData = try fileReader.read(from: url, offset: readStart)
+        }
 
         var combined = cursor.partial
         combined.append(newData)
