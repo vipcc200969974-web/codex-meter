@@ -838,11 +838,13 @@ enum UsageFreshness: Equatable, Sendable {
 struct UsageSnapshot: Sendable {
     let quota: QuotaSnapshot
     let dailyTokens: DailyTokenUsage
+    let dailyTokenDay: Date?
     let freshness: UsageFreshness
 
     static let unavailable = UsageSnapshot(
         quota: .unavailable(),
         dailyTokens: .zero,
+        dailyTokenDay: nil,
         freshness: .unavailable
     )
 }
@@ -988,6 +990,7 @@ final class UsageStore: ObservableObject {
         self.snapshot = UsageSnapshot(
             quota: cachedQuota,
             dailyTokens: .zero,
+            dailyTokenDay: calendar.startOfDay(for: now()),
             freshness: cachedQuota.isUnavailable ? .unavailable : .stale
         )
         let savedInterval = UserDefaults.standard.integer(forKey: CacheKey.voiceBroadcastIntervalMinutes)
@@ -999,6 +1002,7 @@ final class UsageStore: ObservableObject {
         isStarted = true
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
+        resetDailyTokensIfDayChanged(at: now())
 
         if watcher == nil {
             watcher = watcherFactory { [weak self] in
@@ -1056,6 +1060,7 @@ final class UsageStore: ObservableObject {
     }
 
     func scheduleRefresh() {
+        resetDailyTokensIfDayChanged(at: now())
         debounceTask?.cancel()
         let generation = lifecycleGeneration
         debounceGeneration &+= 1
@@ -1072,6 +1077,7 @@ final class UsageStore: ObservableObject {
     }
 
     func refreshAfterWakeOrUnlock() {
+        resetDailyTokensIfDayChanged(at: now())
         watcher?.rebind()
         refresh()
         if isStarted {
@@ -1080,13 +1086,14 @@ final class UsageStore: ObservableObject {
     }
 
     func refresh() {
+        let loadDate = now()
+        let loadDay = resetDailyTokensIfDayChanged(at: loadDate)
         guard !isRefreshing else {
             refreshPending = true
             return
         }
         isRefreshing = true
         let loader = loader
-        let loadDate = now()
         let generation = lifecycleGeneration
 
         refreshQueue.async { [weak self] in
@@ -1094,18 +1101,24 @@ final class UsageStore: ObservableObject {
 
             DispatchQueue.main.async {
                 guard let self, self.lifecycleGeneration == generation else { return }
+                let currentDay = self.resetDailyTokensIfDayChanged(at: self.now())
                 let old = self.snapshot
                 let quota = result.quota ?? old.quota
-                let tokens = result.dailyTokens ?? old.dailyTokens
+                let isCurrentDayLoad = loadDay == currentDay
+                let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
                 let hasFreshQuota = result.quota != nil
-                let hasFreshTokens = result.dailyTokens != nil
+                let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
                 self.snapshot = UsageSnapshot(
                     quota: quota,
                     dailyTokens: tokens,
+                    dailyTokenDay: currentDay,
                     freshness: hasFreshQuota && hasFreshTokens ? .live : (quota.isUnavailable ? .unavailable : .stale)
                 )
                 if let freshQuota = result.quota {
                     freshQuota.cache()
+                }
+                if !isCurrentDayLoad {
+                    self.refreshPending = true
                 }
                 self.isRefreshing = false
                 self.finishRefreshSideEffects()
@@ -1133,9 +1146,24 @@ final class UsageStore: ObservableObject {
                 return
             }
             self.midnightTask = nil
+            self.resetDailyTokensIfDayChanged(at: self.now())
             self.refresh()
             self.scheduleNextLocalMidnight(generation: generation)
         }
+    }
+
+    @discardableResult
+    private func resetDailyTokensIfDayChanged(at date: Date) -> Date {
+        let currentDay = calendar.startOfDay(for: date)
+        guard snapshot.dailyTokenDay != currentDay else { return currentDay }
+        let quota = snapshot.quota
+        snapshot = UsageSnapshot(
+            quota: quota,
+            dailyTokens: .zero,
+            dailyTokenDay: currentDay,
+            freshness: quota.isUnavailable ? .unavailable : .stale
+        )
+        return currentDay
     }
 
     isolated deinit {

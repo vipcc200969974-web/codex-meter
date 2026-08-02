@@ -206,32 +206,18 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(loader.callCount, 3)
     }
 
-    func testNextLocalMidnightRefreshResetsTokensWithoutFileActivity() async throws {
-        var shanghai = Calendar(identifier: .gregorian)
-        shanghai.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Shanghai"))
-        let beforeMidnight = try XCTUnwrap(shanghai.date(from: DateComponents(
-            year: 2026,
-            month: 8,
-            day: 1,
-            hour: 23,
-            minute: 59,
-            second: 30
-        )))
-        let midnight = try XCTUnwrap(shanghai.date(byAdding: .second, value: 30, to: beforeMidnight))
+    func testMidnightFailurePublishesNewDayZeroAndRetainsQuota() async throws {
+        let (shanghai, beforeMidnight, midnight) = try makeShanghaiDayBoundary()
         let clock = LockedDateSource(beforeMidnight)
         let scheduler = ManualUsageScheduler()
-        let initialTokens = DailyTokenUsage(
-            totalTokens: 42,
-            cachedInputTokens: 10,
-            nonCachedInputTokens: 12,
-            outputTokens: 20,
-            reasoningOutputTokens: 5,
-            latestEventAt: beforeMidnight
+        let quota = makeQuota(remainingPercent: 61, sourceName: "yesterday")
+        let loader = ControlledUsageLoader(
+            results: [
+                UsageLoadResult(quota: quota, dailyTokens: makeTokens(total: 42)),
+                .empty
+            ],
+            blockedCalls: [2]
         )
-        let loader = SequenceUsageLoader(results: [
-            UsageLoadResult(quota: nil, dailyTokens: initialTokens),
-            UsageLoadResult(quota: nil, dailyTokens: .zero)
-        ])
         let store = UsageStore(
             loader: loader,
             watcher: SpyActivityWatcher(),
@@ -242,15 +228,190 @@ final class UsageStoreTests: XCTestCase {
 
         let initial = await nextSnapshot(from: store) { store.start() }
         XCTAssertEqual(initial.dailyTokens.totalTokens, 42)
+        XCTAssertEqual(initial.quota.remainingPercent, 61)
 
         scheduler.advance(by: 29.999)
         XCTAssertEqual(store.snapshot.dailyTokens.totalTokens, 42)
 
-        clock.set(midnight)
-        let reset = await nextSnapshot(from: store) {
-            scheduler.advance(by: 0.001)
+        var firstMidnightPublication: UsageSnapshot?
+        let firstPublicationCancellable = store.$snapshot.dropFirst().prefix(1).sink {
+            firstMidnightPublication = $0
         }
-        XCTAssertEqual(reset.dailyTokens, .zero)
+        clock.set(midnight)
+        scheduler.advance(by: 0.001)
+        await loader.waitUntilStarted(count: 2)
+        let beforeFailureCompletes = store.snapshot
+        let failed = await nextSnapshot(from: store) {
+            loader.release(call: 2)
+        }
+        XCTAssertEqual(firstMidnightPublication?.dailyTokens, .zero)
+        XCTAssertEqual(beforeFailureCompletes.dailyTokens, .zero)
+        XCTAssertEqual(beforeFailureCompletes.quota.remainingPercent, 61)
+        XCTAssertEqual(beforeFailureCompletes.freshness, .stale)
+        XCTAssertEqual(failed.dailyTokens, .zero)
+        XCTAssertEqual(failed.quota.remainingPercent, 61)
+        XCTAssertEqual(failed.freshness, .stale)
+        withExtendedLifetime(firstPublicationCancellable) {}
+    }
+
+    func testWakeAfterDayChangeResetsTokensWithoutMidnightCallback() async throws {
+        let (shanghai, beforeMidnight, midnight) = try makeShanghaiDayBoundary()
+        let clock = LockedDateSource(beforeMidnight)
+        let watcher = SpyActivityWatcher()
+        let loader = ControlledUsageLoader(
+            results: [
+                UsageLoadResult(
+                    quota: makeQuota(remainingPercent: 61, sourceName: "yesterday"),
+                    dailyTokens: makeTokens(total: 42)
+                ),
+                .empty
+            ],
+            blockedCalls: [2]
+        )
+        let store = UsageStore(
+            loader: loader,
+            watcher: watcher,
+            calendar: shanghai,
+            now: clock.now
+        )
+
+        _ = await nextSnapshot(from: store) { store.refresh() }
+        clock.set(midnight)
+        var firstWakePublication: UsageSnapshot?
+        let firstPublicationCancellable = store.$snapshot.dropFirst().prefix(1).sink {
+            firstWakePublication = $0
+        }
+        store.refreshAfterWakeOrUnlock()
+        await loader.waitUntilStarted(count: 2)
+        let beforeFailureCompletes = store.snapshot
+        let failed = await nextSnapshot(from: store) {
+            loader.release(call: 2)
+        }
+
+        XCTAssertEqual(firstWakePublication?.dailyTokens, .zero)
+        XCTAssertEqual(beforeFailureCompletes.dailyTokens, .zero)
+        XCTAssertEqual(beforeFailureCompletes.quota.remainingPercent, 61)
+        XCTAssertEqual(beforeFailureCompletes.freshness, .stale)
+        XCTAssertEqual(failed.dailyTokens, .zero)
+        XCTAssertEqual(watcher.rebindCount, 1)
+        withExtendedLifetime(firstPublicationCancellable) {}
+    }
+
+    func testLoadCompletingAfterDayChangeRejectsOldTokensAndRequestsCurrentDayFollowUp() async throws {
+        let (shanghai, beforeMidnight, midnight) = try makeShanghaiDayBoundary()
+        let clock = LockedDateSource(beforeMidnight)
+        let lateTokens = makeTokens(total: 99)
+        let currentTokens = makeTokens(total: 7)
+        let loader = ControlledUsageLoader(
+            results: [
+                UsageLoadResult(
+                    quota: makeQuota(remainingPercent: 61, sourceName: "initial"),
+                    dailyTokens: makeTokens(total: 42)
+                ),
+                UsageLoadResult(
+                    quota: makeQuota(remainingPercent: 70, sourceName: "late quota"),
+                    dailyTokens: lateTokens
+                ),
+                UsageLoadResult(
+                    quota: makeQuota(remainingPercent: 80, sourceName: "current"),
+                    dailyTokens: currentTokens
+                )
+            ],
+            blockedCalls: [2, 3]
+        )
+        let store = UsageStore(
+            loader: loader,
+            watcher: nil,
+            calendar: shanghai,
+            now: clock.now
+        )
+        var publishedTokenTotals: [Int64] = []
+        let cancellable = store.$snapshot.dropFirst().sink {
+            publishedTokenTotals.append($0.dailyTokens.totalTokens)
+        }
+
+        _ = await nextSnapshot(from: store) { store.refresh() }
+        store.refresh()
+        await loader.waitUntilStarted(count: 2)
+        clock.set(midnight)
+
+        let reset = await nextSnapshot(from: store) {
+            loader.release(call: 2)
+        }
+        guard reset.dailyTokens == .zero else {
+            XCTFail("Previous-day completion republished \(reset.dailyTokens.totalTokens) tokens")
+            return
+        }
+        await loader.waitUntilStarted(count: 3)
+
+        XCTAssertEqual(store.snapshot.dailyTokens, .zero)
+        XCTAssertEqual(store.snapshot.quota.remainingPercent, 70)
+        XCTAssertEqual(store.snapshot.freshness, .stale)
+        XCTAssertEqual(loader.callDates, [beforeMidnight, beforeMidnight, midnight])
+        XCTAssertFalse(publishedTokenTotals.contains(lateTokens.totalTokens))
+
+        let current = await nextSnapshot(from: store) {
+            loader.release(call: 3)
+        }
+        XCTAssertEqual(current.dailyTokens, currentTokens)
+        XCTAssertEqual(current.quota.remainingPercent, 80)
+        XCTAssertEqual(current.freshness, .live)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testMidnightSuccessPublishesNewDayTokensAndSchedulesFollowingMidnight() async throws {
+        let (shanghai, beforeMidnight, midnight) = try makeShanghaiDayBoundary()
+        let clock = LockedDateSource(beforeMidnight)
+        let scheduler = ManualUsageScheduler()
+        let newDayTokens = makeTokens(total: 7)
+        let loader = ControlledUsageLoader(
+            results: [
+                UsageLoadResult(
+                    quota: makeQuota(remainingPercent: 61, sourceName: "yesterday"),
+                    dailyTokens: makeTokens(total: 42)
+                ),
+                UsageLoadResult(
+                    quota: makeQuota(remainingPercent: 60, sourceName: "today"),
+                    dailyTokens: newDayTokens
+                )
+            ],
+            blockedCalls: [2]
+        )
+        let store = UsageStore(
+            loader: loader,
+            watcher: SpyActivityWatcher(),
+            scheduler: scheduler,
+            calendar: shanghai,
+            now: clock.now
+        )
+
+        _ = await nextSnapshot(from: store) { store.start() }
+        var firstMidnightPublication: UsageSnapshot?
+        let firstPublicationCancellable = store.$snapshot.dropFirst().prefix(1).sink {
+            firstMidnightPublication = $0
+        }
+        clock.set(midnight)
+        scheduler.advance(by: 30)
+        await loader.waitUntilStarted(count: 2)
+        let beforeSuccessCompletes = store.snapshot
+        let refreshed = await nextSnapshot(from: store) {
+            loader.release(call: 2)
+        }
+        XCTAssertEqual(firstMidnightPublication?.dailyTokens, .zero)
+        XCTAssertEqual(beforeSuccessCompletes.dailyTokens, .zero)
+        XCTAssertEqual(refreshed.dailyTokens, newDayTokens)
+        XCTAssertEqual(refreshed.quota.remainingPercent, 60)
+        XCTAssertEqual(refreshed.freshness, .live)
+        let activeMidnightTasks = scheduler.tasks.filter {
+            !$0.isCancelled && $0.repeatingInterval == nil
+        }
+        XCTAssertEqual(activeMidnightTasks.count, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(activeMidnightTasks.first).nextFireTime,
+            86_430,
+            accuracy: 0.001
+        )
+        withExtendedLifetime(firstPublicationCancellable) {}
     }
 
     func testRepeatedStartDoesNotDuplicateWatcherOrImmediateRefresh() async throws {
@@ -528,6 +689,65 @@ final class SequenceUsageLoader: UsageLoading, @unchecked Sendable {
     }
 }
 
+final class ControlledUsageLoader: UsageLoading, @unchecked Sendable {
+    private let condition = NSCondition()
+    private let results: [UsageLoadResult]
+    private let blockedCalls: Set<Int>
+    private var calls = 0
+    private var dates: [Date] = []
+    private var releasedCalls = Set<Int>()
+    private var startWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(results: [UsageLoadResult], blockedCalls: Set<Int>) {
+        self.results = results
+        self.blockedCalls = blockedCalls
+    }
+
+    var callDates: [Date] {
+        condition.lock()
+        defer { condition.unlock() }
+        return dates
+    }
+
+    func load(now: Date) -> UsageLoadResult {
+        condition.lock()
+        calls += 1
+        let call = calls
+        dates.append(now)
+        let readyWaiters = startWaiters.filter { $0.count <= calls }
+        startWaiters.removeAll { $0.count <= calls }
+        condition.unlock()
+        readyWaiters.forEach { $0.continuation.resume() }
+
+        condition.lock()
+        while blockedCalls.contains(call), !releasedCalls.contains(call) {
+            condition.wait()
+        }
+        condition.unlock()
+        return results[call - 1]
+    }
+
+    func waitUntilStarted(count: Int) async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if calls >= count {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                startWaiters.append((count, continuation))
+                condition.unlock()
+            }
+        }
+    }
+
+    func release(call: Int) {
+        condition.lock()
+        releasedCalls.insert(call)
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 final class RestartUsageLoader: UsageLoading, @unchecked Sendable {
     private let condition = NSCondition()
     private var calls = 0
@@ -783,6 +1003,25 @@ private func makeTokens(total: Int64) -> DailyTokenUsage {
         reasoningOutputTokens: total / 8,
         latestEventAt: Date(timeIntervalSince1970: TimeInterval(total))
     )
+}
+
+private func makeShanghaiDayBoundary() throws -> (
+    calendar: Calendar,
+    beforeMidnight: Date,
+    midnight: Date
+) {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Shanghai"))
+    let beforeMidnight = try XCTUnwrap(calendar.date(from: DateComponents(
+        year: 2026,
+        month: 8,
+        day: 1,
+        hour: 23,
+        minute: 59,
+        second: 30
+    )))
+    let midnight = try XCTUnwrap(calendar.date(byAdding: .second, value: 30, to: beforeMidnight))
+    return (calendar, beforeMidnight, midnight)
 }
 
 private func makeQuota(remainingPercent: Int, sourceName: String) -> QuotaSnapshot {
