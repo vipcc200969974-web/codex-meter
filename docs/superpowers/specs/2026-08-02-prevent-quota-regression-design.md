@@ -38,6 +38,8 @@ An older candidate is treated like a quota read failure:
 
 Equal timestamps remain eligible because the provider already resolves reset-cycle, source-priority, and highest-usage ties before constructing the snapshot.
 
+`UsageStore` receives its initial cached quota and cache-save action explicitly. `AppDelegate` supplies the real `UserDefaults` load/save behavior, while tests default to no cached quota and a no-op save action. This keeps the regression tests independent from the user's installed-app cache.
+
 ## Testing
 
 Add or update focused tests for these production failures:

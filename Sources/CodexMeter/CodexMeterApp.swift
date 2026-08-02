@@ -28,7 +28,10 @@ private enum PanelMetrics {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let usageStore = UsageStore()
+    private let usageStore = UsageStore(
+        cachedQuota: QuotaSnapshot.cached(),
+        cacheQuota: { $0.cache() }
+    )
     private var statusItem: NSStatusItem?
     private var statusView: CompactStatusItemView?
     private var panelWindow: NSPanel?
@@ -1242,8 +1245,11 @@ final class UsageStore: ObservableObject {
     private let calendar: Calendar
     private let now: @Sendable () -> Date
     private let watcherFactory: UsageWatcherFactory
+    private let cacheQuota: (QuotaSnapshot) -> Void
 
     init(
+        cachedQuota: QuotaSnapshot? = nil,
+        cacheQuota: @escaping (QuotaSnapshot) -> Void = { _ in },
         loader: any UsageLoading = LocalUsageLoader(),
         watcher: CodexActivityWatching? = nil,
         debounceInterval: TimeInterval = 0.8,
@@ -1264,7 +1270,8 @@ final class UsageStore: ObservableObject {
         self.calendar = calendar
         self.now = now
         self.watcherFactory = watcherFactory
-        let cachedQuota = QuotaSnapshot.cached() ?? .unavailable()
+        self.cacheQuota = cacheQuota
+        let cachedQuota = cachedQuota ?? .unavailable()
         self.snapshot = UsageSnapshot(
             quota: cachedQuota,
             dailyTokens: .zero,
@@ -1381,10 +1388,15 @@ final class UsageStore: ObservableObject {
                 guard let self, self.lifecycleGeneration == generation else { return }
                 let currentDay = self.resetDailyTokensIfDayChanged(at: self.now())
                 let old = self.snapshot
-                let quota = result.quota ?? old.quota
+                let acceptedQuota = result.quota.flatMap { candidate in
+                    old.quota.isUnavailable || candidate.lastUpdated >= old.quota.lastUpdated
+                        ? candidate
+                        : nil
+                }
+                let quota = acceptedQuota ?? old.quota
                 let isCurrentDayLoad = loadDay == currentDay
                 let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
-                let hasFreshQuota = result.quota != nil
+                let hasFreshQuota = acceptedQuota != nil
                 let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
                 if let isTaskActive = result.isTaskActive {
                     self.isTaskActive = isTaskActive
@@ -1402,8 +1414,8 @@ final class UsageStore: ObservableObject {
                     dailyTokenDay: currentDay,
                     freshness: hasFreshQuota && hasFreshTokens ? .live : (quota.isUnavailable ? .unavailable : .stale)
                 )
-                if let freshQuota = result.quota {
-                    freshQuota.cache()
+                if let acceptedQuota {
+                    self.cacheQuota(acceptedQuota)
                 }
                 if !isCurrentDayLoad {
                     self.refreshPending = true

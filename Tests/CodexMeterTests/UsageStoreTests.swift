@@ -85,6 +85,37 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(failedSnapshot.freshness, .stale)
     }
 
+    func testOlderQuotaResultCannotReplaceNewerPublishedSnapshot() async {
+        let newerTime = Date(timeIntervalSince1970: 1_200)
+        let olderTime = Date(timeIntervalSince1970: 1_100)
+        let newerCachedQuota = makeQuota(
+            remainingPercent: 54,
+            sourceName: "本机缓存",
+            lastUpdated: newerTime
+        )
+        let loader = SequenceUsageLoader(results: [
+            UsageLoadResult(
+                quota: makeQuota(
+                    remainingPercent: 64,
+                    sourceName: "Codex 日志",
+                    lastUpdated: olderTime
+                ),
+                dailyTokens: .zero
+            )
+        ])
+        let store = UsageStore(
+            cachedQuota: newerCachedQuota,
+            loader: loader,
+            watcher: nil
+        )
+
+        let afterOlderRefresh = await nextSnapshot(from: store) { store.refresh() }
+
+        XCTAssertEqual(afterOlderRefresh.quota.remainingPercent, 54)
+        XCTAssertEqual(afterOlderRefresh.quota.lastUpdated, newerTime)
+        XCTAssertEqual(afterOlderRefresh.freshness, .stale)
+    }
+
     func testFailedTokenReadKeepsPreviousValueAndAppliesFreshQuota() async throws {
         let initialTokens = DailyTokenUsage(
             totalTokens: 42,
@@ -1219,8 +1250,12 @@ private func makeShanghaiDayBoundary() throws -> (
     return (calendar, beforeMidnight, midnight)
 }
 
-private func makeQuota(remainingPercent: Int, sourceName: String) -> QuotaSnapshot {
-    let now = Date(timeIntervalSince1970: 1_000)
+private func makeQuota(
+    remainingPercent: Int,
+    sourceName: String,
+    lastUpdated: Date = Date(timeIntervalSince1970: 1_000)
+) -> QuotaSnapshot {
+    let now = lastUpdated
     return QuotaSnapshot(
         record: RateLimitRecord(
             timestamp: now,
@@ -1234,6 +1269,6 @@ private func makeQuota(remainingPercent: Int, sourceName: String) -> QuotaSnapsh
             ], now: now)
         ),
         sourceName: sourceName,
-        lastUpdated: now
+        lastUpdated: lastUpdated
     )
 }

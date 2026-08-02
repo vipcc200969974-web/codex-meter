@@ -14,6 +14,7 @@
 - Preserve newest-modification-first session file ordering.
 - Preserve discovery and selected-file read failure behavior.
 - Never cache or publish a quota observation older than the displayed observation.
+- Keep unit tests isolated from the installed app's `UserDefaults` quota cache.
 - Do not change refresh timing, daily Token accounting, task activity, colors, or layout.
 
 ---
@@ -171,7 +172,7 @@ git commit -m "fix: keep newest quota files within scan budget"
 
 **Interfaces:**
 - Consumes: `UsageLoadResult.quota: QuotaSnapshot?` and the current `UsageSnapshot.quota`.
-- Produces: accepted quota rule `old.isUnavailable || candidate.lastUpdated >= old.lastUpdated`.
+- Produces: injected `cachedQuota`, injected `cacheQuota`, and accepted quota rule `old.isUnavailable || candidate.lastUpdated >= old.lastUpdated`.
 
 - [ ] **Step 1: Add the failing publication regression test**
 
@@ -179,15 +180,12 @@ git commit -m "fix: keep newest quota files within scan budget"
 func testOlderQuotaResultCannotReplaceNewerPublishedSnapshot() async {
     let newerTime = Date(timeIntervalSince1970: 1_200)
     let olderTime = Date(timeIntervalSince1970: 1_100)
+    let newerCachedQuota = makeQuota(
+        remainingPercent: 54,
+        sourceName: "本机缓存",
+        lastUpdated: newerTime
+    )
     let loader = SequenceUsageLoader(results: [
-        UsageLoadResult(
-            quota: makeQuota(
-                remainingPercent: 54,
-                sourceName: "Codex 会话",
-                lastUpdated: newerTime
-            ),
-            dailyTokens: .zero
-        ),
         UsageLoadResult(
             quota: makeQuota(
                 remainingPercent: 64,
@@ -197,12 +195,14 @@ func testOlderQuotaResultCannotReplaceNewerPublishedSnapshot() async {
             dailyTokens: .zero
         )
     ])
-    let store = UsageStore(loader: loader, watcher: nil)
+    let store = UsageStore(
+        cachedQuota: newerCachedQuota,
+        loader: loader,
+        watcher: nil
+    )
 
-    let newest = await nextSnapshot(from: store) { store.refresh() }
     let afterOlderRefresh = await nextSnapshot(from: store) { store.refresh() }
 
-    XCTAssertEqual(newest.quota.remainingPercent, 54)
     XCTAssertEqual(afterOlderRefresh.quota.remainingPercent, 54)
     XCTAssertEqual(afterOlderRefresh.quota.lastUpdated, newerTime)
     XCTAssertEqual(afterOlderRefresh.freshness, .stale)
@@ -250,6 +250,56 @@ Expected: FAIL because `UsageStore.refresh()` currently publishes every non-nil 
 
 - [ ] **Step 3: Accept only an equal-or-newer quota observation**
 
+Add cache injection before the existing loader arguments:
+
+```swift
+private let cacheQuota: (QuotaSnapshot) -> Void
+
+init(
+    cachedQuota: QuotaSnapshot? = nil,
+    cacheQuota: @escaping (QuotaSnapshot) -> Void = { _ in },
+    loader: any UsageLoading = LocalUsageLoader(),
+    watcher: CodexActivityWatching? = nil,
+    debounceInterval: TimeInterval = 0.8,
+    fallbackInterval: TimeInterval = 60,
+    scheduler: any UsageScheduling = FoundationUsageScheduler(),
+    calendar: Calendar = .autoupdatingCurrent,
+    now: @escaping @Sendable () -> Date = Date.init,
+    watcherFactory: @escaping UsageWatcherFactory = {
+        CodexActivityWatcher(onChange: $0)
+    }
+) {
+    self.loader = loader
+    self.watcher = watcher
+    self.createsWatcher = watcher == nil
+    self.debounceInterval = debounceInterval
+    self.fallbackInterval = fallbackInterval
+    self.scheduler = scheduler
+    self.calendar = calendar
+    self.now = now
+    self.watcherFactory = watcherFactory
+    self.cacheQuota = cacheQuota
+    let cachedQuota = cachedQuota ?? .unavailable()
+    self.snapshot = UsageSnapshot(
+        quota: cachedQuota,
+        dailyTokens: .zero,
+        dailyTokenDay: calendar.startOfDay(for: now()),
+        freshness: cachedQuota.isUnavailable ? .unavailable : .stale
+    )
+    let savedInterval = UserDefaults.standard.integer(forKey: CacheKey.voiceBroadcastIntervalMinutes)
+    self.voiceBroadcastIntervalMinutes = Self.allowedVoiceBroadcastIntervals.contains(savedInterval) ? savedInterval : 1
+}
+```
+
+Construct the production store with the real cache while tests use the isolated defaults:
+
+```swift
+private let usageStore = UsageStore(
+    cachedQuota: QuotaSnapshot.cached(),
+    cacheQuota: { $0.cache() }
+)
+```
+
 In the main-thread completion block, replace the direct quota assignment with:
 
 ```swift
@@ -268,7 +318,7 @@ Cache only `acceptedQuota`:
 
 ```swift
 if let acceptedQuota {
-    acceptedQuota.cache()
+    self.cacheQuota(acceptedQuota)
 }
 ```
 
