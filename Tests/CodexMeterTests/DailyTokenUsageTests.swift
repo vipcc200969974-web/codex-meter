@@ -264,6 +264,49 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(event.usage.reasoningOutputTokens, 20)
     }
 
+    func testRejectsMalformedLiveTokenMetrics() {
+        let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
+        let interval = DateInterval(start: start, duration: 86_400)
+        let malformedMetrics = [
+            #"{"input_tokens":-1,"total_tokens":10}"#,
+            #"{"input_tokens":10,"cached_input_tokens":11,"total_tokens":20}"#,
+            #"{"output_tokens":10,"reasoning_output_tokens":11,"total_tokens":20}"#,
+            #"{"input_tokens":11,"output_tokens":10,"total_tokens":20}"#,
+            #"{"input_tokens":9223372036854775806,"output_tokens":9223372036854775806,"total_tokens":9223372036854775806}"#,
+            #"{"total_tokens":9223372036854775807}"#,
+            #"{"total_tokens":9.223372036854776e18}"#
+        ]
+
+        for metrics in malformedMetrics {
+            let line = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":\#(metrics)}}}"#
+            XCTAssertNil(
+                DailyTokenLogParser.parse(line: line, inside: interval),
+                "Accepted malformed metrics: \(metrics)"
+            )
+        }
+    }
+
+    func testMalformedOversizedRecordDoesNotPublishOrPoisonLaterValidUsage() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("rollout-malformed.jsonl")
+        let malformed = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":9.223372036854776e18}}}}"#
+        try (malformed + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertEqual(try provider.currentUsage(now: now), .zero)
+
+        let valid = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":10}}}}"#
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((valid + "\n").utf8))
+        try handle.close()
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 10)
+    }
+
     func testParsesTokenCountWithValidJSONWhitespace() throws {
         let start = ISO8601DateFormatter().date(from: "2026-07-31T16:00:00Z")!
         let interval = DateInterval(start: start, duration: 86_400)

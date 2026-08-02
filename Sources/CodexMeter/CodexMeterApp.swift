@@ -1394,6 +1394,7 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
         text: String,
         now: Date
     ) -> RateLimitRecord? {
+        guard RateLimitWindow.isRepresentableEpoch(timestamp) else { return nil }
         let windows = [
             headerWindow(prefix: "primary", in: text),
             headerWindow(prefix: "secondary", in: text)
@@ -1416,11 +1417,12 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
             return nil
         }
 
-        return RateLimitWindow(
+        let window = RateLimitWindow(
             usedPercent: usedPercent,
             resetsAt: resetsAt,
             windowMinutes: windowMinutes
         )
+        return window.isValid ? window : nil
     }
 
     private func runSQLiteRows(databasePath: String, query: String) -> [SQLiteLogRow]? {
@@ -1657,6 +1659,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     ) -> RateLimitRecord? {
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let timestamp = parseDate(object["timestamp"] as? String),
               let payload = object["payload"] as? [String: Any],
               let rateLimits = payload["rate_limits"] as? [String: Any],
               isAggregateCodexLimit(rateLimits) else {
@@ -1671,7 +1674,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         guard !windowSet.isEmpty else { return nil }
 
         return RateLimitRecord(
-            timestamp: parseDate(object["timestamp"] as? String),
+            timestamp: timestamp,
             fileModifiedAt: fileModifiedAt,
             windowSet: windowSet
         )
@@ -1709,11 +1712,12 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
               let resetsAt = Self.double(dictionary["resets_at"]) else {
             return nil
         }
-        return RateLimitWindow(
+        let window = RateLimitWindow(
             usedPercent: usedPercent,
             resetsAt: resetsAt,
             windowMinutes: Self.int(dictionary["window_minutes"])
         )
+        return window.isValid ? window : nil
     }
 
     private static func parseDate(_ value: String?) -> Date? {
@@ -1734,16 +1738,18 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     }
 
     private static func double(_ value: Any?) -> Double? {
+        let result: Double?
         if let double = value as? Double {
-            return double
+            result = double
+        } else if let int = value as? Int {
+            result = Double(int)
+        } else if let string = value as? String {
+            result = Double(string)
+        } else {
+            result = nil
         }
-        if let int = value as? Int {
-            return Double(int)
-        }
-        if let string = value as? String {
-            return Double(string)
-        }
-        return nil
+        guard let result, result.isFinite else { return nil }
+        return result
     }
 
     private static func int(_ value: Any?) -> Int? {
@@ -1751,7 +1757,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             return int
         }
         if let double = value as? Double {
-            return Int(double)
+            return Int(exactly: double)
         }
         if let string = value as? String {
             return Int(string)
@@ -2028,21 +2034,31 @@ enum QuotaWindowKind: Int, CaseIterable, Sendable {
 }
 
 struct RateLimitWindow: Sendable {
+    private static let maximumExactlyRepresentableInteger = 9_007_199_254_740_991.0
+
     let usedPercent: Double
     let resetsAt: Double
     let windowMinutes: Int?
+
+    var isValid: Bool {
+        // Ingress is intentionally strict: quota usage is 0...100 and only
+        // the two window durations rendered by the app are accepted.
+        usedPercent.isFinite
+            && (0...100).contains(usedPercent)
+            && Self.isRepresentableEpoch(resetsAt)
+            && windowMinutes.flatMap(QuotaWindowKind.init(rawValue:)) != nil
+    }
+
+    static func isRepresentableEpoch(_ value: Double) -> Bool {
+        value.isFinite && value >= 0 && value <= maximumExactlyRepresentableInteger
+    }
 
     var kind: QuotaWindowKind? {
         windowMinutes.flatMap { QuotaWindowKind(rawValue: $0) }
     }
 
     var canonicalResetEpochSecond: Int64? {
-        let maximumExactlyRepresentableInteger = 9_007_199_254_740_991.0
-        guard resetsAt.isFinite,
-              resetsAt >= 0,
-              resetsAt <= maximumExactlyRepresentableInteger else {
-            return nil
-        }
+        guard Self.isRepresentableEpoch(resetsAt) else { return nil }
         return Int64(resetsAt.rounded(.toNearestOrAwayFromZero))
     }
 }
@@ -2052,7 +2068,7 @@ struct RateLimitWindowSet: Sendable {
     let weekly: RateLimitWindow?
 
     init(windows: [RateLimitWindow], now: Date) {
-        let active = windows.filter { $0.resetsAt > now.timeIntervalSince1970 }
+        let active = windows.filter { $0.isValid && $0.resetsAt > now.timeIntervalSince1970 }
         fiveHour = active.last { $0.kind == .fiveHour }
         weekly = active.last { $0.kind == .weekly }
     }
@@ -2074,7 +2090,7 @@ struct QuotaWindowSnapshot: Sendable {
     }
 
     init?(window: RateLimitWindow) {
-        guard let kind = window.kind else { return nil }
+        guard window.isValid, let kind = window.kind else { return nil }
         let usedPercent = Int(window.usedPercent.rounded())
         self.init(
             kind: kind,

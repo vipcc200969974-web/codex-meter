@@ -28,6 +28,29 @@ final class CodexLogQuotaProviderTests: XCTestCase {
         ))
     }
 
+    func testRejectsMalformedQuotaHeaderNumbers() {
+        let malformedHeaders = [
+            #"{"x-codex-primary-used-percent": "NaN", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "2000"}"#,
+            #"{"x-codex-primary-used-percent": "inf", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "2000"}"#,
+            #"{"x-codex-primary-used-percent": "-1", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "2000"}"#,
+            #"{"x-codex-primary-used-percent": "101", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "2000"}"#,
+            #"{"x-codex-primary-used-percent": "35", "x-codex-primary-window-minutes": "10080", "x-codex-primary-reset-at": "9007199254740992"}"#,
+            #"{"x-codex-primary-used-percent": "35", "x-codex-primary-window-minutes": "-300", "x-codex-primary-reset-at": "2000"}"#,
+            #"{"x-codex-primary-used-percent": "35", "x-codex-primary-window-minutes": "9223372036854775808", "x-codex-primary-reset-at": "2000"}"#
+        ]
+
+        for header in malformedHeaders {
+            XCTAssertNil(
+                CodexLogQuotaProvider.parseHeaderRecord(
+                    timestamp: 1_100,
+                    text: header,
+                    now: now
+                ),
+                "Accepted malformed header: \(header)"
+            )
+        }
+    }
+
     func testReadsLatestQuotaFromLargeSQLiteResult() throws {
         let databaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-\(UUID().uuidString).sqlite")

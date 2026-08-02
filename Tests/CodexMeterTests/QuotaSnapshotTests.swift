@@ -39,4 +39,22 @@ final class QuotaSnapshotTests: XCTestCase {
         XCTAssertTrue(snapshot.showsWeeklySecondary)
         XCTAssertEqual(snapshot.weeklyPercentText, "65%")
     }
+
+    func testSnapshotRejectsNonFiniteAndOutOfRangeUsageBeforeRounding() {
+        XCTAssertNil(QuotaWindowSnapshot(window: RateLimitWindow(
+            usedPercent: .nan,
+            resetsAt: 2_000,
+            windowMinutes: 300
+        )))
+        XCTAssertNil(QuotaWindowSnapshot(window: RateLimitWindow(
+            usedPercent: .infinity,
+            resetsAt: 2_000,
+            windowMinutes: 300
+        )))
+        XCTAssertNil(QuotaWindowSnapshot(window: RateLimitWindow(
+            usedPercent: 101,
+            resetsAt: 2_000,
+            windowMinutes: 300
+        )))
+    }
 }

@@ -17,6 +17,23 @@ struct DailyTokenUsage: Codable, Equatable, Sendable {
         latestEventAt: nil
     )
 
+    var hasValidMetrics: Bool {
+        let values = [
+            totalTokens,
+            cachedInputTokens,
+            nonCachedInputTokens,
+            outputTokens,
+            reasoningOutputTokens
+        ]
+        guard values.allSatisfy({ $0 >= 0 && $0 < Int64.max }) else { return false }
+        guard reasoningOutputTokens <= outputTokens else { return false }
+        let (inputTokens, inputOverflow) = cachedInputTokens.addingReportingOverflow(
+            nonCachedInputTokens
+        )
+        let (components, componentOverflow) = inputTokens.addingReportingOverflow(outputTokens)
+        return !inputOverflow && !componentOverflow && components <= totalTokens
+    }
+
     static func + (lhs: Self, rhs: Self) -> Self {
         Self(
             totalTokens: lhs.totalTokens + rhs.totalTokens,
@@ -121,29 +138,53 @@ struct JSONDailyTokenEventDecoder: DailyTokenEventDecoding, Sendable {
 
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
-            inputTokens = Self.metric(.inputTokens, from: values)
-            cachedInputTokens = Self.metric(.cachedInputTokens, from: values)
-            outputTokens = Self.metric(.outputTokens, from: values)
-            reasoningOutputTokens = Self.metric(.reasoningOutputTokens, from: values)
-            totalTokens = Self.metric(.totalTokens, from: values)
+            inputTokens = try Self.metric(.inputTokens, from: values)
+            cachedInputTokens = try Self.metric(.cachedInputTokens, from: values)
+            outputTokens = try Self.metric(.outputTokens, from: values)
+            reasoningOutputTokens = try Self.metric(.reasoningOutputTokens, from: values)
+            totalTokens = try Self.metric(.totalTokens, from: values)
         }
 
         private static func metric(
             _ key: CodingKeys,
             from values: KeyedDecodingContainer<CodingKeys>
-        ) -> Int64 {
+        ) throws -> Int64 {
+            guard values.contains(key), (try? values.decodeNil(forKey: key)) != true else {
+                return 0
+            }
             if let value = try? values.decode(Int64.self, forKey: key) {
-                return max(value, 0)
+                guard value >= 0, value < Int64.max else {
+                    throw invalidMetric(key, in: values)
+                }
+                return value
             }
-            if let value = try? values.decode(Double.self, forKey: key), value.isFinite {
-                guard value > 0 else { return 0 }
-                return value >= Double(Int64.max) ? Int64.max : Int64(value)
+            if let value = try? values.decode(Double.self, forKey: key) {
+                guard value.isFinite,
+                      let integer = Int64(exactly: value),
+                      integer >= 0,
+                      integer < Int64.max else {
+                    throw invalidMetric(key, in: values)
+                }
+                return integer
             }
-            if let value = try? values.decode(String.self, forKey: key),
-               let number = Int64(value) {
-                return max(number, 0)
+            if let value = try? values.decode(String.self, forKey: key) {
+                guard let integer = Int64(value), integer >= 0, integer < Int64.max else {
+                    throw invalidMetric(key, in: values)
+                }
+                return integer
             }
-            return 0
+            throw invalidMetric(key, in: values)
+        }
+
+        private static func invalidMetric(
+            _ key: CodingKeys,
+            in values: KeyedDecodingContainer<CodingKeys>
+        ) -> DecodingError {
+            DecodingError.dataCorruptedError(
+                forKey: key,
+                in: values,
+                debugDescription: "Token metric must be a nonnegative representable Int64"
+            )
         }
     }
 
@@ -152,21 +193,21 @@ struct JSONDailyTokenEventDecoder: DailyTokenEventDecoding, Sendable {
               envelope.payload.type == "token_count",
               let last = envelope.payload.info?.lastTokenUsage,
               last.totalTokens > 0,
+              last.cachedInputTokens <= last.inputTokens,
               let timestamp = timestampParser.parse(envelope.timestamp) else {
             return nil
         }
 
-        return DailyTokenEvent(
-            timestamp: timestamp,
-            usage: DailyTokenUsage(
-                totalTokens: last.totalTokens,
-                cachedInputTokens: last.cachedInputTokens,
-                nonCachedInputTokens: max(last.inputTokens - last.cachedInputTokens, 0),
-                outputTokens: last.outputTokens,
-                reasoningOutputTokens: last.reasoningOutputTokens,
-                latestEventAt: timestamp
-            )
+        let usage = DailyTokenUsage(
+            totalTokens: last.totalTokens,
+            cachedInputTokens: last.cachedInputTokens,
+            nonCachedInputTokens: last.inputTokens - last.cachedInputTokens,
+            outputTokens: last.outputTokens,
+            reasoningOutputTokens: last.reasoningOutputTokens,
+            latestEventAt: timestamp
         )
+        guard usage.hasValidMetrics else { return nil }
+        return DailyTokenEvent(timestamp: timestamp, usage: usage)
     }
 }
 
@@ -483,22 +524,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
     }
 
     private static func isValid(_ usage: DailyTokenUsage, inside interval: DateInterval) -> Bool {
-        let values = [
-            usage.totalTokens,
-            usage.cachedInputTokens,
-            usage.nonCachedInputTokens,
-            usage.outputTokens,
-            usage.reasoningOutputTokens
-        ]
-        guard values.allSatisfy({ $0 >= 0 && $0 < Int64.max }) else { return false }
-        guard usage.reasoningOutputTokens <= usage.outputTokens else { return false }
-        let (inputTokens, inputOverflow) = usage.cachedInputTokens.addingReportingOverflow(
-            usage.nonCachedInputTokens
-        )
-        let (components, componentOverflow) = inputTokens.addingReportingOverflow(usage.outputTokens)
-        guard !inputOverflow, !componentOverflow, components <= usage.totalTokens else {
-            return false
-        }
+        guard usage.hasValidMetrics else { return false }
         if usage.totalTokens == 0 {
             return usage.latestEventAt == nil
         }

@@ -44,6 +44,74 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         ))
     }
 
+    func testRejectsMalformedSessionQuotaNumbers() {
+        let malformedWindows = [
+            #"{"used_percent":"NaN","window_minutes":10080,"resets_at":2000}"#,
+            #"{"used_percent":"inf","window_minutes":10080,"resets_at":2000}"#,
+            #"{"used_percent":-1,"window_minutes":10080,"resets_at":2000}"#,
+            #"{"used_percent":101,"window_minutes":10080,"resets_at":2000}"#,
+            #"{"used_percent":35,"window_minutes":10080,"resets_at":9007199254740992}"#,
+            #"{"used_percent":35,"window_minutes":-300,"resets_at":2000}"#,
+            #"{"used_percent":35,"window_minutes":"9223372036854775808","resets_at":2000}"#
+        ]
+
+        for window in malformedWindows {
+            let line = #"{"timestamp":"1970-01-01T00:16:40Z","payload":{"rate_limits":{"limit_id":"codex","primary":\#(window)}}}"#
+            XCTAssertNil(
+                CodexSessionQuotaProvider.parseRecord(
+                    line: line,
+                    fileModifiedAt: now,
+                    now: now
+                ),
+                "Accepted malformed session window: \(window)"
+            )
+        }
+    }
+
+    func testRejectsUnrepresentableNumericSessionWindowMinutes() {
+        let line = #"{"timestamp":"1970-01-01T00:16:40Z","payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":1e20,"resets_at":2000}}}}"#
+
+        XCTAssertNil(CodexSessionQuotaProvider.parseRecord(
+            line: line,
+            fileModifiedAt: now,
+            now: now
+        ))
+    }
+
+    func testRejectsMissingOrMalformedSessionEventTimestamp() {
+        let missing = #"{"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":10080,"resets_at":2000}}}}"#
+        let malformed = #"{"timestamp":"not-a-date","payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":10080,"resets_at":2000}}}}"#
+
+        for line in [missing, malformed] {
+            XCTAssertNil(CodexSessionQuotaProvider.parseRecord(
+                line: line,
+                fileModifiedAt: Date(timeIntervalSince1970: 1_500),
+                now: now
+            ))
+        }
+    }
+
+    func testLaterUnrelatedAppendCannotRefreshTimestampLessQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        let timestampLessQuota = #"{"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":10080,"resets_at":2000}}}}"#
+        let unrelatedAppend = #"{"timestamp":"1970-01-01T00:25:00Z","payload":{"type":"message","content":"unrelated"}}"#
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "timestamp-less.jsonl",
+            lines: [timestampLessQuota, unrelatedAppend],
+            modifiedAt: Date(timeIntervalSince1970: 1_500)
+        )
+
+        let testNow = now
+        XCTAssertTrue(CodexSessionQuotaProvider(
+            roots: [activeRoot],
+            now: { testNow }
+        ).currentWindowObservations().isEmpty)
+    }
+
     func testReadsMonotonicFiveHourAndWeeklyWindowsFromActiveAndArchivedLogs() throws {
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
