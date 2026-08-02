@@ -33,18 +33,58 @@
 
 **Interfaces:**
 - Consumes: existing `PanelGlassBackground` SwiftUI surface and its main-panel and actions-popover call sites.
-- Produces: `PanelGlassSurfaceRole`, `PanelGlassSurfaceRole.castsOuterShadow: Bool`, and `PanelGlassBackground(role:)`.
+- Produces: `PanelGlassSurfaceRole`, `PanelGlassSurfaceRole.castsOuterShadow: Bool`, and `PanelGlassBackground(role:)` with rendered main-panel transparency outside the glass card.
 
 - [ ] **Step 1: Write the failing role-policy test**
 
 ```swift
+import AppKit
+import SwiftUI
 import XCTest
 @testable import CodexMeter
 
+@MainActor
 final class PanelGlassBackgroundTests: XCTestCase {
-    func testMainPanelOmitsOuterShadowWhileActionsPopoverKeepsIt() {
-        XCTAssertFalse(PanelGlassSurfaceRole.mainPanel.castsOuterShadow)
-        XCTAssertTrue(PanelGlassSurfaceRole.actionsPopover.castsOuterShadow)
+    func testMainPanelRendersTransparentOutsideGlassSurface() throws {
+        let image = try render(role: .mainPanel)
+
+        XCTAssertLessThan(maximumOuterAlpha(in: image), 0.001)
+    }
+
+    func testActionsPopoverRetainsRenderedOuterShadow() throws {
+        let image = try render(role: .actionsPopover)
+
+        XCTAssertGreaterThan(maximumOuterAlpha(in: image), 0.001)
+    }
+
+    private func render(role: PanelGlassSurfaceRole) throws -> NSImage {
+        let renderer = ImageRenderer(
+            content: PanelGlassBackground(role: role)
+                .frame(width: 100, height: 100)
+                .padding(30)
+        )
+        renderer.proposedSize = ProposedViewSize(width: 160, height: 160)
+        renderer.scale = 1
+
+        return try XCTUnwrap(renderer.nsImage)
+    }
+
+    private func maximumOuterAlpha(in image: NSImage) -> CGFloat {
+        guard
+            let tiff = image.tiffRepresentation,
+            let bitmap = NSBitmapImageRep(data: tiff)
+        else {
+            return 1
+        }
+
+        var maximum: CGFloat = 0
+        for y in 0..<bitmap.pixelsHigh {
+            for x in 0..<bitmap.pixelsWide
+            where x < 20 || x >= bitmap.pixelsWide - 20 || y < 20 || y >= bitmap.pixelsHigh - 20 {
+                maximum = max(maximum, bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0)
+            }
+        }
+        return maximum
     }
 }
 ```
@@ -59,7 +99,7 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/swiftpm-module-cache" \
 swift test --filter PanelGlassBackgroundTests
 ```
 
-Expected: FAIL because `PanelGlassSurfaceRole` is not defined.
+Expected: FAIL because `PanelGlassSurfaceRole` and `PanelGlassBackground(role:)` are not defined.
 
 - [ ] **Step 3: Add the role policy and apply it at both call sites**
 
@@ -174,7 +214,7 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/swiftpm-module-cache" \
 swift test --filter PanelGlassBackgroundTests
 ```
 
-Expected: PASS with one test and no unexpected-signal output.
+Expected: PASS with two tests and no unexpected-signal output. The main-panel render has no pixels outside the glass surface, while the actions-popover render retains visible shadow pixels.
 
 - [ ] **Step 5: Commit the behavior change**
 
