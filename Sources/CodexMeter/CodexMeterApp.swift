@@ -2358,6 +2358,56 @@ struct QuotaWindowSnapshot: Sendable {
     }
 }
 
+enum QuotaColorBand: Equatable {
+    case critical
+    case warning
+    case healthy
+
+    init(remainingPercent: Int) {
+        switch remainingPercent {
+        case 0...20:
+            self = .critical
+        case 21...50:
+            self = .warning
+        default:
+            self = .healthy
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .critical:
+            return .red
+        case .warning:
+            return .orange
+        case .healthy:
+            return .green
+        }
+    }
+
+    var tagBackgroundColor: NSColor {
+        switch self {
+        case .critical:
+            return NSColor(calibratedRed: 1.0, green: 0.784, blue: 0.780, alpha: 0.92)
+        case .warning:
+            return NSColor(calibratedRed: 1.000, green: 0.820, blue: 0.550, alpha: 0.94)
+        case .healthy:
+            return NSColor(calibratedRed: 0.722, green: 0.953, blue: 0.820, alpha: 0.92)
+        }
+    }
+
+    var tagTextColor: NSColor {
+        switch self {
+        case .critical:
+            return NSColor(calibratedRed: 0.290, green: 0.071, blue: 0.075, alpha: 1)
+        case .warning:
+            return NSColor(calibratedRed: 0.400, green: 0.200, blue: 0.000, alpha: 1)
+        case .healthy:
+            return NSColor(calibratedRed: 0.063, green: 0.247, blue: 0.157, alpha: 1)
+        }
+    }
+}
+
 struct QuotaSnapshot: Sendable {
     let mainWindow: QuotaWindowSnapshot?
     let weeklyWindow: QuotaWindowSnapshot?
@@ -2498,54 +2548,21 @@ struct QuotaSnapshot: Sendable {
 
     var tint: Color {
         guard let mainWindow else { return .secondary }
-        return Self.tint(for: mainWindow.remainingPercent)
+        return QuotaColorBand(remainingPercent: mainWindow.remainingPercent).tint
     }
 
     var tagBackgroundColor: NSColor {
         guard let mainWindow else { return NSColor(calibratedWhite: 1, alpha: 0.36) }
-        return Self.tagBackgroundColor(for: mainWindow.remainingPercent)
+        return QuotaColorBand(remainingPercent: mainWindow.remainingPercent).tagBackgroundColor
     }
 
     var tagTextColor: NSColor {
         guard let mainWindow else { return .labelColor }
-        return Self.tagTextColor(for: mainWindow.remainingPercent)
+        return QuotaColorBand(remainingPercent: mainWindow.remainingPercent).tagTextColor
     }
 
     var weeklyTint: Color {
-        Self.tint(for: weeklyWindow?.remainingPercent ?? 0)
-    }
-
-    private static func tint(for percent: Int) -> Color {
-        switch percent {
-        case 0...20:
-            return .red
-        case 21...45:
-            return .yellow
-        default:
-            return .green
-        }
-    }
-
-    private static func tagBackgroundColor(for percent: Int) -> NSColor {
-        switch percent {
-        case 0...20:
-            return NSColor(calibratedRed: 1.0, green: 0.784, blue: 0.780, alpha: 0.92)
-        case 21...45:
-            return NSColor(calibratedRed: 0.973, green: 0.910, blue: 0.714, alpha: 0.92)
-        default:
-            return NSColor(calibratedRed: 0.722, green: 0.953, blue: 0.820, alpha: 0.92)
-        }
-    }
-
-    private static func tagTextColor(for percent: Int) -> NSColor {
-        switch percent {
-        case 0...20:
-            return NSColor(calibratedRed: 0.290, green: 0.071, blue: 0.075, alpha: 1)
-        case 21...45:
-            return NSColor(calibratedRed: 0.227, green: 0.176, blue: 0.043, alpha: 1)
-        default:
-            return NSColor(calibratedRed: 0.063, green: 0.247, blue: 0.157, alpha: 1)
-        }
+        QuotaColorBand(remainingPercent: weeklyWindow?.remainingPercent ?? 0).tint
     }
 
     var resetText: String {
