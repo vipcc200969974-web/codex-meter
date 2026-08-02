@@ -1452,12 +1452,14 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     private let roots: [URL]
     private let maxBytesPerFile: UInt64
     private let maxTotalBytes: UInt64
+    private let fileDiscovery: any SessionFileDiscovering
     private let now: @Sendable () -> Date
 
     init(
         roots: [URL]? = nil,
         maxBytesPerFile: UInt64 = 64 * 1_024 * 1_024,
         maxTotalBytes: UInt64 = 256 * 1_024 * 1_024,
+        fileDiscovery: (any SessionFileDiscovering)? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.roots = roots ?? [
@@ -1466,6 +1468,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         ]
         self.maxBytesPerFile = maxBytesPerFile
         self.maxTotalBytes = maxTotalBytes
+        self.fileDiscovery = fileDiscovery ?? LocalSessionFileDiscovery()
         self.now = now
     }
 
@@ -1485,7 +1488,12 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
 
     private func recentRateLimitRecords(now: Date) -> [RateLimitRecord]? {
         let lowerBound = QuotaHistoryBounds.lowerBound(for: now)
-        let files = deduplicatedSessionFiles(overlapping: lowerBound)
+        let files: [SessionFile]
+        do {
+            files = try deduplicatedSessionFiles(overlapping: lowerBound)
+        } catch {
+            return nil
+        }
         guard filesFitScanBudget(files) else { return nil }
 
         var records: [RateLimitRecord] = []
@@ -1518,9 +1526,12 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         return true
     }
 
-    private func deduplicatedSessionFiles(overlapping lowerBound: Date) -> [SessionFile] {
-        let candidates = roots.flatMap { recentJSONLFiles(under: $0) }
-            .filter { $0.modifiedAt >= lowerBound }
+    private func deduplicatedSessionFiles(overlapping lowerBound: Date) throws -> [SessionFile] {
+        var candidates: [SessionFile] = []
+        for root in roots {
+            candidates.append(contentsOf: try fileDiscovery.recentJSONLFiles(under: root))
+        }
+        candidates = candidates.filter { $0.modifiedAt >= lowerBound }
         var filesByRolloutName: [String: SessionFile] = [:]
 
         for candidate in candidates {
@@ -1542,36 +1553,6 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             }
             return lhs.url.path < rhs.url.path
         }
-    }
-
-    private func recentJSONLFiles(under root: URL) -> [SessionFile] {
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        var files: [SessionFile] = []
-        for case let url as URL in enumerator {
-            guard url.pathExtension == "jsonl" else { continue }
-            guard let values = try? url.resourceValues(
-                forKeys: [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey]
-            ),
-                  values.isRegularFile == true,
-                  let modifiedAt = values.contentModificationDate,
-                  let fileSize = values.fileSize,
-                  fileSize >= 0 else {
-                continue
-            }
-            files.append(SessionFile(
-                url: url,
-                modifiedAt: modifiedAt,
-                byteCount: UInt64(fileSize)
-            ))
-        }
-        return files
     }
 
     private func rateLimitRecords(
@@ -1859,7 +1840,100 @@ private enum RateLimitWindowReducer {
     }
 }
 
-private struct SessionFile {
+protocol SessionFileDiscovering: Sendable {
+    func recentJSONLFiles(under root: URL) throws -> [SessionFile]
+}
+
+final class LocalSessionFileDiscovery: SessionFileDiscovering, @unchecked Sendable {
+    typealias EnumeratorFactory = (
+        URL,
+        [URLResourceKey],
+        @escaping (URL, Error) -> Bool
+    ) -> FileManager.DirectoryEnumerator?
+
+    private let fileManager: FileManager
+    private let enumeratorFactory: EnumeratorFactory
+
+    init(
+        fileManager: FileManager = .default,
+        enumeratorFactory: EnumeratorFactory? = nil
+    ) {
+        self.fileManager = fileManager
+        self.enumeratorFactory = enumeratorFactory ?? { root, keys, errorHandler in
+            fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles],
+                errorHandler: errorHandler
+            )
+        }
+    }
+
+    func recentJSONLFiles(under root: URL) throws -> [SessionFile] {
+        guard try directoryExists(at: root) else { return [] }
+        let keys: [URLResourceKey] = [
+            .contentModificationDateKey,
+            .isRegularFileKey,
+            .fileSizeKey
+        ]
+        var traversalError: Error?
+        guard let enumerator = enumeratorFactory(root, keys, { _, error in
+            traversalError = error
+            return false
+        }) else {
+            throw SessionFileDiscoveryError.cannotEnumerateRoot(root)
+        }
+
+        var files: [SessionFile] = []
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            let attributes = try fileManager.attributesOfItem(atPath: url.path)
+            guard let fileType = attributes[.type] as? FileAttributeType else {
+                throw SessionFileDiscoveryError.missingRequiredMetadata(url)
+            }
+            guard fileType == .typeRegular else { continue }
+            guard let modifiedAt = attributes[.modificationDate] as? Date,
+                  let fileSize = attributes[.size] as? NSNumber,
+                  fileSize.int64Value >= 0 else {
+                throw SessionFileDiscoveryError.missingRequiredMetadata(url)
+            }
+            files.append(SessionFile(
+                url: url,
+                modifiedAt: modifiedAt,
+                byteCount: fileSize.uint64Value
+            ))
+        }
+        if let traversalError {
+            throw traversalError
+        }
+        return files
+    }
+
+    private func directoryExists(at root: URL) throws -> Bool {
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try fileManager.attributesOfItem(atPath: root.path)
+        } catch {
+            let cocoaError = error as NSError
+            if cocoaError.domain == NSCocoaErrorDomain,
+               [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(cocoaError.code) {
+                return false
+            }
+            throw error
+        }
+        guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+            throw SessionFileDiscoveryError.rootIsNotDirectory(root)
+        }
+        return true
+    }
+}
+
+enum SessionFileDiscoveryError: Error {
+    case cannotEnumerateRoot(URL)
+    case missingRequiredMetadata(URL)
+    case rootIsNotDirectory(URL)
+}
+
+struct SessionFile: Sendable {
     let url: URL
     let modifiedAt: Date
     let byteCount: UInt64

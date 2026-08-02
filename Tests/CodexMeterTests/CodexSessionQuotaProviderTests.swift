@@ -2,6 +2,22 @@ import Foundation
 import XCTest
 @testable import CodexMeter
 
+private final class CandidateMetadataErrorFileManager: FileManager, @unchecked Sendable {
+    private let targetFile: URL
+
+    init(targetFile: URL) {
+        self.targetFile = targetFile.standardizedFileURL
+        super.init()
+    }
+
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+        if URL(fileURLWithPath: path).standardizedFileURL == targetFile {
+            throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: path])
+        }
+        return try super.attributesOfItem(atPath: path)
+    }
+}
+
 final class CodexSessionQuotaProviderTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
 
@@ -355,6 +371,163 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
 
         XCTAssertEqual(weekly.window.usedPercent, 3)
         XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_200))
+    }
+
+    func testCandidateMetadataFailureInvalidatesReadableSessionQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "readable-lower.jsonl",
+            lines: [rateLimitLine(
+                timestamp: 1_100,
+                usedPercent: 12,
+                resetsAt: 2_000,
+                windowMinutes: 10_080
+            )]
+        )
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "metadata-failure.jsonl",
+            lines: [rateLimitLine(
+                timestamp: 1_200,
+                usedPercent: 81,
+                resetsAt: 2_000,
+                windowMinutes: 10_080
+            )]
+        )
+        let failingFile = activeRoot.appendingPathComponent("metadata-failure.jsonl")
+        let discovery = LocalSessionFileDiscovery(
+            fileManager: CandidateMetadataErrorFileManager(targetFile: failingFile)
+        )
+
+        let testNow = now
+        let observations = CodexSessionQuotaProvider(
+            roots: [activeRoot],
+            fileDiscovery: discovery,
+            now: { testNow }
+        ).currentWindowObservations()
+
+        XCTAssertTrue(observations.isEmpty)
+    }
+
+    func testMissingRootIsEmptyWhileReadableRootStillPublishesQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        let missingRoot = temporaryRoot.appendingPathComponent("never-created")
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "readable.jsonl",
+            lines: [rateLimitLine(
+                timestamp: 1_100,
+                usedPercent: 23,
+                resetsAt: 2_000,
+                windowMinutes: 10_080
+            )]
+        )
+
+        let testNow = now
+        let weekly = try XCTUnwrap(
+            CodexSessionQuotaProvider(
+                roots: [activeRoot, missingRoot],
+                now: { testNow }
+            ).currentWindowObservations().first { $0.window.kind == .weekly }
+        )
+
+        XCTAssertEqual(weekly.window.usedPercent, 23)
+    }
+
+    func testEnumeratorCreationFailureInvalidatesReadableSessionQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        let failingRoot = temporaryRoot.appendingPathComponent("cannot-enumerate")
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "readable.jsonl",
+            lines: [rateLimitLine(
+                timestamp: 1_100,
+                usedPercent: 34,
+                resetsAt: 2_000,
+                windowMinutes: 10_080
+            )]
+        )
+        try FileManager.default.createDirectory(at: failingRoot, withIntermediateDirectories: true)
+        let discovery = LocalSessionFileDiscovery(
+            enumeratorFactory: { root, keys, errorHandler in
+                guard root.standardizedFileURL != failingRoot.standardizedFileURL else {
+                    return nil
+                }
+                return FileManager.default.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: keys,
+                    options: [.skipsHiddenFiles],
+                    errorHandler: errorHandler
+                )
+            }
+        )
+
+        let testNow = now
+        let observations = CodexSessionQuotaProvider(
+            roots: [activeRoot, failingRoot],
+            fileDiscovery: discovery,
+            now: { testNow }
+        ).currentWindowObservations()
+
+        XCTAssertTrue(observations.isEmpty)
+    }
+
+    func testEnumeratorTraversalFailureInvalidatesReadableSessionQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        let failingRoot = temporaryRoot.appendingPathComponent("traversal-failure")
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "readable.jsonl",
+            lines: [rateLimitLine(
+                timestamp: 1_100,
+                usedPercent: 45,
+                resetsAt: 2_000,
+                windowMinutes: 10_080
+            )]
+        )
+        try FileManager.default.createDirectory(at: failingRoot, withIntermediateDirectories: true)
+        let discovery = LocalSessionFileDiscovery(
+            enumeratorFactory: { root, keys, errorHandler in
+                if root.standardizedFileURL == failingRoot.standardizedFileURL {
+                    _ = errorHandler(
+                        root,
+                        CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: root.path])
+                    )
+                }
+                return FileManager.default.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: keys,
+                    options: [.skipsHiddenFiles],
+                    errorHandler: errorHandler
+                )
+            }
+        )
+
+        let testNow = now
+        let observations = CodexSessionQuotaProvider(
+            roots: [activeRoot, failingRoot],
+            fileDiscovery: discovery,
+            now: { testNow }
+        ).currentWindowObservations()
+
+        XCTAssertTrue(observations.isEmpty)
     }
 
     func testKeepsHighestUsageWithinCurrentFiveHourWindow() {
