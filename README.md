@@ -97,7 +97,7 @@ Codex Meter 会读取这些本地数据源：
 
 今日 Token 用量只读取 `payload.type == "token_count"` 记录中的 `payload.info.last_token_usage` 字段，用来汇总今日总量、缓存输入、非缓存输入、输出和推理明细。
 
-任务活动也只来自本机 JSONL 中的生命周期记录。仅当顶层 `type` 为 `event_msg`，并且记录含有顶层 `timestamp`、`payload.type`（`task_started` 或 `task_complete`）和非空 `payload.turn_id` 时，才会参与计算。同一 `turn_id` 的 `task_started` 代表活动开始，`task_complete` 代表结束；只要任意 turn 未结束，菜单栏圆环就会旋转。为避免 Codex 意外退出后留下永久活动状态，未完成 turn 会在开始 24 小时后自动过期。
+任务活动也只来自本机 JSONL 中的生命周期记录。仅当顶层 `type` 为 `event_msg`，并且记录含有顶层 `timestamp`、`payload.type`（`task_started` 或 `task_complete`）和非空 `payload.turn_id` 时，才会参与计算。同一 `turn_id` 的 `task_started` 代表活动开始，`task_complete` 代表结束；只要任意 turn 未结束，菜单栏圆环就会旋转。为避免 Codex 意外退出后留下永久活动状态，未完成 turn 仅当开始时间严格早于当前时间 24 小时（超过 24 小时）才会过期；恰好满 24 小时时仍视为活动。
 
 Codex Meter 会在本机扫描这些 JSONL 的原始字节来定位结构化 Token 和任务生命周期记录，但不会解析、保留、显示或上传私人提示词、回复或认证字段；所有汇总都在本机完成，不会发起网络请求，也不会调用任何官方服务器任务 API。
 
