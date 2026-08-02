@@ -1450,16 +1450,22 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
 
 struct CodexSessionQuotaProvider: QuotaObservationProviding {
     private let roots: [URL]
+    private let maxBytesPerFile: UInt64
+    private let maxTotalBytes: UInt64
     private let now: @Sendable () -> Date
 
     init(
         roots: [URL]? = nil,
+        maxBytesPerFile: UInt64 = 64 * 1_024 * 1_024,
+        maxTotalBytes: UInt64 = 256 * 1_024 * 1_024,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.roots = roots ?? [
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
         ]
+        self.maxBytesPerFile = maxBytesPerFile
+        self.maxTotalBytes = maxTotalBytes
         self.now = now
     }
 
@@ -1480,11 +1486,13 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     private func recentRateLimitRecords(now: Date) -> [RateLimitRecord]? {
         let lowerBound = QuotaHistoryBounds.lowerBound(for: now)
         let files = deduplicatedSessionFiles(overlapping: lowerBound)
+        guard filesFitScanBudget(files) else { return nil }
 
         var records: [RateLimitRecord] = []
         for file in files {
             guard let fileRecords = rateLimitRecords(
                 in: file.url,
+                expectedByteCount: file.byteCount,
                 fileModifiedAt: file.modifiedAt,
                 now: now,
                 lowerBound: lowerBound
@@ -1495,6 +1503,19 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         }
 
         return records
+    }
+
+    private func filesFitScanBudget(_ files: [SessionFile]) -> Bool {
+        var totalBytes: UInt64 = 0
+        for file in files {
+            guard file.byteCount <= maxBytesPerFile,
+                  totalBytes <= maxTotalBytes,
+                  file.byteCount <= maxTotalBytes - totalBytes else {
+                return false
+            }
+            totalBytes += file.byteCount
+        }
+        return true
     }
 
     private func deduplicatedSessionFiles(overlapping lowerBound: Date) -> [SessionFile] {
@@ -1526,7 +1547,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     private func recentJSONLFiles(under root: URL) -> [SessionFile] {
         guard let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else {
             return []
@@ -1535,18 +1556,27 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         var files: [SessionFile] = []
         for case let url as URL in enumerator {
             guard url.pathExtension == "jsonl" else { continue }
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+            guard let values = try? url.resourceValues(
+                forKeys: [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey]
+            ),
                   values.isRegularFile == true,
-                  let modifiedAt = values.contentModificationDate else {
+                  let modifiedAt = values.contentModificationDate,
+                  let fileSize = values.fileSize,
+                  fileSize >= 0 else {
                 continue
             }
-            files.append(SessionFile(url: url, modifiedAt: modifiedAt))
+            files.append(SessionFile(
+                url: url,
+                modifiedAt: modifiedAt,
+                byteCount: UInt64(fileSize)
+            ))
         }
         return files
     }
 
     private func rateLimitRecords(
         in url: URL,
+        expectedByteCount: UInt64,
         fileModifiedAt: Date,
         now: Date,
         lowerBound: Date
@@ -1555,7 +1585,6 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         defer { try? handle.close() }
 
         let chunkSize = 64 * 1_024
-        let timestampParser = SessionLineTimestampParser()
         var records: [RateLimitRecord] = []
         var earlierOffset: UInt64
         do {
@@ -1563,10 +1592,10 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         } catch {
             return nil
         }
+        guard earlierOffset == expectedByteCount else { return nil }
         var laterFragment = Data()
-        var crossedLowerBound = false
 
-        while earlierOffset > 0 && !crossedLowerBound {
+        while earlierOffset > 0 {
             let byteCount = Int(min(UInt64(chunkSize), earlierOffset))
             earlierOffset -= UInt64(byteCount)
 
@@ -1598,19 +1627,13 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             guard firstCompleteIndex < fragments.count else { continue }
             for fragment in fragments[firstCompleteIndex...].reversed() {
                 guard !fragment.isEmpty else { continue }
-                if let timestamp = timestampParser.timestamp(in: fragment),
-                   timestamp < lowerBound {
-                    crossedLowerBound = true
-                    break
-                }
-
                 guard fragment.range(of: rateLimitsMarker) != nil else { continue }
                 let line = String(decoding: fragment, as: UTF8.self)
                 guard let record = Self.parseRecord(
                     line: line,
                     fileModifiedAt: fileModifiedAt,
                     now: now
-                ) else { continue }
+                ), record.sortDate >= lowerBound else { continue }
                 records.append(record)
             }
         }
@@ -1836,35 +1859,10 @@ private enum RateLimitWindowReducer {
     }
 }
 
-private final class SessionLineTimestampParser {
-    private let fractionalFormatter: ISO8601DateFormatter
-    private let standardFormatter: ISO8601DateFormatter
-
-    init() {
-        fractionalFormatter = ISO8601DateFormatter()
-        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        standardFormatter = ISO8601DateFormatter()
-        standardFormatter.formatOptions = [.withInternetDateTime]
-    }
-
-    func timestamp(in bytes: Data.SubSequence) -> Date? {
-        let prefix = String(decoding: bytes.prefix(256), as: UTF8.self)
-        for marker in ["\"timestamp\":\"", "\"timestamp\": \""] {
-            guard let markerRange = prefix.range(of: marker) else { continue }
-            let valueStart = markerRange.upperBound
-            guard let valueEnd = prefix[valueStart...].firstIndex(of: "\"") else {
-                continue
-            }
-            let value = String(prefix[valueStart..<valueEnd])
-            return fractionalFormatter.date(from: value) ?? standardFormatter.date(from: value)
-        }
-        return nil
-    }
-}
-
 private struct SessionFile {
     let url: URL
     let modifiedAt: Date
+    let byteCount: UInt64
 }
 
 struct RateLimitRecord {

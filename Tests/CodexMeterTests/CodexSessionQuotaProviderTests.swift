@@ -105,6 +105,142 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_164))
     }
 
+    func testContinuesPastOutOfOrderOldTimestampToEarlierInBoundHigh() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "out-of-order.jsonl",
+            lines: [
+                rateLimitLine(
+                    timestamp: 1_100,
+                    usedPercent: 79,
+                    resetsAt: 2_000,
+                    windowMinutes: 10_080
+                ),
+                rateLimitLine(
+                    timestamp: -625_401,
+                    usedPercent: 99,
+                    resetsAt: 2_000,
+                    windowMinutes: 10_080
+                ),
+                rateLimitLine(
+                    timestamp: 1_200,
+                    usedPercent: 0,
+                    resetsAt: 2_000,
+                    windowMinutes: 10_080
+                )
+            ]
+        )
+
+        let testNow = now
+        let weekly = try XCTUnwrap(
+            CodexSessionQuotaProvider(roots: [activeRoot], now: { testNow })
+                .currentWindowObservations()
+                .first { $0.window.kind == .weekly }
+        )
+
+        XCTAssertEqual(weekly.window.usedPercent, 79)
+        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_200))
+    }
+
+    func testOversizedSessionFileReturnsNoPartialQuotaFromVisibleSuffix() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "over-byte-cap.jsonl",
+            lines: [
+                rateLimitLine(
+                    timestamp: 1_100,
+                    usedPercent: 83,
+                    resetsAt: 2_000,
+                    windowMinutes: 10_080,
+                    paddingBytes: 512
+                ),
+                rateLimitLine(
+                    timestamp: 1_200,
+                    usedPercent: 2,
+                    resetsAt: 2_000,
+                    windowMinutes: 10_080
+                )
+            ]
+        )
+        try writeSessionFile(
+            under: activeRoot,
+            filename: "otherwise-readable.jsonl",
+            lines: [
+                rateLimitLine(
+                    timestamp: 1_150,
+                    usedPercent: 41,
+                    resetsAt: 2_000,
+                    windowMinutes: 10_080
+                )
+            ]
+        )
+        XCTAssertGreaterThan(
+            try fileSize(at: activeRoot.appendingPathComponent("over-byte-cap.jsonl")),
+            256
+        )
+        XCTAssertLessThanOrEqual(
+            try fileSize(at: activeRoot.appendingPathComponent("otherwise-readable.jsonl")),
+            256
+        )
+
+        let testNow = now
+        let observations = CodexSessionQuotaProvider(
+            roots: [activeRoot],
+            maxBytesPerFile: 256,
+            now: { testNow }
+        ).currentWindowObservations()
+
+        XCTAssertTrue(observations.isEmpty)
+    }
+
+    func testAggregateCandidateBytesOverCapReturnsNoPartialQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        for index in 0..<2 {
+            try writeSessionFile(
+                under: activeRoot,
+                filename: "aggregate-cap-\(index).jsonl",
+                lines: [
+                    rateLimitLine(
+                        timestamp: TimeInterval(1_100 + index),
+                        usedPercent: index == 0 ? 67 : 3,
+                        resetsAt: 2_000,
+                        windowMinutes: 10_080,
+                        paddingBytes: 256
+                    )
+                ]
+            )
+        }
+        let candidateByteCounts = try (0..<2).map { index in
+            try fileSize(at: activeRoot.appendingPathComponent("aggregate-cap-\(index).jsonl"))
+        }
+        XCTAssertTrue(candidateByteCounts.allSatisfy { $0 <= 700 && $0 <= 1_024 })
+        XCTAssertGreaterThan(candidateByteCounts.reduce(0, +), 700)
+
+        let testNow = now
+        let observations = CodexSessionQuotaProvider(
+            roots: [activeRoot],
+            maxBytesPerFile: 1_024,
+            maxTotalBytes: 700,
+            now: { testNow }
+        ).currentWindowObservations()
+
+        XCTAssertTrue(observations.isEmpty)
+    }
+
     func testGroupsFractionalEquivalentResetValuesFromSessionLog() throws {
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
@@ -328,5 +464,10 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
             + "\"limit_id\":\"codex\",\"primary\":{\"used_percent\":\(usedPercent),"
             + "\"window_minutes\":\(windowMinutes),\"resets_at\":\(resetsAt)}}},"
             + "\"padding\":\"\(String(repeating: "x", count: paddingBytes))\"}"
+    }
+
+    private func fileSize(at url: URL) throws -> UInt64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value
     }
 }
