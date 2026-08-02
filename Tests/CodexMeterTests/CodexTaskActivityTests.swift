@@ -54,6 +54,30 @@ private final class RemovingAfterRootMetadataFileManager: FileManager, @unchecke
     }
 }
 
+private final class GrowingAfterTaskMetadataFileManager: FileManager, @unchecked Sendable {
+    private let target: URL
+    private let appendedData: Data
+    private var didGrow = false
+
+    init(target: URL, appendedData: Data) {
+        self.target = target.standardizedFileURL
+        self.appendedData = appendedData
+        super.init()
+    }
+
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+        let attributes = try super.attributesOfItem(atPath: path)
+        if URL(fileURLWithPath: path).standardizedFileURL == target, !didGrow {
+            let handle = try FileHandle(forWritingTo: target)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: appendedData)
+            didGrow = true
+        }
+        return attributes
+    }
+}
+
 final class CodexTaskActivityTests: XCTestCase {
     private var base: URL!
     private var activeRoot: URL!
@@ -340,6 +364,28 @@ final class CodexTaskActivityTests: XCTestCase {
         }
     }
 
+    func testFileGrowthAfterMetadataIsRefusedWithoutTreatingItAsOrdinaryReadFailure() throws {
+        let approvedData = Data(
+            (lifecycleLine(.started, turnID: "bounded", at: now) + "\n").utf8
+        )
+        try approvedData.write(to: activeFile)
+        let fileManager = GrowingAfterTaskMetadataFileManager(
+            target: activeFile,
+            appendedData: Data(repeating: 0x20, count: 4_096)
+        )
+        let approvedByteCount = UInt64(approvedData.count)
+        let provider = makeProvider(
+            roots: [activeRoot],
+            fileManager: fileManager,
+            maxBytesPerFile: approvedByteCount,
+            maxTotalBytes: approvedByteCount
+        )
+
+        XCTAssertThrowsError(try provider.currentActivity(now: now)) {
+            XCTAssertEqual($0 as? CodexTaskActivityProviderError, .fileTooLarge)
+        }
+    }
+
     func testFileLargerThanSixtyFourMiBIsRefused() throws {
         try createSparseFile(at: activeFile, size: 64 * 1_024 * 1_024 + 1)
 
@@ -361,15 +407,37 @@ final class CodexTaskActivityTests: XCTestCase {
         }
     }
 
+    func testOversizedValidCacheIsIgnoredAndSourceIsRebuilt() throws {
+        try writeLifecycle(.started, turnID: "cached", to: activeFile, at: now)
+        XCTAssertTrue(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+
+        var sourceBytes = try Data(contentsOf: activeFile)
+        sourceBytes.replaceSubrange(
+            0..<(sourceBytes.count - 1),
+            with: repeatElement(0x20, count: sourceBytes.count - 1)
+        )
+        try sourceBytes.write(to: activeFile, options: [])
+
+        var oversizedCache = try Data(contentsOf: cacheURL)
+        oversizedCache.append(Data(repeating: 0x20, count: 4 * 1_024 * 1_024))
+        try oversizedCache.write(to: cacheURL, options: .atomic)
+
+        XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+    }
+
     private func makeProvider(
         roots: [URL]? = nil,
         fileManager: FileManager = .default,
-        cacheURL: URL? = nil
+        cacheURL: URL? = nil,
+        maxBytesPerFile: UInt64 = 64 * 1_024 * 1_024,
+        maxTotalBytes: UInt64 = 256 * 1_024 * 1_024
     ) -> CodexTaskActivityProvider {
         CodexTaskActivityProvider(
             roots: roots ?? [activeRoot, archivedRoot],
             fileManager: fileManager,
-            cacheURL: cacheURL
+            cacheURL: cacheURL,
+            maxBytesPerFile: maxBytesPerFile,
+            maxTotalBytes: maxTotalBytes
         )
     }
 

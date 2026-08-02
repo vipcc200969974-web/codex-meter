@@ -291,6 +291,7 @@ enum CodexTaskActivityProviderError: Error, Equatable {
 final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Sendable {
     private static let cacheSchemaVersion = 1
     private static let activityHorizon: TimeInterval = 86_400
+    private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
 
     private struct FileIdentity: Codable, Hashable {
         let device: UInt64
@@ -348,6 +349,11 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     private struct PersistentActiveTurn: Codable {
         let turnID: String
         let startedAt: Date
+    }
+
+    private struct BoundedRead {
+        let data: Data
+        let hasMoreBytes: Bool
     }
 
     private let roots: [URL]
@@ -423,7 +429,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
 
     private func loadCache(now: Date, lowerBound: Date) -> [CursorKey: FileCursor] {
         guard let cacheURL,
-              let data = try? Data(contentsOf: cacheURL),
+              let data = readCacheData(at: cacheURL),
               let cache = try? JSONDecoder().decode(PersistentCache.self, from: data),
               cache.schemaVersion == Self.cacheSchemaVersion,
               cache.rootsFingerprint == rootsFingerprint,
@@ -452,6 +458,32 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             )
         }
         return loaded
+    }
+
+    private func readCacheData(at url: URL) -> Data? {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let fileSize = attributes[.size] as? NSNumber,
+              fileSize.int64Value >= 0,
+              fileSize.uint64Value <= Self.maxCacheBytes else {
+            return nil
+        }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let result = try Self.readExactly(
+                from: handle,
+                byteCount: fileSize.uint64Value
+            )
+            guard UInt64(result.data.count) == fileSize.uint64Value,
+                  !result.hasMoreBytes else {
+                return nil
+            }
+            return result.data
+        } catch {
+            return nil
+        }
     }
 
     private func areValid(_ persisted: [PersistentCursor]) -> Bool {
@@ -653,16 +685,23 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         cursor.needsBoundaryValidation = false
 
         let readStart = cursor.offset
-        let newData: Data
-        if candidate.byteCount == readStart {
-            newData = Data()
-        } else {
-            newData = try read(from: candidate.url, offset: readStart)
-            let (actualEnd, overflow) = readStart.addingReportingOverflow(UInt64(newData.count))
-            guard !overflow, actualEnd == candidate.byteCount else {
-                throw CodexTaskActivityProviderError.readFailed
-            }
+        let approvedByteCount = candidate.byteCount - readStart
+        let result = try read(
+            from: candidate.url,
+            offset: readStart,
+            byteCount: approvedByteCount
+        )
+        guard UInt64(result.data.count) == approvedByteCount else {
+            throw CodexTaskActivityProviderError.readFailed
         }
+        if result.hasMoreBytes {
+            let actualByteCount = try currentByteCount(of: candidate.url)
+            if actualByteCount > maxBytesPerFile {
+                throw CodexTaskActivityProviderError.fileTooLarge
+            }
+            throw CodexTaskActivityProviderError.readFailed
+        }
+        let newData = result.data
 
         var completeAndPartial = cursor.partial
         completeAndPartial.append(newData)
@@ -684,12 +723,53 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         cursor.offset = readStart + UInt64(newData.count)
     }
 
-    private func read(from url: URL, offset: UInt64) throws -> Data {
+    private func read(
+        from url: URL,
+        offset: UInt64,
+        byteCount: UInt64
+    ) throws -> BoundedRead {
         do {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             try handle.seek(toOffset: offset)
-            return try handle.readToEnd() ?? Data()
+            return try Self.readExactly(from: handle, byteCount: byteCount)
+        } catch {
+            throw CodexTaskActivityProviderError.readFailed
+        }
+    }
+
+    private static func readExactly(
+        from handle: FileHandle,
+        byteCount: UInt64
+    ) throws -> BoundedRead {
+        guard byteCount <= UInt64(Int.max) else {
+            throw CodexTaskActivityProviderError.fileTooLarge
+        }
+
+        var remaining = Int(byteCount)
+        var data = Data()
+        data.reserveCapacity(remaining)
+        while remaining > 0 {
+            guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else {
+                break
+            }
+            data.append(chunk)
+            remaining -= chunk.count
+        }
+        let hasMoreBytes = try handle.read(upToCount: 1)?.isEmpty == false
+        return BoundedRead(data: data, hasMoreBytes: hasMoreBytes)
+    }
+
+    private func currentByteCount(of url: URL) throws -> UInt64 {
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: url.path)
+            guard let fileSize = attributes[.size] as? NSNumber,
+                  fileSize.int64Value >= 0 else {
+                throw CodexTaskActivityProviderError.readFailed
+            }
+            return fileSize.uint64Value
+        } catch let error as CodexTaskActivityProviderError {
+            throw error
         } catch {
             throw CodexTaskActivityProviderError.readFailed
         }
