@@ -16,7 +16,7 @@ Codex reports the same weekly quota window with slightly different `reset-at` va
 
 The change stays inside `RateLimitWindowReducer.bestWindows`. For each supported quota kind, observations are sorted by canonical reset timestamp and grouped into reset cycles. Adjacent reset timestamps that remain within 60 seconds of the cycle's newest reset timestamp belong to the same cycle. The reducer selects the cycle with the greatest reset timestamp, then combines its highest usage with its newest observation metadata.
 
-The resulting window uses the newest observation's reset timestamp rather than the stale maximum. This keeps the displayed countdown aligned with the freshest response while preserving monotonic usage within the cycle.
+The resulting window uses the newest observation's reset timestamp normalized to its canonical whole second rather than the stale maximum. This keeps the displayed countdown aligned with the freshest response, preserves the existing fractional-reset normalization, and preserves monotonic usage within the cycle.
 
 ## Testing
 

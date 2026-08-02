@@ -2030,6 +2030,8 @@ private enum QuotaHistoryBounds {
 }
 
 private enum RateLimitWindowReducer {
+    private static let resetDriftToleranceSeconds: Int64 = 60
+
     static func observations(
         from records: [RateLimitRecord],
         sourceName: String
@@ -2064,18 +2066,20 @@ private enum RateLimitWindowReducer {
             }).max() else {
                 return nil
             }
-            let sameReset = candidatesForKind.filter {
-                $0.window.canonicalResetEpochSecond == newestReset
+            let sameResetCycle = candidatesForKind.filter {
+                guard let reset = $0.window.canonicalResetEpochSecond else { return false }
+                return newestReset - reset <= resetDriftToleranceSeconds
             }
-            guard let highestUsage = sameReset.max(by: usagePrecedes),
-                  let latestObservation = sameReset.max(by: observationPrecedes) else {
+            guard let highestUsage = sameResetCycle.max(by: usagePrecedes),
+                  let latestObservation = sameResetCycle.max(by: observationPrecedes),
+                  let latestReset = latestObservation.window.canonicalResetEpochSecond else {
                 return nil
             }
             return ObservedRateLimitWindow(
                 window: RateLimitWindow(
                     usedPercent: highestUsage.window.usedPercent,
-                    resetsAt: Double(newestReset),
-                    windowMinutes: highestUsage.window.windowMinutes
+                    resetsAt: Double(latestReset),
+                    windowMinutes: latestObservation.window.windowMinutes
                 ),
                 observedAt: latestObservation.observedAt,
                 sourceName: latestObservation.sourceName

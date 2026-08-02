@@ -41,6 +41,47 @@ final class QuotaObservationSelectionTests: XCTestCase {
         XCTAssertEqual(result.observedAt, newerZero.observedAt)
     }
 
+    func testResetDriftWithinSixtySecondsUsesNewestTruthfulQuota() throws {
+        let older = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 36, resetsAt: 1_986, windowMinutes: 10_080),
+            observedAt: Date(timeIntervalSince1970: 1_100),
+            sourceName: "Codex 日志"
+        )
+        let newer = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 43, resetsAt: 1_971, windowMinutes: 10_080),
+            observedAt: Date(timeIntervalSince1970: 1_200),
+            sourceName: "Codex 日志"
+        )
+
+        let result = try XCTUnwrap(CompositeQuotaProvider.merge([older, newer], now: now))
+
+        XCTAssertEqual(result.windowSet.weekly?.usedPercent, 43)
+        XCTAssertEqual(result.windowSet.weekly?.resetsAt, 1_971)
+        XCTAssertEqual(result.observedAt, newer.observedAt)
+    }
+
+    func testResetDriftBeyondSixtySecondsKeepsCyclesSeparate() throws {
+        let laterReset = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 36, resetsAt: 2_061, windowMinutes: 10_080),
+            observedAt: Date(timeIntervalSince1970: 1_100),
+            sourceName: "Codex 日志"
+        )
+        let newerObservationForEarlierReset = ObservedRateLimitWindow(
+            window: RateLimitWindow(usedPercent: 43, resetsAt: 2_000, windowMinutes: 10_080),
+            observedAt: Date(timeIntervalSince1970: 1_200),
+            sourceName: "Codex 日志"
+        )
+
+        let result = try XCTUnwrap(CompositeQuotaProvider.merge(
+            [laterReset, newerObservationForEarlierReset],
+            now: now
+        ))
+
+        XCTAssertEqual(result.windowSet.weekly?.usedPercent, 36)
+        XCTAssertEqual(result.windowSet.weekly?.resetsAt, 2_061)
+        XCTAssertEqual(result.observedAt, laterReset.observedAt)
+    }
+
     func testLaterArrivalWithStaleResetCannotReplaceNewerReset() throws {
         let newerReset = ObservedRateLimitWindow(
             window: RateLimitWindow(usedPercent: 7, resetsAt: 2_000, windowMinutes: 300),

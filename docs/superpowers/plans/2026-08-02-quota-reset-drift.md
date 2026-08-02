@@ -12,7 +12,7 @@
 
 - Reset timestamps differing by at most 60 seconds are the same cycle.
 - Usage within a cycle remains monotonic by selecting the highest observed usage.
-- The published observation time, source, and reset timestamp come from the newest observation in the selected cycle.
+- The published observation time, source, and canonical whole-second reset timestamp come from the newest observation in the selected cycle.
 - Reset timestamps more than 60 seconds apart remain distinct cycles.
 - Existing five-hour, weekly-only, expiry, and unsupported-window behavior must remain unchanged.
 
@@ -80,7 +80,7 @@ let selectedCycle = candidatesForKind.filter {
 }
 ```
 
-Keep `highestUsage` and `latestObservation` selection, but construct the returned window with `latestObservation.window.resetsAt` and `latestObservation.window.windowMinutes`.
+Keep `highestUsage` and `latestObservation` selection, but construct the returned window with `Double(latestObservation.window.canonicalResetEpochSecond!)` and `latestObservation.window.windowMinutes`. Bind the canonical reset through the existing `guard` instead of force-unwrapping it in production code.
 
 - [ ] **Step 4: Run focused quota tests and verify GREEN**
 
