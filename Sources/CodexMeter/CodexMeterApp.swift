@@ -42,8 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureWakeRefreshObservers()
         usageStore.start()
 
-        snapshotCancellable = usageStore.$snapshot.sink { [weak self] snapshot in
-            self?.updateStatusItem(with: snapshot)
+        snapshotCancellable = Publishers.CombineLatest(
+            usageStore.$snapshot,
+            usageStore.$isTaskActive
+        ).sink { [weak self] snapshot, isTaskActive in
+            self?.updateStatusItem(with: snapshot, isTaskActive: isTaskActive)
         }
     }
 
@@ -64,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.view = view
         statusView = view
 
-        updateStatusItem(with: usageStore.snapshot)
+        updateStatusItem(with: usageStore.snapshot, isTaskActive: usageStore.isTaskActive)
     }
 
     private func configurePanelWindow() {
@@ -109,7 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func updateStatusItem(with snapshot: UsageSnapshot) {
+    private func updateStatusItem(with snapshot: UsageSnapshot, isTaskActive: Bool) {
         let quota = snapshot.quota
         let title = quota.isUnavailable ? "未同步" : "\(quota.percentText) | \(quota.shortResetText)"
         let tooltip = quota.isUnavailable
@@ -119,7 +122,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             title: title,
             color: quota.tagTextColor,
             backgroundColor: quota.tagBackgroundColor,
-            tooltip: tooltip
+            tooltip: tooltip,
+            isTaskActive: isTaskActive
         )
         statusItem?.length = statusView?.frame.width ?? NSStatusItem.variableLength
     }
@@ -180,34 +184,162 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+struct CompactStatusItemLayout {
+    static let horizontalPadding: CGFloat = 5
+    static let dividerSpacing: CGFloat = 5
+    static let dividerHeight: CGFloat = 9
+    static let ringDiameter: CGFloat = 12.5
+    static let trailingPadding: CGFloat = 6
+
+    let textFrame: NSRect
+    let dividerFrame: NSRect
+    let ringFrame: NSRect
+    let totalWidth: CGFloat
+
+    init(textWidth: CGFloat, statusHeight: CGFloat) {
+        textFrame = NSRect(
+            x: Self.horizontalPadding,
+            y: 0,
+            width: textWidth,
+            height: statusHeight
+        )
+        dividerFrame = NSRect(
+            x: textFrame.maxX + Self.dividerSpacing,
+            y: (statusHeight - Self.dividerHeight) / 2,
+            width: 1,
+            height: Self.dividerHeight
+        )
+        ringFrame = NSRect(
+            x: dividerFrame.maxX + Self.dividerSpacing,
+            y: (statusHeight - Self.ringDiameter) / 2,
+            width: Self.ringDiameter,
+            height: Self.ringDiameter
+        )
+        totalWidth = ringFrame.maxX + Self.trailingPadding
+    }
+}
+
+protocol StatusItemAnimationTask: AnyObject {
+    func cancel()
+}
+
+typealias StatusItemAnimationFactory = (
+    _ interval: TimeInterval,
+    _ tick: @escaping @MainActor () -> Void
+) -> any StatusItemAnimationTask
+
+func makeStatusItemAnimation(
+    interval: TimeInterval,
+    tick: @escaping @MainActor () -> Void
+) -> any StatusItemAnimationTask {
+    TimerStatusItemAnimationTask(interval: interval, tick: tick)
+}
+
+private final class TimerStatusItemAnimationTask: NSObject, StatusItemAnimationTask, @unchecked Sendable {
+    private let tick: @MainActor () -> Void
+    private var timer: Timer?
+
+    init(interval: TimeInterval, tick: @escaping @MainActor () -> Void) {
+        self.tick = tick
+        super.init()
+
+        let timer = Timer(
+            timeInterval: interval,
+            target: self,
+            selector: #selector(timerDidFire),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    @objc private func timerDidFire() {
+        MainActor.assumeIsolated {
+            tick()
+        }
+    }
+}
+
+@MainActor
 final class CompactStatusItemView: NSView {
     var onClick: (() -> Void)?
 
     private let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-    private let horizontalPadding: CGFloat = 5
+    private let animationFactory: StatusItemAnimationFactory
     private var title = ""
     private var color = NSColor.labelColor
     private var backgroundColor = NSColor.clear
+    private var isTaskActive = false
+    private var animationTask: (any StatusItemAnimationTask)?
+    private(set) var ringAngleDegrees: CGFloat = 90
 
-    func update(title: String, color: NSColor, backgroundColor: NSColor, tooltip: String) {
+    init(animationFactory: @escaping StatusItemAnimationFactory = makeStatusItemAnimation) {
+        self.animationFactory = animationFactory
+        super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) {
+        animationFactory = makeStatusItemAnimation
+        super.init(coder: coder)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    isolated deinit {
+        animationTask?.cancel()
+    }
+
+    func update(
+        title: String,
+        color: NSColor,
+        backgroundColor: NSColor,
+        tooltip: String,
+        isTaskActive: Bool
+    ) {
         self.title = title
         self.color = color
         self.backgroundColor = backgroundColor
-        self.toolTip = tooltip
+        self.isTaskActive = isTaskActive
 
-        let width = ceil(attributedTitle.size().width + horizontalPadding * 2)
-        frame = NSRect(x: 0, y: 0, width: width, height: NSStatusBar.system.thickness)
+        let activityText = isTaskActive ? "ChatGPT 正在执行任务" : "当前无运行任务"
+        self.toolTip = "\(tooltip)\n\(activityText)"
+        setAccessibilityLabel("\(title)，\(activityText)")
+
+        let layout = CompactStatusItemLayout(
+            textWidth: ceil(attributedTitle.size().width),
+            statusHeight: NSStatusBar.system.thickness
+        )
+        frame = NSRect(
+            x: 0,
+            y: 0,
+            width: layout.totalWidth,
+            height: NSStatusBar.system.thickness
+        )
+        updateAnimation()
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let size = attributedTitle.size()
+        let title = attributedTitle
+        let size = title.size()
+        let layout = CompactStatusItemLayout(
+            textWidth: ceil(size.width),
+            statusHeight: bounds.height
+        )
         let tagRect = NSRect(
             x: 0,
             y: floor((bounds.height - 17) / 2),
-            width: bounds.width,
+            width: layout.totalWidth,
             height: 17
         )
         backgroundColor.setFill()
@@ -215,12 +347,28 @@ final class CompactStatusItemView: NSView {
 
         color.set()
         let rect = NSRect(
-            x: horizontalPadding,
+            x: layout.textFrame.minX,
             y: floor((bounds.height - size.height) / 2),
             width: size.width,
             height: size.height
         )
-        attributedTitle.draw(in: rect)
+        title.draw(in: rect)
+
+        color.withAlphaComponent(0.35).setFill()
+        NSBezierPath(rect: layout.dividerFrame).fill()
+
+        let ringPath = NSBezierPath()
+        ringPath.lineWidth = 1.5
+        ringPath.lineCapStyle = .round
+        ringPath.appendArc(
+            withCenter: NSPoint(x: layout.ringFrame.midX, y: layout.ringFrame.midY),
+            radius: (CompactStatusItemLayout.ringDiameter - ringPath.lineWidth) / 2,
+            startAngle: ringAngleDegrees,
+            endAngle: ringAngleDegrees + 285,
+            clockwise: false
+        )
+        color.setStroke()
+        ringPath.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -229,6 +377,21 @@ final class CompactStatusItemView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         onClick?()
+    }
+
+    private func updateAnimation() {
+        if isTaskActive {
+            guard animationTask == nil else { return }
+            animationTask = animationFactory(1.0 / 12.0) { [weak self] in
+                guard let self, self.isTaskActive else { return }
+                self.ringAngleDegrees = (self.ringAngleDegrees + 30)
+                    .truncatingRemainder(dividingBy: 360)
+                self.needsDisplay = true
+            }
+        } else {
+            animationTask?.cancel()
+            animationTask = nil
+        }
     }
 
     private var attributedTitle: NSAttributedString {
