@@ -73,6 +73,13 @@ enum CodexTaskLifecycleParser {
     }
 
     static func parseCompleteLines(in data: Data) -> [CodexTaskLifecycleEvent] {
+        parseCompleteLines(in: data, decoder: decoder)
+    }
+
+    static func parseCompleteLines(
+        in data: Data,
+        decoder: any CodexTaskLifecycleDecoding
+    ) -> [CodexTaskLifecycleEvent] {
         var events: [CodexTaskLifecycleEvent] = []
         for lineRange in CodexTaskLifecycleLineDiscriminator.completeCandidateLineRanges(in: data) {
             if let event = decoder.decode(from: data.subdata(in: lineRange)) {
@@ -84,13 +91,12 @@ enum CodexTaskLifecycleParser {
 }
 
 private enum CodexTaskLifecycleLineDiscriminator {
-    private static let eventMessage = Data("event_msg".utf8)
     private static let started = Data("task_started".utf8)
     private static let completed = Data("task_complete".utf8)
 
     static func isLifecycleEvent(_ data: Data) -> Bool {
-        guard data.range(of: eventMessage) != nil else { return false }
-        return data.range(of: started) != nil || data.range(of: completed) != nil
+        var scanner = JSONLifecycleScanner(data: data)
+        return scanner.isLifecycleEvent()
     }
 
     static func completeCandidateLineRanges(in data: Data) -> [Range<Data.Index>] {
@@ -110,5 +116,162 @@ private enum CodexTaskLifecycleLineDiscriminator {
             }
         }
         return ranges.sorted { $0.lowerBound < $1.lowerBound }
+    }
+}
+
+private struct JSONLifecycleScanner {
+    private let bytes: [UInt8]
+    private var index = 0
+
+    init(data: Data) {
+        bytes = Array(data)
+    }
+
+    mutating func isLifecycleEvent() -> Bool {
+        guard consume(0x7B) else { return false }
+
+        var isEventMessage = false
+        var lifecycleType = false
+        while true {
+            skipWhitespace()
+            if consume(0x7D) {
+                return isEventMessage && lifecycleType
+            }
+            guard let key = parseString(), consume(0x3A) else { return false }
+
+            switch key {
+            case "type":
+                isEventMessage = parseString() == "event_msg"
+            case "payload":
+                lifecycleType = parsePayloadLifecycleType()
+            default:
+                guard skipValue() else { return false }
+            }
+
+            skipWhitespace()
+            if consume(0x7D) {
+                return isEventMessage && lifecycleType
+            }
+            guard consume(0x2C) else { return false }
+        }
+    }
+
+    private mutating func parsePayloadLifecycleType() -> Bool {
+        guard consume(0x7B) else { return false }
+
+        var lifecycleType = false
+        while true {
+            skipWhitespace()
+            if consume(0x7D) { return lifecycleType }
+            guard let key = parseString(), consume(0x3A) else { return false }
+
+            if key == "type" {
+                let value = parseString()
+                lifecycleType = value == "task_started" || value == "task_complete"
+            } else if !skipValue() {
+                return false
+            }
+
+            skipWhitespace()
+            if consume(0x7D) { return lifecycleType }
+            guard consume(0x2C) else { return false }
+        }
+    }
+
+    private mutating func skipValue() -> Bool {
+        skipWhitespace()
+        guard index < bytes.count else { return false }
+
+        switch bytes[index] {
+        case 0x22:
+            return skipString()
+        case 0x7B:
+            index += 1
+            return skipObject()
+        case 0x5B:
+            index += 1
+            return skipArray()
+        default:
+            let start = index
+            while index < bytes.count,
+                  ![0x2C, 0x5D, 0x7D, 0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) {
+                index += 1
+            }
+            return index > start
+        }
+    }
+
+    private mutating func skipObject() -> Bool {
+        skipWhitespace()
+        if consume(0x7D) { return true }
+        while true {
+            guard parseString() != nil, consume(0x3A), skipValue() else { return false }
+            skipWhitespace()
+            if consume(0x7D) { return true }
+            guard consume(0x2C) else { return false }
+        }
+    }
+
+    private mutating func skipArray() -> Bool {
+        skipWhitespace()
+        if consume(0x5D) { return true }
+        while true {
+            guard skipValue() else { return false }
+            skipWhitespace()
+            if consume(0x5D) { return true }
+            guard consume(0x2C) else { return false }
+        }
+    }
+
+    private mutating func parseString() -> String? {
+        skipWhitespace()
+        guard consume(0x22) else { return nil }
+        let start = index
+        var escaped = false
+
+        while index < bytes.count {
+            let byte = bytes[index]
+            index += 1
+            if escaped {
+                escaped = false
+            } else if byte == 0x5C {
+                escaped = true
+            } else if byte == 0x22 {
+                return String(bytes: bytes[start..<(index - 1)], encoding: .utf8)
+            }
+        }
+        return nil
+    }
+
+    private mutating func skipString() -> Bool {
+        skipWhitespace()
+        guard consume(0x22) else { return false }
+        var escaped = false
+
+        while index < bytes.count {
+            let byte = bytes[index]
+            index += 1
+            if escaped {
+                escaped = false
+            } else if byte == 0x5C {
+                escaped = true
+            } else if byte == 0x22 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private mutating func consume(_ byte: UInt8) -> Bool {
+        skipWhitespace()
+        guard index < bytes.count, bytes[index] == byte else { return false }
+        index += 1
+        return true
+    }
+
+    private mutating func skipWhitespace() {
+        while index < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) {
+            index += 1
+        }
     }
 }

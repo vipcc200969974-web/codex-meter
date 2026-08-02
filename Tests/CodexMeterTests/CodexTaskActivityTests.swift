@@ -35,13 +35,26 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertNil(CodexTaskLifecycleParser.parse(line: missingTimestamp))
     }
 
-    func testRawDiscriminatorSkipsLargePrivatePayloadBeforeTypedDecoding() {
-        let decoder = CountingCodexTaskLifecycleDecoder()
-        let privateContent = String(repeating: "private task_started task_complete ", count: 100_000)
+    func testRawDiscriminatorSkipsLargePrivatePayloadWithAllMarkersBeforeTypedDecoding() {
+        let privateContent = String(
+            repeating: "private event_msg task_started task_complete ",
+            count: 100_000
+        )
         let line = #"{"timestamp":"2026-08-02T02:00:00Z","type":"response_item","payload":{"type":"message","content":"\#(privateContent)"}}"#
 
-        XCTAssertNil(CodexTaskLifecycleParser.parse(line: line, decoder: decoder))
-        XCTAssertEqual(decoder.decodeCount, 0)
+        let lineDecoder = CountingCodexTaskLifecycleDecoder()
+        XCTAssertNil(CodexTaskLifecycleParser.parse(line: line, decoder: lineDecoder))
+        XCTAssertEqual(lineDecoder.decodeCount, 0)
+
+        let batchDecoder = CountingCodexTaskLifecycleDecoder()
+        XCTAssertEqual(
+            CodexTaskLifecycleParser.parseCompleteLines(
+                in: Data((line + "\n").utf8),
+                decoder: batchDecoder
+            ),
+            []
+        )
+        XCTAssertEqual(batchDecoder.decodeCount, 0)
     }
 
     func testParsesOnlyCompleteLifecycleLines() throws {
