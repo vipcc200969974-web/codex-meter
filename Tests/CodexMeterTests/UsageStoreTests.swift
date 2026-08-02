@@ -5,6 +5,34 @@ import XCTest
 
 @MainActor
 final class UsageStoreTests: XCTestCase {
+    func testLocalLoaderReturnsActivityAlongsideTokens() {
+        let tokens = makeTokens(total: 42)
+        let loader = LocalUsageLoader(
+            quotaProvider: CompositeQuotaProvider(providers: []),
+            tokenProvider: StubDailyTokenUsageProvider(usage: tokens),
+            taskActivityProvider: StubTaskActivityProvider(activity: true)
+        )
+
+        let result = loader.load(now: Date(timeIntervalSince1970: 1_000))
+
+        XCTAssertEqual(result.dailyTokens, tokens)
+        XCTAssertEqual(result.isTaskActive, true)
+    }
+
+    func testLocalLoaderMapsActivityFailureToNilWithoutAffectingTokens() {
+        let tokens = makeTokens(total: 42)
+        let loader = LocalUsageLoader(
+            quotaProvider: CompositeQuotaProvider(providers: []),
+            tokenProvider: StubDailyTokenUsageProvider(usage: tokens),
+            taskActivityProvider: StubTaskActivityProvider(error: StubProviderError.failed)
+        )
+
+        let result = loader.load(now: Date(timeIntervalSince1970: 1_000))
+
+        XCTAssertEqual(result.dailyTokens, tokens)
+        XCTAssertNil(result.isTaskActive)
+    }
+
     func testRefreshRequestedDuringLoadRunsOneFollowUp() async throws {
         let loader = BlockingUsageLoader()
         let store = UsageStore(loader: loader, watcher: nil, debounceInterval: 0.01)
@@ -132,6 +160,54 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(recovered.freshness, .live)
     }
 
+    func testSuccessfulActivityLoadPublishesIndependentState() async {
+        let loader = SequenceUsageLoader(results: [
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: true),
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: false)
+        ])
+        let store = UsageStore(loader: loader, watcher: SpyActivityWatcher())
+
+        await nextTaskActivity(from: store) { store.refresh() }
+        XCTAssertTrue(store.isTaskActive)
+        await nextTaskActivity(from: store) { store.refresh() }
+        XCTAssertFalse(store.isTaskActive)
+    }
+
+    func testActivityFailureRetainsForSixtySecondsThenFailsIdle() async {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let clock = LockedDateSource(start)
+        let loader = SequenceUsageLoader(results: [
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: true),
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: nil),
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: nil)
+        ])
+        let store = UsageStore(loader: loader, watcher: SpyActivityWatcher(), now: clock.now)
+
+        await nextTaskActivity(from: store) { store.refresh() }
+        clock.set(start.addingTimeInterval(59.999))
+        _ = await nextSnapshot(from: store) { store.refresh() }
+        XCTAssertTrue(store.isTaskActive)
+        clock.set(start.addingTimeInterval(60))
+        await nextTaskActivity(from: store) { store.refresh() }
+        XCTAssertFalse(store.isTaskActive)
+    }
+
+    func testActivityFailureDoesNotChangeQuotaTokenFreshness() async {
+        let loader = SequenceUsageLoader(results: [
+            UsageLoadResult(
+                quota: makeQuota(remainingPercent: 70, sourceName: "fresh"),
+                dailyTokens: makeTokens(total: 42),
+                isTaskActive: nil
+            )
+        ])
+        let store = UsageStore(loader: loader, watcher: SpyActivityWatcher())
+
+        let snapshot = await nextSnapshot(from: store) { store.refresh() }
+
+        XCTAssertEqual(snapshot.freshness, .live)
+        XCTAssertFalse(store.isTaskActive)
+    }
+
     func testWatcherBurstDebouncesToOneLoad() async throws {
         let loader = CountingUsageLoader(result: .empty)
         let scheduler = ManualUsageScheduler()
@@ -166,7 +242,11 @@ final class UsageStoreTests: XCTestCase {
     }
 
     func testDefaultWatcherDebounceWaitsExactlyEightHundredMilliseconds() async throws {
-        let loader = CountingUsageLoader(result: .empty)
+        let loader = CountingUsageLoader(result: UsageLoadResult(
+            quota: nil,
+            dailyTokens: nil,
+            isTaskActive: true
+        ))
         let scheduler = ManualUsageScheduler()
         let store = UsageStore(loader: loader, watcher: nil, scheduler: scheduler)
 
@@ -178,32 +258,40 @@ final class UsageStoreTests: XCTestCase {
             scheduler.advance(by: 0.001)
         }
         XCTAssertEqual(loader.callCount, 1)
+        XCTAssertTrue(store.isTaskActive)
     }
 
     func testFallbackPollRebindsWatcherAndRefreshesEverySixtySeconds() async throws {
-        let loader = CountingUsageLoader(result: .empty)
+        let loader = SequenceUsageLoader(results: [
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: true),
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: false),
+            UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: true)
+        ])
         let watcher = SpyActivityWatcher()
         let scheduler = ManualUsageScheduler()
         let store = UsageStore(loader: loader, watcher: watcher, scheduler: scheduler)
 
-        _ = await nextSnapshot(from: store) { store.start() }
+        await nextTaskActivity(from: store) { store.start() }
         XCTAssertEqual(loader.callCount, 1)
+        XCTAssertTrue(store.isTaskActive)
 
         scheduler.advance(by: 59.999)
         XCTAssertEqual(watcher.rebindCount, 0)
         XCTAssertEqual(loader.callCount, 1)
 
-        _ = await nextSnapshot(from: store) {
+        await nextTaskActivity(from: store) {
             scheduler.advance(by: 0.001)
         }
         XCTAssertEqual(watcher.rebindCount, 1)
         XCTAssertEqual(loader.callCount, 2)
+        XCTAssertFalse(store.isTaskActive)
 
-        _ = await nextSnapshot(from: store) {
+        await nextTaskActivity(from: store) {
             scheduler.advance(by: 60)
         }
         XCTAssertEqual(watcher.rebindCount, 2)
         XCTAssertEqual(loader.callCount, 3)
+        XCTAssertTrue(store.isTaskActive)
     }
 
     func testMidnightFailurePublishesNewDayZeroAndRetainsQuota() async throws {
@@ -615,6 +703,44 @@ final class UsageStoreTests: XCTestCase {
     }
 }
 
+private enum StubProviderError: Error {
+    case failed
+}
+
+private final class StubDailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendable {
+    private let usage: DailyTokenUsage
+
+    init(usage: DailyTokenUsage) {
+        self.usage = usage
+    }
+
+    func currentUsage(now: Date) throws -> DailyTokenUsage {
+        usage
+    }
+}
+
+private final class StubTaskActivityProvider: CodexTaskActivityProviding, @unchecked Sendable {
+    private let activity: Bool?
+    private let error: (any Error)?
+
+    init(activity: Bool) {
+        self.activity = activity
+        self.error = nil
+    }
+
+    init(error: any Error) {
+        self.activity = nil
+        self.error = error
+    }
+
+    func currentActivity(now: Date) throws -> Bool {
+        if let error {
+            throw error
+        }
+        return activity ?? false
+    }
+}
+
 final class BlockingUsageLoader: UsageLoading, @unchecked Sendable {
     private let condition = NSCondition()
     private var calls = 0
@@ -723,14 +849,22 @@ final class BlockingUsageLoader: UsageLoading, @unchecked Sendable {
 final class SequenceUsageLoader: UsageLoading, @unchecked Sendable {
     private let lock = NSLock()
     private var results: [UsageLoadResult]
+    private var calls = 0
 
     init(results: [UsageLoadResult]) {
         self.results = results
     }
 
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
     func load(now: Date) -> UsageLoadResult {
         lock.lock()
         defer { lock.unlock() }
+        calls += 1
         return results.isEmpty ? .empty : results.removeFirst()
     }
 }
@@ -1034,6 +1168,21 @@ private func nextSnapshot(
         var cancellable: AnyCancellable?
         cancellable = store.$snapshot.dropFirst().prefix(1).sink { snapshot in
             continuation.resume(returning: snapshot)
+            cancellable?.cancel()
+        }
+        action()
+    }
+}
+
+@MainActor
+private func nextTaskActivity(
+    from store: UsageStore,
+    after action: () -> Void
+) async {
+    await withCheckedContinuation { continuation in
+        var cancellable: AnyCancellable?
+        cancellable = store.$isTaskActive.dropFirst().prefix(1).sink { _ in
+            continuation.resume()
             cancellable?.cancel()
         }
         action()

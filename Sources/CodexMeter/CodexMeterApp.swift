@@ -853,6 +853,17 @@ struct UsageSnapshot: Sendable {
 struct UsageLoadResult: Sendable {
     let quota: QuotaSnapshot?
     let dailyTokens: DailyTokenUsage?
+    let isTaskActive: Bool?
+
+    init(
+        quota: QuotaSnapshot?,
+        dailyTokens: DailyTokenUsage?,
+        isTaskActive: Bool? = nil
+    ) {
+        self.quota = quota
+        self.dailyTokens = dailyTokens
+        self.isTaskActive = isTaskActive
+    }
 
     static let empty = UsageLoadResult(quota: nil, dailyTokens: nil)
 }
@@ -864,19 +875,27 @@ protocol UsageLoading: Sendable {
 final class LocalUsageLoader: UsageLoading, @unchecked Sendable {
     private let quotaProvider: CompositeQuotaProvider
     private let tokenProvider: any DailyTokenUsageProviding
+    private let taskActivityProvider: any CodexTaskActivityProviding
 
     init(
         quotaProvider: CompositeQuotaProvider = CompositeQuotaProvider(),
-        tokenProvider: any DailyTokenUsageProviding = DailyTokenUsageProvider()
+        tokenProvider: any DailyTokenUsageProviding = DailyTokenUsageProvider(),
+        taskActivityProvider: any CodexTaskActivityProviding = CodexTaskActivityProvider()
     ) {
         self.quotaProvider = quotaProvider
         self.tokenProvider = tokenProvider
+        self.taskActivityProvider = taskActivityProvider
     }
 
     func load(now: Date) -> UsageLoadResult {
         let quota = quotaProvider.currentObservation(now: now).map(QuotaSnapshot.init(observation:))
         let tokens = try? tokenProvider.currentUsage(now: now)
-        return UsageLoadResult(quota: quota, dailyTokens: tokens)
+        let isTaskActive = try? taskActivityProvider.currentActivity(now: now)
+        return UsageLoadResult(
+            quota: quota,
+            dailyTokens: tokens,
+            isTaskActive: isTaskActive
+        )
     }
 }
 
@@ -940,6 +959,7 @@ typealias UsageWatcherFactory = (_ onChange: @escaping () -> Void) -> any CodexA
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var snapshot: UsageSnapshot
+    @Published private(set) var isTaskActive = false
     @Published var voiceBroadcastEnabled = false
     @Published var voiceBroadcastIntervalMinutes: Int
 
@@ -956,6 +976,7 @@ final class UsageStore: ObservableObject {
     private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var notifiedLevels = Set<Int>()
+    private var lastTaskActivitySuccessAt: Date?
     private let loader: any UsageLoading
     private var watcher: CodexActivityWatching?
     private let createsWatcher: Bool
@@ -1109,6 +1130,16 @@ final class UsageStore: ObservableObject {
                 let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
                 let hasFreshQuota = result.quota != nil
                 let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
+                if let isTaskActive = result.isTaskActive {
+                    self.isTaskActive = isTaskActive
+                    self.lastTaskActivitySuccessAt = loadDate
+                } else {
+                    let shouldRetainActive = self.isTaskActive
+                        && self.lastTaskActivitySuccessAt.map {
+                            loadDate.timeIntervalSince($0) < self.fallbackInterval
+                        } == true
+                    self.isTaskActive = shouldRetainActive
+                }
                 self.snapshot = UsageSnapshot(
                     quota: quota,
                     dailyTokens: tokens,
