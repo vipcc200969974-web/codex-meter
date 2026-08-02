@@ -1618,7 +1618,12 @@ struct CompositeQuotaProvider: Sendable {
     }
 
     func currentObservation(now: Date = Date()) -> QuotaObservation? {
-        Self.merge(providers.flatMap { $0.currentWindowObservations() }, now: now)
+        for provider in providers {
+            if let observation = Self.merge(provider.currentWindowObservations(), now: now) {
+                return observation
+            }
+        }
+        return nil
     }
 
     static func merge(_ candidates: [ObservedRateLimitWindow], now: Date) -> QuotaObservation? {

@@ -2,8 +2,76 @@ import Foundation
 import XCTest
 @testable import CodexMeter
 
+private final class CountingQuotaProvider: QuotaObservationProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private let observations: [ObservedRateLimitWindow]
+    private var storedInvocationCount = 0
+
+    init(observations: [ObservedRateLimitWindow]) {
+        self.observations = observations
+    }
+
+    var invocationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedInvocationCount
+    }
+
+    func currentWindowObservations() -> [ObservedRateLimitWindow] {
+        lock.lock()
+        storedInvocationCount += 1
+        lock.unlock()
+        return observations
+    }
+}
+
 final class QuotaObservationSelectionTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
+
+    func testValidPrimaryObservationDoesNotInvokeExpensiveFallback() throws {
+        let reset = 2_000.0
+        let primary = CountingQuotaProvider(observations: [
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 48, resetsAt: reset, windowMinutes: 10_080),
+                observedAt: Date(timeIntervalSince1970: 1_200),
+                sourceName: "Codex 日志"
+            )
+        ])
+        let fallback = CountingQuotaProvider(observations: [
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 48, resetsAt: reset, windowMinutes: 10_080),
+                observedAt: Date(timeIntervalSince1970: 1_200),
+                sourceName: "Codex 会话"
+            )
+        ])
+
+        let result = try XCTUnwrap(
+            CompositeQuotaProvider(providers: [primary, fallback]).currentObservation(now: now)
+        )
+
+        XCTAssertEqual(result.windowSet.weekly?.usedPercent, 48)
+        XCTAssertEqual(primary.invocationCount, 1)
+        XCTAssertEqual(fallback.invocationCount, 0)
+    }
+
+    func testEmptyPrimaryInvokesFallbackAndReturnsItsObservation() throws {
+        let primary = CountingQuotaProvider(observations: [])
+        let fallback = CountingQuotaProvider(observations: [
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 48, resetsAt: 2_000, windowMinutes: 10_080),
+                observedAt: Date(timeIntervalSince1970: 1_200),
+                sourceName: "Codex 会话"
+            )
+        ])
+
+        let result = try XCTUnwrap(
+            CompositeQuotaProvider(providers: [primary, fallback]).currentObservation(now: now)
+        )
+
+        XCTAssertEqual(result.windowSet.weekly?.usedPercent, 48)
+        XCTAssertEqual(primary.invocationCount, 1)
+        XCTAssertEqual(fallback.invocationCount, 1)
+    }
 
     func testNewerSourceWinsWhenResetWindowChanges() throws {
         let old = ObservedRateLimitWindow(
