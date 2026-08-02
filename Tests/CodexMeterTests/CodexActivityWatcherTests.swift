@@ -140,7 +140,7 @@ final class CodexActivityWatcherTests: XCTestCase {
         wait(for: [appended], timeout: 3)
     }
 
-    func testRebindRecoversAfterActiveFileIsReplaced() throws {
+    func testAutomaticRecoveryAfterActiveFileIsReplaced() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let sessions = root.appendingPathComponent("sessions/2042/08/01")
         let archived = root.appendingPathComponent("archived_sessions")
@@ -174,8 +174,6 @@ final class CodexActivityWatcherTests: XCTestCase {
         // The first barrier lets the active event handler return; the second
         // drains the automatic recovery it enqueues after `onChange`.
         watcher.waitUntilIdleForTesting()
-        watcher.waitUntilIdleForTesting()
-        watcher.rebind()
         watcher.waitUntilIdleForTesting()
         changes.setNext(appended)
         let handle = try FileHandle(forWritingTo: file)

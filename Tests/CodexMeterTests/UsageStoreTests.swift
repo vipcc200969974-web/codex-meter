@@ -414,6 +414,52 @@ final class UsageStoreTests: XCTestCase {
         withExtendedLifetime(firstPublicationCancellable) {}
     }
 
+    func testSpringForwardSchedulesCalendarMidnightAndResetsDayIdentity() async throws {
+        var losAngeles = Calendar(identifier: .gregorian)
+        losAngeles.timeZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+        let springForwardDay = try XCTUnwrap(losAngeles.date(from: DateComponents(
+            year: 2026,
+            month: 3,
+            day: 8,
+            hour: 0,
+            minute: 0,
+            second: 0
+        )))
+        let followingMidnight = try XCTUnwrap(losAngeles.date(from: DateComponents(
+            year: 2026,
+            month: 3,
+            day: 9,
+            hour: 0,
+            minute: 0,
+            second: 0
+        )))
+        let clock = LockedDateSource(springForwardDay)
+        let scheduler = ManualUsageScheduler()
+        let store = UsageStore(
+            loader: CountingUsageLoader(result: UsageLoadResult(
+                quota: makeQuota(remainingPercent: 61, sourceName: "DST"),
+                dailyTokens: makeTokens(total: 42)
+            )),
+            watcher: SpyActivityWatcher(),
+            scheduler: scheduler,
+            calendar: losAngeles,
+            now: clock.now
+        )
+
+        _ = await nextSnapshot(from: store) { store.start() }
+        let midnightTask = try XCTUnwrap(scheduler.tasks.first {
+            !$0.isCancelled && $0.repeatingInterval == nil
+        })
+        XCTAssertEqual(midnightTask.nextFireTime, 82_800, accuracy: 0.001)
+
+        clock.set(followingMidnight)
+        let reset = await nextSnapshot(from: store) {
+            midnightTask.fireEvenIfCancelled()
+        }
+        XCTAssertEqual(reset.dailyTokens, .zero)
+        XCTAssertEqual(reset.dailyTokenDay, losAngeles.startOfDay(for: followingMidnight))
+    }
+
     func testRepeatedStartDoesNotDuplicateWatcherOrImmediateRefresh() async throws {
         let loader = CountingUsageLoader(result: .empty)
         let watcher = SpyActivityWatcher()

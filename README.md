@@ -77,14 +77,16 @@ swift run CodexMeter
 
 ## 数据从哪里来
 
-Codex Meter 会扫描这些本地目录：
+Codex Meter 会读取这些本地数据源：
 
 ```text
 ~/.codex/sessions
 ~/.codex/archived_sessions
+~/.codex/logs_2.sqlite
+~/.codex/logs_2.sqlite-wal
 ```
 
-额度数据只读取日志中的结构化 `payload.rate_limits` 记录，用来推断：
+额度数据读取 SQLite 日志和会话/归档 JSONL 中的结构化 `payload.rate_limits` 记录，用来推断：
 
 - 5 小时窗口额度
 - 7 天窗口额度
@@ -132,7 +134,7 @@ Codex Meter 不读取或上传对话内容，也不读取或上传认证信息�
 
 ## 隐私
 
-Codex Meter 只在本机读取 JSONL 日志文件，不上传会话内容，不读取认证信息，也不发网络请求。
+Codex Meter 只在本机读取 JSONL 日志及 `logs_2.sqlite`（含 WAL）中的结构化字段；不上传会话内容，不读取认证信息，也不发网络请求。
 
 ## 许可证
 

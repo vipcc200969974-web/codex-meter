@@ -39,6 +39,9 @@ struct DailyTokenUsage: Codable, Equatable, Sendable {
 
     private var compositionDenominator: Double {
         guard totalTokens > 0 else { return 0 }
+        // Normal records use totalTokens. If nonnegative visible components
+        // exceed it, normalize by their sum so segment widths remain finite;
+        // reasoning is already a subset of output and is intentionally excluded.
         let components = [cachedInputTokens, nonCachedInputTokens, outputTokens]
             .reduce(0.0) { $0 + max(Double($1), 0) }
         return max(Double(totalTokens), components)
