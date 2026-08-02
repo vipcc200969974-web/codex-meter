@@ -49,7 +49,7 @@ The activity provider reads the same local roots already watched by Codex Meter:
 
 It recognizes only complete JSONL records whose top-level type is `event_msg` and whose structured payload type is `task_started` or `task_complete`. It decodes only the lifecycle type, `turn_id`, and lifecycle timestamp needed to determine state.
 
-Prompt text, replies, reasoning, tool arguments, authentication data, and unrelated event payloads are not decoded, retained, displayed, or uploaded. No network request is introduced. The persistent cursor cache contains only file identity, complete-line offsets, lifecycle type, turn identifier, and timestamp; it never contains raw JSONL bytes or partial lines.
+Prompt text, replies, reasoning, tool arguments, authentication data, and unrelated event payloads are not decoded, retained, displayed, or uploaded. No network request is introduced. The persistent cursor cache contains only file identity, complete-line offsets, SHA-256 generation fingerprints, lifecycle type, turn identifier, and timestamp; it never contains raw JSONL bytes or partial lines.
 
 ## Architecture and data flow
 
@@ -58,13 +58,14 @@ Prompt text, replies, reasoning, tool arguments, authentication data, and unrela
 A dedicated provider owns lifecycle parsing and incremental file state.
 
 1. Discover JSONL candidates in active and archived session roots.
-2. Deduplicate moved or archived copies by stable file identity, with rollout basename as a fallback.
-3. Read only bytes appended after each validated complete-line cursor.
-4. Use a narrow raw discriminator before typed decoding so unrelated records are skipped without materializing their payloads.
-5. Maintain the latest lifecycle state for each `turn_id`.
-6. Return `isActive == true` when at least one non-stale turn remains started.
+2. Treat a never-tracked archived file as definitively stopped, while continuing to follow a cached active file that moves into the archive.
+3. Deduplicate moved or archived copies by stable file identity, with rollout basename as a fallback.
+4. Read only bytes appended after each validated complete-line cursor, using bounded chunks.
+5. Use a narrow raw discriminator before typed decoding so unrelated records are skipped without materializing their payloads.
+6. Maintain the latest lifecycle state for each `turn_id`.
+7. Return `isActive == true` when at least one non-stale turn remains started.
 
-On first launch without a valid cursor cache, the provider rebuilds lifecycle state from candidate files modified within the 24-hour activity horizon. A cold rebuild accepts at most 64 MiB per file and 256 MiB across all candidates; exceeding either bound makes that refresh unavailable rather than publishing a partial false-active result. File replacement, truncation, active-to-archive moves, and incomplete trailing lines must not duplicate or lose lifecycle events.
+On first launch without a valid cursor cache, the provider rebuilds lifecycle state from active-session files modified within the 24-hour activity horizon. A cold rebuild or incremental refresh accepts at most 256 MiB of unread bytes per file and 512 MiB of unread bytes in aggregate; validated historical offsets do not consume that budget. Exceeding either unread bound makes that refresh unavailable rather than publishing a partial false-active result. A refresh reads the metadata-approved snapshot and leaves bytes appended during that read for the next refresh. File replacement, truncation, active-to-archive moves, and incomplete trailing lines must not duplicate or lose lifecycle events. SHA-256 samples at the beginning and validated boundary detect same-identity truncate-and-rewrite generations without persisting source bytes.
 
 ### `UsageStore`
 
@@ -90,7 +91,7 @@ The tooltip adds either `ChatGPT 正在执行任务` or `当前无运行任务`.
 - Traversal, metadata, or read failures do not publish partially reconstructed activity.
 - Malformed, non-lifecycle, timestamp-less, or identifier-less events are ignored.
 - An incomplete final JSONL line is retained only in memory until it becomes complete and is never persisted.
-- A cache whose identity, offset, day horizon, or aggregate state cannot be validated is discarded and rebuilt.
+- A cache whose identity, offset, day horizon, or generation fingerprint cannot be validated is discarded and rebuilt.
 - After an app or task crash, the 24-hour lifecycle expiry guarantees eventual idle state even if no completion event was written.
 
 ## Testing and acceptance criteria

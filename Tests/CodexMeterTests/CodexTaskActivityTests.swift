@@ -157,12 +157,13 @@ final class CodexTaskActivityTests: XCTestCase {
 
     func testAnyUncompletedTurnMakesGlobalActivityActive() throws {
         try writeLifecycle(.started, turnID: "a", to: activeFile, at: now.addingTimeInterval(-10))
-        try writeLifecycle(.started, turnID: "b", to: otherFile, at: now.addingTimeInterval(-9))
+        let secondActiveFile = activeRoot.appendingPathComponent("rollout-second.jsonl")
+        try writeLifecycle(.started, turnID: "b", to: secondActiveFile, at: now.addingTimeInterval(-9))
         try appendLifecycle(.completed, turnID: "a", to: activeFile, at: now.addingTimeInterval(-5))
 
         XCTAssertTrue(try makeProvider().currentActivity(now: now))
 
-        try appendLifecycle(.completed, turnID: "b", to: otherFile, at: now)
+        try appendLifecycle(.completed, turnID: "b", to: secondActiveFile, at: now)
         XCTAssertFalse(try makeProvider().currentActivity(now: now))
     }
 
@@ -261,15 +262,66 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertFalse(try makeProvider().currentActivity(now: now))
     }
 
-    func testRestartUsesCachedCursorWithoutRereadingCoveredBytes() throws {
-        try writeLifecycle(.started, turnID: "cached", to: activeFile, at: now.addingTimeInterval(-10))
-        XCTAssertTrue(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+    func testCachedFileMayGrowPastAbsolutePerFileCapWhenOnlyAppendIsWithinBudget() throws {
+        let padding = String(repeating: " ", count: 2_048)
+        try Data((lifecycleLine(.started, turnID: "cached", at: now.addingTimeInterval(-10)) + padding + "\n").utf8)
+            .write(to: activeFile)
+        XCTAssertTrue(
+            try makeProvider(cacheURL: cacheURL, maxBytesPerFile: 4_096, maxTotalBytes: 4_096)
+                .currentActivity(now: now)
+        )
 
-        var coveredBytes = try Data(contentsOf: activeFile)
-        coveredBytes.replaceSubrange(0..<(coveredBytes.count - 1), with: repeatElement(0x20, count: coveredBytes.count - 1))
-        try coveredBytes.write(to: activeFile, options: [])
+        let appended = Data((lifecycleLine(.completed, turnID: "cached", at: now) + "\n").utf8)
+        try append(appended, to: activeFile)
 
-        XCTAssertTrue(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+        XCTAssertFalse(
+            try makeProvider(
+                cacheURL: cacheURL,
+                maxBytesPerFile: UInt64(appended.count),
+                maxTotalBytes: UInt64(appended.count)
+            ).currentActivity(now: now)
+        )
+    }
+
+    func testCachedHistoricalOffsetsMayExceedAggregateUnreadBudget() throws {
+        let secondActiveFile = activeRoot.appendingPathComponent("rollout-second.jsonl")
+        try writeLifecycle(.started, turnID: "first", to: activeFile, at: now.addingTimeInterval(-10))
+        try writeLifecycle(.started, turnID: "second", to: secondActiveFile, at: now.addingTimeInterval(-9))
+        XCTAssertTrue(
+            try makeProvider(cacheURL: cacheURL, maxBytesPerFile: 4_096, maxTotalBytes: 8_192)
+                .currentActivity(now: now)
+        )
+
+        XCTAssertTrue(
+            try makeProvider(cacheURL: cacheURL, maxBytesPerFile: 1, maxTotalBytes: 1)
+                .currentActivity(now: now)
+        )
+    }
+
+    func testColdHugeArchiveDoesNotBlockActiveSessionDetection() throws {
+        try writeLifecycle(.started, turnID: "live", to: activeFile, at: now)
+        try createSparseFile(at: otherFile, size: 1_024 * 1_024)
+
+        XCTAssertTrue(
+            try makeProvider(maxBytesPerFile: 512, maxTotalBytes: 512)
+                .currentActivity(now: now)
+        )
+    }
+
+    func testSameIdentityLargerRewriteRebuildsFromLifecycleNearBeginning() throws {
+        try writeLifecycle(.started, turnID: "old", to: activeFile, at: now.addingTimeInterval(-10))
+        let provider = makeProvider()
+        XCTAssertTrue(try provider.currentActivity(now: now))
+
+        let replacement = lifecycleLine(.completed, turnID: "old", at: now)
+            + String(repeating: " ", count: 4_096)
+            + "\n"
+        let handle = try FileHandle(forWritingTo: activeFile)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data(replacement.utf8))
+        try handle.close()
+
+        XCTAssertFalse(try provider.currentActivity(now: now))
     }
 
     func testCorruptCacheIsDiscardedAndRebuiltFromSource() throws {
@@ -294,6 +346,7 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(cache.contains("rootsFingerprint"))
         XCTAssertTrue(cache.contains("savedAt"))
         XCTAssertTrue(cache.contains("completeLineOffset"))
+        XCTAssertTrue(cache.contains("generationFingerprint"))
         XCTAssertTrue(cache.contains("safe-id"))
         XCTAssertFalse(cache.contains(sentinel))
     }
@@ -364,7 +417,7 @@ final class CodexTaskActivityTests: XCTestCase {
         }
     }
 
-    func testFileGrowthAfterMetadataIsRefusedWithoutTreatingItAsOrdinaryReadFailure() throws {
+    func testFileGrowthAfterMetadataUsesBoundedSnapshotThenBudgetsAppendOnNextRefresh() throws {
         let approvedData = Data(
             (lifecycleLine(.started, turnID: "bounded", at: now) + "\n").utf8
         )
@@ -381,28 +434,35 @@ final class CodexTaskActivityTests: XCTestCase {
             maxTotalBytes: approvedByteCount
         )
 
+        XCTAssertTrue(try provider.currentActivity(now: now))
         XCTAssertThrowsError(try provider.currentActivity(now: now)) {
             XCTAssertEqual($0 as? CodexTaskActivityProviderError, .fileTooLarge)
         }
     }
 
-    func testFileLargerThanSixtyFourMiBIsRefused() throws {
-        try createSparseFile(at: activeFile, size: 64 * 1_024 * 1_024 + 1)
+    func testColdActiveFileLargerThanReconstructionBudgetIsRefused() throws {
+        try createSparseFile(at: activeFile, size: 1_025)
 
-        XCTAssertThrowsError(try makeProvider().currentActivity(now: now)) {
+        XCTAssertThrowsError(
+            try makeProvider(maxBytesPerFile: 1_024, maxTotalBytes: 4_096)
+                .currentActivity(now: now)
+        ) {
             XCTAssertEqual($0 as? CodexTaskActivityProviderError, .fileTooLarge)
         }
     }
 
-    func testAggregateLargerThanTwoHundredFiftySixMiBIsRefused() throws {
-        for index in 0..<5 {
+    func testColdActiveAggregateLargerThanReconstructionBudgetIsRefused() throws {
+        for index in 0..<3 {
             try createSparseFile(
                 at: activeRoot.appendingPathComponent("rollout-\(index).jsonl"),
-                size: 64 * 1_024 * 1_024
+                size: 1_024
             )
         }
 
-        XCTAssertThrowsError(try makeProvider().currentActivity(now: now)) {
+        XCTAssertThrowsError(
+            try makeProvider(maxBytesPerFile: 1_024, maxTotalBytes: 2_048)
+                .currentActivity(now: now)
+        ) {
             XCTAssertEqual($0 as? CodexTaskActivityProviderError, .aggregateTooLarge)
         }
     }

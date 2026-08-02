@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum CodexTaskLifecycleKind: String, Codable, Sendable {
@@ -141,7 +142,8 @@ private struct JSONLifecycleScanner {
 
             switch key {
             case "type":
-                isEventMessage = parseString() == "event_msg"
+                guard parseString() == "event_msg" else { return false }
+                isEventMessage = true
             case "payload":
                 lifecycleType = parsePayloadLifecycleType()
             default:
@@ -167,7 +169,10 @@ private struct JSONLifecycleScanner {
 
             if key == "type" {
                 let value = parseString()
-                lifecycleType = value == "task_started" || value == "task_complete"
+                guard value == "task_started" || value == "task_complete" else {
+                    return false
+                }
+                lifecycleType = true
             } else if !skipValue() {
                 return false
             }
@@ -289,9 +294,11 @@ enum CodexTaskActivityProviderError: Error, Equatable {
 }
 
 final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Sendable {
-    private static let cacheSchemaVersion = 1
+    private static let cacheSchemaVersion = 2
     private static let activityHorizon: TimeInterval = 86_400
     private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
+    private static let readChunkBytes = 4 * 1_024 * 1_024
+    private static let fingerprintSampleBytes: UInt64 = 4 * 1_024
 
     private struct FileIdentity: Codable, Hashable {
         let device: UInt64
@@ -317,6 +324,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         var offset: UInt64 = 0
         var partial = Data()
         var activeTurns: [String: Date] = [:]
+        var generationFingerprint: String?
         var needsBoundaryValidation = false
     }
 
@@ -325,6 +333,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         let modifiedAt: Date
         let byteCount: UInt64
         let identity: FileIdentity?
+        let isArchived: Bool
 
         var key: CursorKey {
             identity.map(CursorKey.identity) ?? .basename(url.lastPathComponent)
@@ -343,6 +352,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         let basename: String
         let identity: FileIdentity?
         let completeLineOffset: UInt64
+        let generationFingerprint: String
         let activeTurns: [PersistentActiveTurn]
     }
 
@@ -357,6 +367,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     }
 
     private let roots: [URL]
+    private let archivedRootPaths: Set<String>
     private let fileManager: FileManager
     private let cacheURL: URL?
     private let maxBytesPerFile: UInt64
@@ -370,8 +381,8 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         roots: [URL]? = nil,
         fileManager: FileManager = .default,
         cacheURL: URL? = nil,
-        maxBytesPerFile: UInt64 = 64 * 1_024 * 1_024,
-        maxTotalBytes: UInt64 = 256 * 1_024 * 1_024
+        maxBytesPerFile: UInt64 = 256 * 1_024 * 1_024,
+        maxTotalBytes: UInt64 = 512 * 1_024 * 1_024
     ) {
         let defaultRoots = [
             fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
@@ -379,6 +390,11 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         ]
         let resolvedRoots = roots ?? defaultRoots
         self.roots = resolvedRoots
+        self.archivedRootPaths = Set(
+            resolvedRoots
+                .filter { $0.lastPathComponent == "archived_sessions" }
+                .map { $0.standardizedFileURL.path }
+        )
         self.fileManager = fileManager
         self.cacheURL = cacheURL ?? (roots == nil ? Self.defaultCacheURL(fileManager: fileManager) : nil)
         self.maxBytesPerFile = maxBytesPerFile
@@ -393,14 +409,23 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         let lowerBound = now.addingTimeInterval(-Self.activityHorizon)
         var refreshed = didLoadCache ? cursors : loadCache(now: now, lowerBound: lowerBound)
         let candidates = try discoverCandidates(modifiedAtOrAfter: lowerBound)
-        try validateBudget(for: candidates)
 
         var discoveredKeys = Set<CursorKey>()
+        var unreadAggregate: UInt64 = 0
         for candidate in candidates {
             let key = candidate.key
+            guard refreshed[key] != nil || !candidate.isArchived else {
+                continue
+            }
             discoveredKeys.insert(key)
             var cursor = refreshed[key] ?? FileCursor(url: candidate.url)
-            try update(&cursor, from: candidate)
+            try prepare(&cursor, for: candidate)
+            let unreadByteCount = candidate.byteCount - cursor.offset
+            try validateBudget(
+                unreadByteCount: unreadByteCount,
+                aggregate: &unreadAggregate
+            )
+            try updatePrepared(&cursor, from: candidate)
             cursor.activeTurns = cursor.activeTurns.filter { $0.value >= lowerBound }
             refreshed[key] = cursor
         }
@@ -454,6 +479,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 url: URL(fileURLWithPath: persisted.path),
                 offset: persisted.completeLineOffset,
                 activeTurns: activeTurns,
+                generationFingerprint: persisted.generationFingerprint,
                 needsBoundaryValidation: true
             )
         }
@@ -487,16 +513,13 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     }
 
     private func areValid(_ persisted: [PersistentCursor]) -> Bool {
-        var aggregate: UInt64 = 0
         for cursor in persisted {
             guard !cursor.path.isEmpty,
                   !cursor.basename.isEmpty,
-                  cursor.completeLineOffset <= maxBytesPerFile,
-                  aggregate <= maxTotalBytes,
-                  cursor.completeLineOffset <= maxTotalBytes - aggregate else {
+                  cursor.generationFingerprint.count == 64,
+                  cursor.generationFingerprint.allSatisfy({ $0.isHexDigit }) else {
                 return false
             }
-            aggregate += cursor.completeLineOffset
 
             var turnIDs = Set<String>()
             for activeTurn in cursor.activeTurns {
@@ -533,6 +556,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 basename: basename,
                 identity: identity,
                 completeLineOffset: completeOffset,
+                generationFingerprint: cursor.generationFingerprint ?? "",
                 activeTurns: activeTurns
             )
         }.sorted { $0.path < $1.path }
@@ -559,7 +583,12 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     private func discoverCandidates(modifiedAtOrAfter lowerBound: Date) throws -> [Candidate] {
         var candidates: [Candidate] = []
         for root in roots {
-            try appendCandidates(from: root, modifiedAtOrAfter: lowerBound, to: &candidates)
+            try appendCandidates(
+                from: root,
+                isArchived: archivedRootPaths.contains(root.standardizedFileURL.path),
+                modifiedAtOrAfter: lowerBound,
+                to: &candidates
+            )
         }
 
         candidates.sort { lhs, rhs in
@@ -587,6 +616,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
 
     private func appendCandidates(
         from root: URL,
+        isArchived: Bool,
         modifiedAtOrAfter lowerBound: Date,
         to candidates: inout [Candidate]
     ) throws {
@@ -630,7 +660,8 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 url: url,
                 modifiedAt: modifiedAt,
                 byteCount: fileSize.uint64Value,
-                identity: FileIdentity(attributes: attributes)
+                identity: FileIdentity(attributes: attributes),
+                isArchived: isArchived
             ))
         }
         if traversalFailed {
@@ -656,85 +687,92 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         return true
     }
 
-    private func validateBudget(for candidates: [Candidate]) throws {
-        var aggregate: UInt64 = 0
-        for candidate in candidates {
-            guard candidate.byteCount <= maxBytesPerFile else {
-                throw CodexTaskActivityProviderError.fileTooLarge
-            }
-            guard aggregate <= maxTotalBytes,
-                  candidate.byteCount <= maxTotalBytes - aggregate else {
-                throw CodexTaskActivityProviderError.aggregateTooLarge
-            }
-            aggregate += candidate.byteCount
+    private func validateBudget(
+        unreadByteCount: UInt64,
+        aggregate: inout UInt64
+    ) throws {
+        guard unreadByteCount <= maxBytesPerFile else {
+            throw CodexTaskActivityProviderError.fileTooLarge
         }
+        guard aggregate <= maxTotalBytes,
+              unreadByteCount <= maxTotalBytes - aggregate else {
+            throw CodexTaskActivityProviderError.aggregateTooLarge
+        }
+        aggregate += unreadByteCount
     }
 
-    private func update(_ cursor: inout FileCursor, from candidate: Candidate) throws {
+    private func prepare(_ cursor: inout FileCursor, for candidate: Candidate) throws {
         cursor.url = candidate.url
-        if candidate.byteCount < cursor.offset || (
-            cursor.needsBoundaryValidation
-                && !isCompleteLineBoundary(
-                    cursor.offset,
-                    in: candidate.url,
-                    fileSize: candidate.byteCount
-                )
-        ) {
+        let completeOffset = cursor.offset - UInt64(cursor.partial.count)
+        let invalidBoundary = cursor.needsBoundaryValidation
+            && !isCompleteLineBoundary(
+                completeOffset,
+                in: candidate.url,
+                fileSize: candidate.byteCount
+            )
+        let invalidGeneration: Bool
+        if let expectedFingerprint = cursor.generationFingerprint,
+           completeOffset <= candidate.byteCount {
+            invalidGeneration = try generationFingerprint(
+                of: candidate.url,
+                through: completeOffset
+            ) != expectedFingerprint
+        } else {
+            invalidGeneration = cursor.generationFingerprint != nil
+        }
+
+        if candidate.byteCount < cursor.offset || invalidBoundary || invalidGeneration {
             cursor = FileCursor(url: candidate.url)
         }
         cursor.needsBoundaryValidation = false
+    }
 
+    private func updatePrepared(_ cursor: inout FileCursor, from candidate: Candidate) throws {
         let readStart = cursor.offset
         let approvedByteCount = candidate.byteCount - readStart
-        let result = try read(
-            from: candidate.url,
-            offset: readStart,
-            byteCount: approvedByteCount
-        )
-        guard UInt64(result.data.count) == approvedByteCount else {
-            throw CodexTaskActivityProviderError.readFailed
-        }
-        if result.hasMoreBytes {
-            let actualByteCount = try currentByteCount(of: candidate.url)
-            if actualByteCount > maxBytesPerFile {
-                throw CodexTaskActivityProviderError.fileTooLarge
+        do {
+            let handle = try FileHandle(forReadingFrom: candidate.url)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: readStart)
+
+            var remaining = approvedByteCount
+            while remaining > 0 {
+                let requested = Int(min(UInt64(Self.readChunkBytes), remaining))
+                guard let chunk = try handle.read(upToCount: requested), !chunk.isEmpty else {
+                    throw CodexTaskActivityProviderError.readFailed
+                }
+                consume(chunk, into: &cursor)
+                remaining -= UInt64(chunk.count)
             }
+
+        } catch let error as CodexTaskActivityProviderError {
+            throw error
+        } catch {
             throw CodexTaskActivityProviderError.readFailed
         }
-        let newData = result.data
 
-        var completeAndPartial = cursor.partial
-        completeAndPartial.append(newData)
-        if let finalNewline = completeAndPartial.lastIndex(of: 0x0A) {
-            let partialStart = completeAndPartial.index(after: finalNewline)
-            cursor.partial = Data(completeAndPartial[partialStart...])
-        } else {
-            cursor.partial = completeAndPartial
-        }
+        cursor.offset = readStart + approvedByteCount
+        let completeOffset = cursor.offset - UInt64(cursor.partial.count)
+        cursor.generationFingerprint = try generationFingerprint(
+            of: candidate.url,
+            through: completeOffset
+        )
+    }
 
-        for event in CodexTaskLifecycleParser.parseCompleteLines(in: completeAndPartial) {
+    private func consume(_ newData: Data, into cursor: inout FileCursor) {
+        cursor.partial.append(newData)
+        guard let finalNewline = cursor.partial.lastIndex(of: 0x0A) else { return }
+        let partialStart = cursor.partial.index(after: finalNewline)
+        let completeData = cursor.partial.subdata(in: cursor.partial.startIndex..<partialStart)
+        cursor.partial = Data(cursor.partial[partialStart...])
+
+        for event in CodexTaskLifecycleParser.parseCompleteLines(in: completeData) {
             switch event.kind {
             case .started:
                 cursor.activeTurns[event.turnID] = event.timestamp
             case .completed:
                 cursor.activeTurns.removeValue(forKey: event.turnID)
             }
-        }
-        cursor.offset = readStart + UInt64(newData.count)
-    }
-
-    private func read(
-        from url: URL,
-        offset: UInt64,
-        byteCount: UInt64
-    ) throws -> BoundedRead {
-        do {
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
-            try handle.seek(toOffset: offset)
-            return try Self.readExactly(from: handle, byteCount: byteCount)
-        } catch {
-            throw CodexTaskActivityProviderError.readFailed
         }
     }
 
@@ -760,14 +798,46 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         return BoundedRead(data: data, hasMoreBytes: hasMoreBytes)
     }
 
-    private func currentByteCount(of url: URL) throws -> UInt64 {
+    private func generationFingerprint(
+        of url: URL,
+        through offset: UInt64
+    ) throws -> String {
         do {
-            let attributes = try fileManager.attributesOfItem(atPath: url.path)
-            guard let fileSize = attributes[.size] as? NSNumber,
-                  fileSize.int64Value >= 0 else {
-                throw CodexTaskActivityProviderError.readFailed
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+
+            var hasher = SHA256()
+            var encodedOffset = offset.bigEndian
+            withUnsafeBytes(of: &encodedOffset) { bytes in
+                hasher.update(data: Data(bytes))
             }
-            return fileSize.uint64Value
+
+            let prefixCount = min(offset, Self.fingerprintSampleBytes)
+            if prefixCount > 0 {
+                try handle.seek(toOffset: 0)
+                let prefix = try Self.readExactly(from: handle, byteCount: prefixCount)
+                guard UInt64(prefix.data.count) == prefixCount else {
+                    throw CodexTaskActivityProviderError.readFailed
+                }
+                hasher.update(data: prefix.data)
+            }
+
+            let boundaryStart = offset > Self.fingerprintSampleBytes
+                ? offset - Self.fingerprintSampleBytes
+                : 0
+            if boundaryStart > 0 {
+                try handle.seek(toOffset: boundaryStart)
+                let boundary = try Self.readExactly(
+                    from: handle,
+                    byteCount: offset - boundaryStart
+                )
+                guard UInt64(boundary.data.count) == offset - boundaryStart else {
+                    throw CodexTaskActivityProviderError.readFailed
+                }
+                hasher.update(data: boundary.data)
+            }
+
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
         } catch let error as CodexTaskActivityProviderError {
             throw error
         } catch {

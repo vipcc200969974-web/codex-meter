@@ -15,7 +15,7 @@
 - Ring diameter is exactly 12.5 points with a 1.5-point rounded stroke and 6 points trailing padding.
 - Active animation is 12 frames per second and one revolution per second; idle launch is top-facing and completion freezes the current angle.
 - Any non-stale local turn makes the global state active; stale means older than exactly 24 hours.
-- Cold scanning is capped at 64 MiB per file and 256 MiB in aggregate; cap or traversal failure never publishes partial activity.
+- Cold active-session reconstruction and incremental reads are capped at 256 MiB of unread data per file and 512 MiB of unread data in aggregate; validated historical offsets and never-tracked archived files do not consume that budget, and failures never publish partial activity.
 - Reuse the existing 800 ms filesystem debounce and 60-second fallback. Do not add polling intervals or a second watcher.
 - Decode only top-level event type plus lifecycle type, `turn_id`, and lifecycle timestamp. Do not decode, retain, display, or upload prompts, replies, reasoning, tool arguments, authentication data, raw lines, or partial lines.
 - Add no dependency and no network request. Do not change quota, token, panel, notification, or login-item behavior.
@@ -199,7 +199,7 @@ func testTwentyFourHourBoundaryIsActiveButOlderStartIsStale() throws {
 }
 ```
 
-Add mutation-sensitive tests for append-without-double-counting, partial-line completion, truncation, larger replacement, same-identity move, active/archive copy deduplication, restart cache hit without rereading unchanged bytes, corrupt cache rebuild, serialized-cache privacy sentinel absence, missing roots, unreadable traversal, 64 MiB/file refusal, and 256 MiB aggregate refusal.
+Add mutation-sensitive tests for append-without-double-counting, partial-line completion, truncation, larger replacement, same-identity move, active/archive copy deduplication, cached offsets larger than the unread budget, never-tracked huge archive skipping, same-identity larger rewrite detection, corrupt cache rebuild, serialized-cache privacy sentinel absence, missing roots, unreadable traversal, per-file unread refusal, aggregate unread refusal, and bounded snapshot growth.
 
 - [ ] **Step 2: Run focused provider tests and verify RED**
 
@@ -229,17 +229,17 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         roots: [URL]? = nil,
         fileManager: FileManager = .default,
         cacheURL: URL? = nil,
-        maxBytesPerFile: UInt64 = 64 * 1_024 * 1_024,
-        maxTotalBytes: UInt64 = 256 * 1_024 * 1_024
+        maxBytesPerFile: UInt64 = 256 * 1_024 * 1_024,
+        maxTotalBytes: UInt64 = 512 * 1_024 * 1_024
     )
 
     func currentActivity(now: Date) throws -> Bool
 }
 ```
 
-Use one locked state transition per refresh. Discover only `.jsonl` candidates modified at or after `now - 86_400`; missing roots are empty, while existing-root traversal and candidate metadata errors throw. Key cursors by device/inode identity with basename fallback, preserve cursors across active-to-archive moves, prune disappeared keys, and rebuild on identity change, truncation, impossible offset, or non-newline cached boundary.
+Use one locked state transition per refresh. Discover only `.jsonl` candidates modified at or after `now - 86_400`; missing roots are empty, while existing-root traversal and candidate metadata errors throw. Never-tracked archived candidates are definitively inactive, but cached active cursors continue across active-to-archive moves. Key cursors by device/inode identity with basename fallback, prune disappeared keys, and rebuild on identity change, truncation, impossible offset, non-newline cached boundary, or SHA-256 generation mismatch.
 
-Persist schema version, root fingerprint, cache save timestamp, file identity, path/basename, complete-line offset, and per-file active turn IDs with their start timestamps. Apply complete appended events in file order. Completion removes only the matching ID. Remove starts whose timestamp is `< now - 86_400`; the exact 24-hour boundary remains active. Validate every cached offset and aggregate before trusting it; write the cache atomically and never persist partial data or raw input.
+Persist schema version, root fingerprint, cache save timestamp, file identity, path/basename, complete-line offset, privacy-safe generation fingerprint, and per-file active turn IDs with their start timestamps. Apply complete appended events in file order. Completion removes only the matching ID. Remove starts whose timestamp is `< now - 86_400`; the exact 24-hour boundary remains active. Budget only cold reconstruction or unread appended bytes, read in bounded chunks, and leave concurrent growth for the next refresh. Write the cache atomically and never persist partial data or raw input.
 
 - [ ] **Step 4: Run focused provider tests and verify GREEN**
 
