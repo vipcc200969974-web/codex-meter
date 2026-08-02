@@ -535,11 +535,17 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(usage.cachedFraction + usage.nonCachedFraction + usage.outputFraction, 1, accuracy: 0.0001)
     }
 
-    func testCompactChineseFormatting() {
+    func testExactFormattingMakesOneTokenDifferenceVisible() {
+        XCTAssertEqual(TokenCountFormatter.exact(520_778_892), "520,778,892")
+        XCTAssertEqual(TokenCountFormatter.exact(520_778_893), "520,778,893")
+    }
+
+    func testCompactChineseFormattingUsesUsefulPrecision() {
         XCTAssertEqual(TokenCountFormatter.compact(9_999), "9,999")
-        XCTAssertEqual(TokenCountFormatter.compact(10_000), "1.0万")
-        XCTAssertEqual(TokenCountFormatter.compact(7_986_313), "798.6万")
-        XCTAssertEqual(TokenCountFormatter.compact(100_000_000), "1.0亿")
+        XCTAssertEqual(TokenCountFormatter.compact(10_000), "1.00万")
+        XCTAssertEqual(TokenCountFormatter.compact(7_986_313), "798.63万")
+        XCTAssertEqual(TokenCountFormatter.compact(100_000_000), "1.000亿")
+        XCTAssertEqual(TokenCountFormatter.compact(520_778_892), "5.208亿")
     }
 
     func testProviderReadsOnlyNewCompleteLinesWithoutDoubleCounting() throws {

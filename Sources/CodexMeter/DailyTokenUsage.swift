@@ -305,14 +305,18 @@ private enum DailyTokenLineDiscriminator {
 }
 
 enum TokenCountFormatter {
+    static func exact(_ value: Int64) -> String {
+        value.formatted(.number.grouping(.automatic))
+    }
+
     static func compact(_ value: Int64) -> String {
         if value >= 100_000_000 {
-            return String(format: "%.1f亿", Double(value) / 100_000_000)
+            return String(format: "%.3f亿", Double(value) / 100_000_000)
         }
         if value >= 10_000 {
-            return String(format: "%.1f万", Double(value) / 10_000)
+            return String(format: "%.2f万", Double(value) / 10_000)
         }
-        return value.formatted(.number.grouping(.automatic))
+        return exact(value)
     }
 }
 

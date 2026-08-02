@@ -513,7 +513,7 @@ struct DailyTokenUsageCard: View {
                 Text("今日 Token")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text(usage.totalTokens == 0 ? "今日暂无使用" : TokenCountFormatter.compact(usage.totalTokens))
+                Text(usage.totalTokens == 0 ? "今日暂无使用" : TokenCountFormatter.exact(usage.totalTokens))
                     .font(.system(size: 22, weight: .bold, design: .rounded))
                     .monospacedDigit()
             }
