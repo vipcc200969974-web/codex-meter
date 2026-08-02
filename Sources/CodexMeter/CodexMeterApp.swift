@@ -294,6 +294,29 @@ private final class TimerStatusItemAnimationTask: NSObject, StatusItemAnimationT
     }
 }
 
+enum StatusActivityRingPath {
+    static let lineWidth: CGFloat = 1.5
+    static let sweepDegrees: CGFloat = 285
+    static let dashPattern: [CGFloat] = [1.6, 2.4]
+
+    static func make(in frame: NSRect, angleDegrees: CGFloat) -> NSBezierPath {
+        let path = NSBezierPath()
+        path.lineWidth = lineWidth
+        path.lineCapStyle = .round
+        dashPattern.withUnsafeBufferPointer {
+            path.setLineDash($0.baseAddress, count: $0.count, phase: 0)
+        }
+        path.appendArc(
+            withCenter: NSPoint(x: frame.midX, y: frame.midY),
+            radius: (CompactStatusItemLayout.ringDiameter - lineWidth) / 2,
+            startAngle: angleDegrees,
+            endAngle: angleDegrees + sweepDegrees,
+            clockwise: false
+        )
+        return path
+    }
+}
+
 @MainActor
 final class CompactStatusItemView: NSView {
     var onClick: (() -> Void)?
@@ -404,15 +427,9 @@ final class CompactStatusItemView: NSView {
         }
         drawDivider(in: layout.activityDividerFrame)
 
-        let ringPath = NSBezierPath()
-        ringPath.lineWidth = 1.5
-        ringPath.lineCapStyle = .round
-        ringPath.appendArc(
-            withCenter: NSPoint(x: layout.ringFrame.midX, y: layout.ringFrame.midY),
-            radius: (CompactStatusItemLayout.ringDiameter - ringPath.lineWidth) / 2,
-            startAngle: ringAngleDegrees,
-            endAngle: ringAngleDegrees + 285,
-            clockwise: false
+        let ringPath = StatusActivityRingPath.make(
+            in: layout.ringFrame,
+            angleDegrees: ringAngleDegrees
         )
         color.setStroke()
         ringPath.stroke()

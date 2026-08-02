@@ -42,6 +42,25 @@ final class CompactStatusItemViewTests: XCTestCase {
         XCTAssertEqual(layout.activityDividerFrame.maxX + 5, layout.ringFrame.minX)
     }
 
+    func testActivityRingPathUsesRoundedShortDashes() {
+        let path = StatusActivityRingPath.make(
+            in: NSRect(x: 0, y: 0, width: 12.5, height: 12.5),
+            angleDegrees: 90
+        )
+        var count = 0
+        var phase: CGFloat = 0
+        path.getLineDash(nil, count: &count, phase: &phase)
+        var pattern = [CGFloat](repeating: 0, count: count)
+        pattern.withUnsafeMutableBufferPointer {
+            path.getLineDash($0.baseAddress, count: &count, phase: &phase)
+        }
+
+        XCTAssertEqual(path.lineWidth, 1.5)
+        XCTAssertEqual(path.lineCapStyle, .round)
+        XCTAssertEqual(pattern, [1.6, 2.4])
+        XCTAssertEqual(phase, 0)
+    }
+
     func testIdleLaunchKeepsTopFacingRingWithoutTimer() {
         let factory = SpyStatusAnimationFactory()
         let view = CompactStatusItemView(animationFactory: factory.make)
