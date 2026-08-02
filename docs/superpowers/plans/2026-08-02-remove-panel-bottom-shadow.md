@@ -48,43 +48,51 @@ final class PanelGlassBackgroundTests: XCTestCase {
     func testMainPanelRendersTransparentOutsideGlassSurface() throws {
         let image = try render(role: .mainPanel)
 
-        XCTAssertLessThan(maximumOuterAlpha(in: image), 0.001)
+        XCTAssertLessThan(outerBrightnessRange(in: image), 0.001)
     }
 
     func testActionsPopoverRetainsRenderedOuterShadow() throws {
         let image = try render(role: .actionsPopover)
 
-        XCTAssertGreaterThan(maximumOuterAlpha(in: image), 0.001)
+        XCTAssertGreaterThan(outerBrightnessRange(in: image), 0.001)
     }
 
-    private func render(role: PanelGlassSurfaceRole) throws -> NSImage {
+    private func render(role: PanelGlassSurfaceRole) throws -> CGImage {
         let renderer = ImageRenderer(
-            content: PanelGlassBackground(role: role)
-                .frame(width: 100, height: 100)
-                .padding(30)
+            content: ZStack {
+                Color.white
+
+                role.applyingOuterShadow(
+                    to: RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(Color.white)
+                        .frame(width: 100, height: 100)
+                )
+            }
+            .frame(width: 160, height: 160)
         )
         renderer.proposedSize = ProposedViewSize(width: 160, height: 160)
         renderer.scale = 1
 
-        return try XCTUnwrap(renderer.nsImage)
+        return try XCTUnwrap(renderer.cgImage)
     }
 
-    private func maximumOuterAlpha(in image: NSImage) -> CGFloat {
-        guard
-            let tiff = image.tiffRepresentation,
-            let bitmap = NSBitmapImageRep(data: tiff)
-        else {
-            return 1
-        }
+    private func outerBrightnessRange(in image: CGImage) -> CGFloat {
+        let bitmap = NSBitmapImageRep(cgImage: image)
 
+        var minimum: CGFloat = 1
         var maximum: CGFloat = 0
         for y in 0..<bitmap.pixelsHigh {
             for x in 0..<bitmap.pixelsWide
             where x < 20 || x >= bitmap.pixelsWide - 20 || y < 20 || y >= bitmap.pixelsHigh - 20 {
-                maximum = max(maximum, bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0)
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                    return 1
+                }
+                let brightness = (color.redComponent + color.greenComponent + color.blueComponent) / 3
+                minimum = min(minimum, brightness)
+                maximum = max(maximum, brightness)
             }
         }
-        return maximum
+        return maximum - minimum
     }
 }
 ```
@@ -99,7 +107,7 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/swiftpm-module-cache" \
 swift test --filter PanelGlassBackgroundTests
 ```
 
-Expected: FAIL because `PanelGlassSurfaceRole` and `PanelGlassBackground(role:)` are not defined.
+Expected: FAIL because `PanelGlassSurfaceRole` and its `applyingOuterShadow(to:)` renderer are not defined.
 
 - [ ] **Step 3: Add the role policy and apply it at both call sites**
 
@@ -112,6 +120,16 @@ enum PanelGlassSurfaceRole {
 
     var castsOuterShadow: Bool {
         self == .actionsPopover
+    }
+
+    @ViewBuilder
+    func applyingOuterShadow<Content: View>(to content: Content) -> some View {
+        if castsOuterShadow {
+            content
+                .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+        } else {
+            content
+        }
     }
 }
 ```
@@ -134,14 +152,8 @@ Split the shared surface from the conditional shadow:
 struct PanelGlassBackground: View {
     let role: PanelGlassSurfaceRole
 
-    @ViewBuilder
     var body: some View {
-        if role.castsOuterShadow {
-            glassSurface
-                .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
-        } else {
-            glassSurface
-        }
+        role.applyingOuterShadow(to: glassSurface)
     }
 
     private var glassSurface: some View {
