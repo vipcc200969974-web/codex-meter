@@ -114,12 +114,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem(with snapshot: UsageSnapshot, isTaskActive: Bool) {
         let quota = snapshot.quota
-        let title = quota.isUnavailable ? "未同步" : "\(quota.percentText) | \(quota.shortResetText)"
+        let percentText = quota.isUnavailable ? "未同步" : quota.percentText
+        let resetText = quota.isUnavailable ? nil : quota.shortResetText
         let tooltip = quota.isUnavailable
             ? "正在等待 Codex 会话额度数据"
             : "\(quota.mainQuotaSpokenName)剩余 \(quota.remainingPercent)% ，距离额度恢复 \(quota.resetText)"
         statusView?.update(
-            title: title,
+            percentText: percentText,
+            resetText: resetText,
             color: quota.tagTextColor,
             backgroundColor: quota.tagBackgroundColor,
             tooltip: tooltip,
@@ -191,26 +193,52 @@ struct CompactStatusItemLayout {
     static let ringDiameter: CGFloat = 12.5
     static let trailingPadding: CGFloat = 6
 
-    let textFrame: NSRect
-    let dividerFrame: NSRect
+    let percentFrame: NSRect
+    let quotaDividerFrame: NSRect?
+    let resetFrame: NSRect?
+    let activityDividerFrame: NSRect
     let ringFrame: NSRect
     let totalWidth: CGFloat
 
-    init(textWidth: CGFloat, statusHeight: CGFloat) {
-        textFrame = NSRect(
+    init(percentWidth: CGFloat, resetWidth: CGFloat?, statusHeight: CGFloat) {
+        percentFrame = NSRect(
             x: Self.horizontalPadding,
             y: 0,
-            width: textWidth,
+            width: percentWidth,
             height: statusHeight
         )
-        dividerFrame = NSRect(
-            x: textFrame.maxX + Self.dividerSpacing,
+
+        let quotaContentMaxX: CGFloat
+        if let resetWidth {
+            let divider = NSRect(
+                x: percentFrame.maxX + Self.dividerSpacing,
+                y: (statusHeight - Self.dividerHeight) / 2,
+                width: 1,
+                height: Self.dividerHeight
+            )
+            quotaDividerFrame = divider
+            let reset = NSRect(
+                x: divider.maxX + Self.dividerSpacing,
+                y: 0,
+                width: resetWidth,
+                height: statusHeight
+            )
+            resetFrame = reset
+            quotaContentMaxX = reset.maxX
+        } else {
+            quotaDividerFrame = nil
+            resetFrame = nil
+            quotaContentMaxX = percentFrame.maxX
+        }
+
+        activityDividerFrame = NSRect(
+            x: quotaContentMaxX + Self.dividerSpacing,
             y: (statusHeight - Self.dividerHeight) / 2,
             width: 1,
             height: Self.dividerHeight
         )
         ringFrame = NSRect(
-            x: dividerFrame.maxX + Self.dividerSpacing,
+            x: activityDividerFrame.maxX + Self.dividerSpacing,
             y: (statusHeight - Self.ringDiameter) / 2,
             width: Self.ringDiameter,
             height: Self.ringDiameter
@@ -272,7 +300,8 @@ final class CompactStatusItemView: NSView {
 
     private let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
     private let animationFactory: StatusItemAnimationFactory
-    private var title = ""
+    private var percentText = ""
+    private var resetText: String?
     private var color = NSColor.labelColor
     private var backgroundColor = NSColor.clear
     private var isTaskActive = false
@@ -298,23 +327,27 @@ final class CompactStatusItemView: NSView {
     }
 
     func update(
-        title: String,
+        percentText: String,
+        resetText: String?,
         color: NSColor,
         backgroundColor: NSColor,
         tooltip: String,
         isTaskActive: Bool
     ) {
-        self.title = title
+        self.percentText = percentText
+        self.resetText = resetText
         self.color = color
         self.backgroundColor = backgroundColor
         self.isTaskActive = isTaskActive
 
         let activityText = isTaskActive ? "ChatGPT 正在执行任务" : "当前无运行任务"
         self.toolTip = "\(tooltip)\n\(activityText)"
-        setAccessibilityLabel("\(title)，\(activityText)")
+        let quotaText = [percentText, resetText].compactMap { $0 }.joined(separator: "，")
+        setAccessibilityLabel("\(quotaText)，\(activityText)")
 
         let layout = CompactStatusItemLayout(
-            textWidth: ceil(attributedTitle.size().width),
+            percentWidth: ceil(attributedText(percentText).size().width),
+            resetWidth: resetText.map { ceil(attributedText($0).size().width) },
             statusHeight: NSStatusBar.system.thickness
         )
         frame = NSRect(
@@ -330,10 +363,13 @@ final class CompactStatusItemView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let title = attributedTitle
-        let size = title.size()
+        let percentTitle = attributedText(percentText)
+        let percentSize = percentTitle.size()
+        let resetTitle = resetText.map(attributedText)
+        let resetSize = resetTitle?.size()
         let layout = CompactStatusItemLayout(
-            textWidth: ceil(size.width),
+            percentWidth: ceil(percentSize.width),
+            resetWidth: resetSize.map { ceil($0.width) },
             statusHeight: bounds.height
         )
         let tagRect = NSRect(
@@ -345,17 +381,28 @@ final class CompactStatusItemView: NSView {
         backgroundColor.setFill()
         NSBezierPath(roundedRect: tagRect, xRadius: 5, yRadius: 5).fill()
 
-        color.set()
-        let rect = NSRect(
-            x: layout.textFrame.minX,
-            y: floor((bounds.height - size.height) / 2),
-            width: size.width,
-            height: size.height
+        let percentRect = NSRect(
+            x: layout.percentFrame.minX,
+            y: floor((bounds.height - percentSize.height) / 2),
+            width: percentSize.width,
+            height: percentSize.height
         )
-        title.draw(in: rect)
+        percentTitle.draw(in: percentRect)
 
-        color.withAlphaComponent(0.35).setFill()
-        NSBezierPath(rect: layout.dividerFrame).fill()
+        if let resetTitle, let resetSize, let resetFrame = layout.resetFrame {
+            let rect = NSRect(
+                x: resetFrame.minX,
+                y: floor((bounds.height - resetSize.height) / 2),
+                width: resetSize.width,
+                height: resetSize.height
+            )
+            resetTitle.draw(in: rect)
+        }
+
+        if let quotaDividerFrame = layout.quotaDividerFrame {
+            drawDivider(in: quotaDividerFrame)
+        }
+        drawDivider(in: layout.activityDividerFrame)
 
         let ringPath = NSBezierPath()
         ringPath.lineWidth = 1.5
@@ -394,15 +441,20 @@ final class CompactStatusItemView: NSView {
         }
     }
 
-    private var attributedTitle: NSAttributedString {
+    private func attributedText(_ text: String) -> NSAttributedString {
         NSAttributedString(
-            string: title,
+            string: text,
             attributes: [
                 .font: font,
                 .foregroundColor: color,
                 .kern: -0.2
             ]
         )
+    }
+
+    private func drawDivider(in frame: NSRect) {
+        color.withAlphaComponent(0.35).setFill()
+        NSBezierPath(rect: frame).fill()
     }
 }
 

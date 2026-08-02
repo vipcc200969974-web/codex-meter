@@ -4,18 +4,42 @@ import XCTest
 
 @MainActor
 final class CompactStatusItemViewTests: XCTestCase {
-    func testLayoutAddsDividerRingAndApprovedSpacing() {
-        let layout = CompactStatusItemLayout(textWidth: 100, statusHeight: 24)
+    func testLayoutDrawsTwoIdenticalDividersAroundResetText() throws {
+        let layout = CompactStatusItemLayout(
+            percentWidth: 28,
+            resetWidth: 36,
+            statusHeight: 24
+        )
+        let quotaDivider = try XCTUnwrap(layout.quotaDividerFrame)
+        let resetFrame = try XCTUnwrap(layout.resetFrame)
 
-        XCTAssertEqual(layout.textFrame.minX, 5)
-        XCTAssertEqual(layout.textFrame.maxX + 5, layout.dividerFrame.minX)
-        XCTAssertEqual(layout.dividerFrame.height, 9)
-        XCTAssertEqual(layout.dividerFrame.midY, 12)
+        XCTAssertEqual(layout.percentFrame.minX, 5)
+        XCTAssertEqual(layout.percentFrame.maxX + 5, quotaDivider.minX)
+        XCTAssertEqual(quotaDivider.size, NSSize(width: 1, height: 9))
+        XCTAssertEqual(quotaDivider.midY, 12)
+        XCTAssertEqual(quotaDivider.maxX + 5, resetFrame.minX)
+        XCTAssertEqual(resetFrame.maxX + 5, layout.activityDividerFrame.minX)
+        XCTAssertEqual(layout.activityDividerFrame.size, quotaDivider.size)
+        XCTAssertEqual(layout.activityDividerFrame.midY, quotaDivider.midY)
         XCTAssertEqual(layout.ringFrame.width, 12.5)
         XCTAssertEqual(layout.ringFrame.height, 12.5)
         XCTAssertEqual(layout.ringFrame.midY, 12)
-        XCTAssertEqual(layout.dividerFrame.maxX + 5, layout.ringFrame.minX)
+        XCTAssertEqual(layout.activityDividerFrame.maxX + 5, layout.ringFrame.minX)
         XCTAssertEqual(layout.ringFrame.maxX + 6, layout.totalWidth)
+    }
+
+    func testUnavailableLayoutKeepsOnlyActivityDivider() {
+        let layout = CompactStatusItemLayout(
+            percentWidth: 36,
+            resetWidth: nil,
+            statusHeight: 24
+        )
+
+        XCTAssertNil(layout.quotaDividerFrame)
+        XCTAssertNil(layout.resetFrame)
+        XCTAssertEqual(layout.percentFrame.maxX + 5, layout.activityDividerFrame.minX)
+        XCTAssertEqual(layout.activityDividerFrame.size, NSSize(width: 1, height: 9))
+        XCTAssertEqual(layout.activityDividerFrame.maxX + 5, layout.ringFrame.minX)
     }
 
     func testIdleLaunchKeepsTopFacingRingWithoutTimer() {
@@ -23,7 +47,8 @@ final class CompactStatusItemViewTests: XCTestCase {
         let view = CompactStatusItemView(animationFactory: factory.make)
 
         view.update(
-            title: "64% | 6d0h",
+            percentText: "64%",
+            resetText: "6d0h",
             color: .labelColor,
             backgroundColor: .systemGreen,
             tooltip: "test",
@@ -82,17 +107,9 @@ final class CompactStatusItemViewTests: XCTestCase {
     func testUpdateExpandsWholeClickableTagToRingTrailingEdge() {
         let view = CompactStatusItemView(animationFactory: SpyStatusAnimationFactory().make)
         update(view, isTaskActive: false)
-        let titleWidth = ceil(
-            NSAttributedString(
-                string: "64% | 6d0h",
-                attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
-                    .kern: -0.2
-                ]
-            ).size().width
-        )
         let expected = CompactStatusItemLayout(
-            textWidth: titleWidth,
+            percentWidth: attributedWidth(of: "64%"),
+            resetWidth: attributedWidth(of: "6d0h"),
             statusHeight: NSStatusBar.system.thickness
         )
         var clickCount = 0
@@ -110,20 +127,48 @@ final class CompactStatusItemViewTests: XCTestCase {
 
         update(view, isTaskActive: true)
         XCTAssertEqual(view.toolTip, "test\nChatGPT 正在执行任务")
-        XCTAssertEqual(view.accessibilityLabel(), "64% | 6d0h，ChatGPT 正在执行任务")
+        XCTAssertEqual(view.accessibilityLabel(), "64%，6d0h，ChatGPT 正在执行任务")
 
         update(view, isTaskActive: false)
         XCTAssertEqual(view.toolTip, "test\n当前无运行任务")
-        XCTAssertEqual(view.accessibilityLabel(), "64% | 6d0h，当前无运行任务")
+        XCTAssertEqual(view.accessibilityLabel(), "64%，6d0h，当前无运行任务")
+    }
+
+    func testUnavailableAccessibilityOmitsResetText() {
+        let view = CompactStatusItemView(animationFactory: SpyStatusAnimationFactory().make)
+
+        view.update(
+            percentText: "未同步",
+            resetText: nil,
+            color: .labelColor,
+            backgroundColor: .systemGreen,
+            tooltip: "test",
+            isTaskActive: false
+        )
+
+        XCTAssertEqual(view.accessibilityLabel(), "未同步，当前无运行任务")
     }
 
     private func update(_ view: CompactStatusItemView, isTaskActive: Bool) {
         view.update(
-            title: "64% | 6d0h",
+            percentText: "64%",
+            resetText: "6d0h",
             color: .labelColor,
             backgroundColor: .systemGreen,
             tooltip: "test",
             isTaskActive: isTaskActive
+        )
+    }
+
+    private func attributedWidth(of text: String) -> CGFloat {
+        ceil(
+            NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+                    .kern: -0.2
+                ]
+            ).size().width
         )
     }
 
