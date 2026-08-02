@@ -11,7 +11,7 @@ Make the menu-bar badge communicate quota urgency more clearly and give the acti
 Use one shared quota band everywhere the app presents quota color:
 
 - `0...20%`: critical red background, dark red text, red panel tint.
-- `21...50%`: warning orange background, dark amber text, orange panel tint.
+- `21...50%`: warning orange background (`red 1.000`, `green 0.820`, `blue 0.550`, `alpha 0.94`), dark amber text (`red 0.400`, `green 0.200`, `blue 0.000`, `alpha 1`), and orange panel tint.
 - `51...100%`: the existing mint-green background, dark green text, green panel tint.
 - Unavailable quota keeps the existing neutral translucent background and label color.
 
