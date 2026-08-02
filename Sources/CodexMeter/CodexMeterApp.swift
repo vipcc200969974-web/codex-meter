@@ -1812,10 +1812,10 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         } catch {
             return nil
         }
-        guard filesFitScanBudget(files) else { return nil }
+        let filesToScan = filesWithinScanBudget(files)
 
         var records: [RateLimitRecord] = []
-        for file in files {
+        for file in filesToScan {
             guard let fileRecords = rateLimitRecords(
                 in: file.url,
                 expectedByteCount: file.byteCount,
@@ -1831,17 +1831,20 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         return records
     }
 
-    private func filesFitScanBudget(_ files: [SessionFile]) -> Bool {
+    private func filesWithinScanBudget(_ files: [SessionFile]) -> [SessionFile] {
+        var selected: [SessionFile] = []
         var totalBytes: UInt64 = 0
+
         for file in files {
             guard file.byteCount <= maxBytesPerFile,
-                  totalBytes <= maxTotalBytes,
-                  file.byteCount <= maxTotalBytes - totalBytes else {
-                return false
+                  file.byteCount <= maxTotalBytes,
+                  totalBytes <= maxTotalBytes - file.byteCount else {
+                continue
             }
+            selected.append(file)
             totalBytes += file.byteCount
         }
-        return true
+        return selected
     }
 
     private func deduplicatedSessionFiles(overlapping lowerBound: Date) throws -> [SessionFile] {

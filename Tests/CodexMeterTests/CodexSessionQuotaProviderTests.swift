@@ -264,7 +264,7 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_200))
     }
 
-    func testOversizedSessionFileReturnsNoPartialQuotaFromVisibleSuffix() throws {
+    func testOlderOversizedSessionFileDoesNotHideNewerReadableQuota() throws {
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: temporaryRoot) }
@@ -273,54 +273,49 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         try writeSessionFile(
             under: activeRoot,
             filename: "over-byte-cap.jsonl",
-            lines: [
-                rateLimitLine(
-                    timestamp: 1_100,
-                    usedPercent: 83,
-                    resetsAt: 2_000,
-                    windowMinutes: 10_080,
-                    paddingBytes: 512
-                ),
-                rateLimitLine(
-                    timestamp: 1_200,
-                    usedPercent: 2,
-                    resetsAt: 2_000,
-                    windowMinutes: 10_080
-                )
-            ]
+            lines: [rateLimitLine(
+                timestamp: 1_100,
+                usedPercent: 36,
+                resetsAt: 2_000,
+                windowMinutes: 10_080,
+                paddingBytes: 512
+            )],
+            modifiedAt: Date(timeIntervalSince1970: 1_100)
         )
         try writeSessionFile(
             under: activeRoot,
-            filename: "otherwise-readable.jsonl",
-            lines: [
-                rateLimitLine(
-                    timestamp: 1_150,
-                    usedPercent: 41,
-                    resetsAt: 2_000,
-                    windowMinutes: 10_080
-                )
-            ]
+            filename: "newer-readable.jsonl",
+            lines: [rateLimitLine(
+                timestamp: 1_200,
+                usedPercent: 46,
+                resetsAt: 2_000,
+                windowMinutes: 10_080
+            )],
+            modifiedAt: Date(timeIntervalSince1970: 1_200)
         )
         XCTAssertGreaterThan(
             try fileSize(at: activeRoot.appendingPathComponent("over-byte-cap.jsonl")),
             256
         )
         XCTAssertLessThanOrEqual(
-            try fileSize(at: activeRoot.appendingPathComponent("otherwise-readable.jsonl")),
+            try fileSize(at: activeRoot.appendingPathComponent("newer-readable.jsonl")),
             256
         )
 
         let testNow = now
-        let observations = CodexSessionQuotaProvider(
-            roots: [activeRoot],
-            maxBytesPerFile: 256,
-            now: { testNow }
-        ).currentWindowObservations()
+        let weekly = try XCTUnwrap(
+            CodexSessionQuotaProvider(
+                roots: [activeRoot],
+                maxBytesPerFile: 256,
+                now: { testNow }
+            ).currentWindowObservations().first { $0.window.kind == .weekly }
+        )
 
-        XCTAssertTrue(observations.isEmpty)
+        XCTAssertEqual(weekly.window.usedPercent, 46)
+        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_200))
     }
 
-    func testAggregateCandidateBytesOverCapReturnsNoPartialQuota() throws {
+    func testAggregateBudgetKeepsNewestFileThatFits() throws {
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: temporaryRoot) }
@@ -338,7 +333,8 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
                         windowMinutes: 10_080,
                         paddingBytes: 256
                     )
-                ]
+                ],
+                modifiedAt: Date(timeIntervalSince1970: TimeInterval(1_100 + index))
             )
         }
         let candidateByteCounts = try (0..<2).map { index in
@@ -348,14 +344,17 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         XCTAssertGreaterThan(candidateByteCounts.reduce(0, +), 700)
 
         let testNow = now
-        let observations = CodexSessionQuotaProvider(
-            roots: [activeRoot],
-            maxBytesPerFile: 1_024,
-            maxTotalBytes: 700,
-            now: { testNow }
-        ).currentWindowObservations()
+        let weekly = try XCTUnwrap(
+            CodexSessionQuotaProvider(
+                roots: [activeRoot],
+                maxBytesPerFile: 1_024,
+                maxTotalBytes: 700,
+                now: { testNow }
+            ).currentWindowObservations().first { $0.window.kind == .weekly }
+        )
 
-        XCTAssertTrue(observations.isEmpty)
+        XCTAssertEqual(weekly.window.usedPercent, 3)
+        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_101))
     }
 
     func testGroupsFractionalEquivalentResetValuesFromSessionLog() throws {
