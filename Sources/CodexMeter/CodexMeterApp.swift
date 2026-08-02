@@ -481,7 +481,7 @@ struct StatusPanelView: View {
     var body: some View {
         ZStack {
             ZStack {
-                PanelGlassBackground()
+                PanelGlassBackground(role: .mainPanel)
 
                 VStack(alignment: .leading, spacing: 12) {
                     header
@@ -671,11 +671,36 @@ struct TokenMetric: View {
     }
 }
 
+enum PanelGlassSurfaceRole {
+    case mainPanel
+    case actionsPopover
+
+    var castsOuterShadow: Bool {
+        self == .actionsPopover
+    }
+
+    @ViewBuilder
+    func applyingOuterShadow<Content: View>(to content: Content) -> some View {
+        if castsOuterShadow {
+            content
+                .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+        } else {
+            content
+        }
+    }
+}
+
 struct PanelGlassBackground: View {
+    let role: PanelGlassSurfaceRole
+
     var body: some View {
+        role.applyingOuterShadow(to: glassSurface)
+    }
+
+    private var glassSurface: some View {
         let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
 
-        ZStack {
+        return ZStack {
             shape
                 .fill(.ultraThinMaterial)
 
@@ -728,7 +753,6 @@ struct PanelGlassBackground: View {
                 .padding(1.2)
         }
         .clipShape(shape)
-        .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
     }
 }
 
@@ -958,7 +982,7 @@ struct ActionsPopover: View {
             .buttonStyle(.plain)
         }
         .padding(10)
-        .background(PanelGlassBackground())
+        .background(PanelGlassBackground(role: .actionsPopover))
     }
 }
 
