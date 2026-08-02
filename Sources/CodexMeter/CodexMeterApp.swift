@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import CoreFoundation
 import SwiftUI
 import UserNotifications
 
@@ -1738,6 +1739,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     }
 
     private static func double(_ value: Any?) -> Double? {
+        guard !isJSONBoolean(value) else { return nil }
         let result: Double?
         if let double = value as? Double {
             result = double
@@ -1753,6 +1755,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
     }
 
     private static func int(_ value: Any?) -> Int? {
+        guard !isJSONBoolean(value) else { return nil }
         if let int = value as? Int {
             return int
         }
@@ -1763,6 +1766,11 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             return Int(string)
         }
         return nil
+    }
+
+    private static func isJSONBoolean(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 }
 

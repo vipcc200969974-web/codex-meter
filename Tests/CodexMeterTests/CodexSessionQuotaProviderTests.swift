@@ -78,6 +78,39 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         ))
     }
 
+    func testRejectsJSONBooleansForSessionQuotaNumericFields() {
+        let booleanWindows = [
+            #"{"used_percent":true,"window_minutes":10080,"resets_at":2000}"#,
+            #"{"used_percent":35,"window_minutes":true,"resets_at":2000}"#,
+            #"{"used_percent":35,"window_minutes":10080,"resets_at":true}"#
+        ]
+        let beforeBooleanReset = Date(timeIntervalSince1970: 0)
+
+        for window in booleanWindows {
+            let line = #"{"timestamp":"1970-01-01T00:00:00Z","payload":{"rate_limits":{"limit_id":"codex","primary":\#(window)}}}"#
+            XCTAssertNil(
+                CodexSessionQuotaProvider.parseRecord(
+                    line: line,
+                    fileModifiedAt: beforeBooleanReset,
+                    now: beforeBooleanReset
+                ),
+                "Accepted JSON boolean as quota number: \(window)"
+            )
+        }
+    }
+
+    func testSessionQuotaNumericZeroIsNotMistakenForJSONBoolean() {
+        let line = #"{"timestamp":"1970-01-01T00:16:40Z","payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":0,"window_minutes":10080,"resets_at":2000}}}}"#
+
+        let record = CodexSessionQuotaProvider.parseRecord(
+            line: line,
+            fileModifiedAt: now,
+            now: now
+        )
+
+        XCTAssertEqual(record?.windowSet.weekly?.usedPercent, 0)
+    }
+
     func testRejectsMissingOrMalformedSessionEventTimestamp() {
         let missing = #"{"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":10080,"resets_at":2000}}}}"#
         let malformed = #"{"timestamp":"not-a-date","payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":10080,"resets_at":2000}}}}"#

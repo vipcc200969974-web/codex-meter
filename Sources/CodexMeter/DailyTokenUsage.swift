@@ -516,7 +516,7 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
             ]
             for index in values.indices {
                 let (sum, overflow) = aggregateValues[index].addingReportingOverflow(values[index])
-                guard !overflow else { return false }
+                guard !overflow, sum < Int64.max else { return false }
                 aggregateValues[index] = sum
             }
         }
@@ -552,7 +552,9 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
 
     private static func adding(_ lhs: Int64, _ rhs: Int64) throws -> Int64 {
         let (sum, overflow) = lhs.addingReportingOverflow(rhs)
-        guard !overflow else { throw DailyTokenUsageProviderError.aggregateOverflow }
+        guard !overflow, sum < Int64.max else {
+            throw DailyTokenUsageProviderError.aggregateOverflow
+        }
         return sum
     }
 

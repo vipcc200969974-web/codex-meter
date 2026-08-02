@@ -807,6 +807,25 @@ final class DailyTokenUsageTests: XCTestCase {
         }
     }
 
+    func testProviderRejectsOneFileAggregateThatEqualsInt64Max() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":9223372036854775797}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":10}}}}"#
+        try (first + "\n" + second + "\n").write(
+            to: root.appendingPathComponent("rollout-file-exact-limit.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertThrowsError(try provider.currentUsage(now: now)) { error in
+            XCTAssertEqual(error as? DailyTokenUsageProviderError, .aggregateOverflow)
+        }
+    }
+
     func testProviderThrowsInsteadOfTrappingWhenPostUpdateCrossFileAggregateOverflows() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1005,6 +1024,49 @@ final class DailyTokenUsageTests: XCTestCase {
                 usage["totalTokens"] = Int64.max / 2 + 1
                 cursors[index]["usage"] = usage
             }
+            object["cursors"] = cursors
+        }
+        let reader = RecordingDailyTokenFileReader()
+        let restarted = DailyTokenUsageProvider(
+            roots: [root],
+            calendar: calendar,
+            fileReader: reader,
+            cacheURL: cache
+        )
+
+        XCTAssertEqual(try restarted.currentUsage(now: now).totalTokens, 300)
+        XCTAssertEqual(reader.offsets.sorted(), [0, 0])
+    }
+
+    func testRestartedProviderRejectsCachedAggregateThatEqualsInt64MaxAcrossFiles() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("sessions")
+        let cache = base.appendingPathComponent("cache/daily-tokens.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let first = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100}}}}"#
+        let second = #"{"timestamp":"2026-08-01T02:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":200}}}}"#
+        try (first + "\n").write(
+            to: root.appendingPathComponent("rollout-exact-limit-a.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try (second + "\n").write(
+            to: root.appendingPathComponent("rollout-exact-limit-b.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+        let seed = DailyTokenUsageProvider(roots: [root], calendar: calendar, cacheURL: cache)
+        XCTAssertEqual(try seed.currentUsage(now: now).totalTokens, 300)
+        try mutateJSONCache(at: cache) { object in
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            var firstUsage = try XCTUnwrap(cursors[0]["usage"] as? [String: Any])
+            var secondUsage = try XCTUnwrap(cursors[1]["usage"] as? [String: Any])
+            firstUsage["totalTokens"] = Int64.max / 2
+            secondUsage["totalTokens"] = Int64.max - Int64.max / 2
+            cursors[0]["usage"] = firstUsage
+            cursors[1]["usage"] = secondUsage
             object["cursors"] = cursors
         }
         let reader = RecordingDailyTokenFileReader()
