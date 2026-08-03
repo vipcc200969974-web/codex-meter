@@ -4,7 +4,7 @@
 
 **Goal:** Make the menu-bar activity ring refresh immediately when any Codex project writes lifecycle events, regardless of the session file's original date directory.
 
-**Architecture:** Replace date-specific `DispatchSource` bindings with one filtered recursive FSEvents stream rooted at `~/.codex`. Keep `UsageStore`'s existing debounce and 60-second fallback, and keep `CodexTaskActivityProvider` as the single source of truth for active versus stopped state.
+**Architecture:** Replace date-specific `DispatchSource` bindings with one filtered recursive FSEvents stream rooted at `~/.codex`. Add a separate activity-only loading path so ring state does not wait for the combined quota and token load. Keep `UsageStore`'s existing debounce and 60-second fallback, and keep `CodexTaskActivityProvider` as the single source of truth for active versus stopped state.
 
 **Tech Stack:** Swift 6, Foundation, CoreServices FSEvents, XCTest, macOS 14.
 
@@ -14,6 +14,7 @@
 - Observe `logs_2.sqlite`, `logs_2.sqlite-wal`, and `logs_2.sqlite-shm` for quota refreshes.
 - Ignore unrelated `.codex` writes.
 - Preserve callback-safe `start`, `rebind`, and `stop` behavior.
+- Publish activity on a dedicated serial path that cannot be blocked by quota or token loading.
 - Keep the existing 0.8-second debounce and 60-second fallback refresh.
 - Do not change quota calculation, token calculation, activity parsing, or menu-bar appearance.
 
@@ -145,7 +146,87 @@ git add Sources/CodexMeter/CodexActivityWatcher.swift Tests/CodexMeterTests/Code
 git commit -m "fix: watch activity across all projects"
 ```
 
-### Task 3: Verify, Build, Install, and Observe
+### Task 3: Publish Activity Independently of Full Usage Loading
+
+**Files:**
+- Modify: `Sources/CodexMeter/CodexMeterApp.swift`
+- Modify: `Tests/CodexMeterTests/UsageStoreTests.swift`
+
+**Interfaces:**
+- Consumes: `CodexTaskActivityProviding.currentActivity(now:)` and watcher `onChange` callbacks.
+- Produces: `TaskActivityLoading.loadActivity(now:) -> Bool?` plus an independent `UsageStore` activity refresh path.
+
+- [ ] **Step 1: Add a failing blocked-load regression**
+
+Create a real test loader that conforms to both `UsageLoading` and the wished-for `TaskActivityLoading`. Its `load(now:)` blocks on an `NSCondition`, while `loadActivity(now:)` returns `true` immediately. Start a `UsageStore`, wait until the combined load is blocked, and assert that `$isTaskActive` still publishes `true` within one second.
+
+```swift
+func testStartPublishesActivityWhileFullUsageLoadIsBlocked() async {
+    let loader = BlockingUsageAndActivityLoader(activity: true)
+    let store = UsageStore(loader: loader, watcher: SpyActivityWatcher())
+    let active = expectation(description: "activity published before full load")
+    let subscription = store.$isTaskActive.dropFirst().sink { value in
+        if value { active.fulfill() }
+    }
+
+    store.start()
+    await loader.waitUntilUsageStarted()
+    await fulfillment(of: [active], timeout: 1)
+
+    XCTAssertTrue(store.isTaskActive)
+    loader.releaseUsage()
+    store.stop()
+    withExtendedLifetime(subscription) {}
+}
+```
+
+- [ ] **Step 2: Run the focused test and confirm RED**
+
+Run:
+
+```bash
+swift test --filter UsageStoreTests/testStartPublishesActivityWhileFullUsageLoadIsBlocked
+```
+
+Expected: fail to compile because `TaskActivityLoading` is missing; after adding only the protocol, time out because activity is still published only by the blocked combined load.
+
+- [ ] **Step 3: Add the activity-only loader interface**
+
+Define:
+
+```swift
+protocol TaskActivityLoading: Sendable {
+    func loadActivity(now: Date) -> Bool?
+}
+```
+
+Make `LocalUsageLoader` conform and implement it with only `try? taskActivityProvider.currentActivity(now:)`. Keep the existing combined `load(now:)` result for compatibility.
+
+- [ ] **Step 4: Add the independent UsageStore activity path**
+
+When the injected `UsageLoading` also conforms to `TaskActivityLoading`, retain the same instance as `activityLoader`. Add a dedicated serial queue, debounce task, generation, in-flight flag, and pending flag. Activity completion updates only `isTaskActive` and `lastTaskActivitySuccessAt` on the main actor.
+
+Call the activity-only path at `start()`, before the combined refresh; after every watcher callback; and after wake or unlock. Cancel its debounce and invalidate its generation in `stop()` and `deinit`. Never run two activity-only loads concurrently; collapse a burst into one follow-up.
+
+- [ ] **Step 5: Verify the focused and store suites are GREEN**
+
+Run:
+
+```bash
+swift test --filter UsageStoreTests/testStartPublishesActivityWhileFullUsageLoadIsBlocked
+swift test --filter UsageStoreTests
+```
+
+Expected: the blocked full load no longer delays activity and all existing store lifecycle tests remain green.
+
+- [ ] **Step 6: Commit the fast activity path**
+
+```bash
+git add Sources/CodexMeter/CodexMeterApp.swift Tests/CodexMeterTests/UsageStoreTests.swift
+git commit -m "fix: refresh task activity independently"
+```
+
+### Task 4: Verify, Build, Install, and Observe
 
 **Files:**
 - Use: `scripts/build-app.sh`
