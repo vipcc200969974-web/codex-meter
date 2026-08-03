@@ -133,7 +133,7 @@ final class CodexTaskActivityTests: XCTestCase {
 
     func testRawDiscriminatorSkipsLargePrivatePayloadWithAllMarkersBeforeTypedDecoding() {
         let privateContent = String(
-            repeating: "private event_msg task_started task_complete ",
+            repeating: "private event_msg task_started task_complete turn_aborted ",
             count: 100_000
         )
         let line = #"{"timestamp":"2026-08-02T02:00:00Z","type":"response_item","payload":{"type":"message","content":"\#(privateContent)"}}"#
@@ -299,6 +299,93 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(cache.contains("turn_aborted"))
 
         XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+    }
+
+    func testVersionTwoCacheMigratesCoveredAbortWithoutRebuildingSource() throws {
+        let startedAt = now.addingTimeInterval(-10)
+        try writeLifecycle(.started, turnID: "legacy-stopped", to: activeFile, at: startedAt)
+        let oversizedPrivateLine = #"{"timestamp":"2026-08-02T02:00:00Z","type":"response_item","payload":{"type":"message","content":""#
+            + String(repeating: "turn_aborted private ", count: 5_000)
+            + #""}}"#
+        try append(Data((oversizedPrivateLine + "\n").utf8), to: activeFile)
+        try appendLifecycle(.aborted, turnID: "legacy-stopped", to: activeFile, at: now)
+        XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+        try mutateCache { object in
+            object["schemaVersion"] = 2
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            cursors[0]["activeTurns"] = [[
+                "turnID": "legacy-stopped",
+                "startedAt": startedAt.timeIntervalSinceReferenceDate
+            ]]
+            cursors[0].removeValue(forKey: "turnStates")
+            object["cursors"] = cursors
+        }
+
+        XCTAssertFalse(
+            try makeProvider(
+                cacheURL: cacheURL,
+                maxBytesPerFile: 0,
+                maxTotalBytes: 0
+            ).currentActivity(now: now)
+        )
+        let migrated = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+        )
+        XCTAssertEqual(migrated["schemaVersion"] as? Int, 3)
+    }
+
+    func testVersionTwoCacheMigrationPreservesActiveTurnWithoutRebuildingSource() throws {
+        let startedAt = now.addingTimeInterval(-10)
+        try writeLifecycle(.started, turnID: "legacy-active", to: activeFile, at: startedAt)
+        XCTAssertTrue(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+        try mutateCache { object in
+            object["schemaVersion"] = 2
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            cursors[0]["activeTurns"] = [[
+                "turnID": "legacy-active",
+                "startedAt": startedAt.timeIntervalSinceReferenceDate
+            ]]
+            cursors[0].removeValue(forKey: "turnStates")
+            object["cursors"] = cursors
+        }
+
+        XCTAssertTrue(
+            try makeProvider(
+                cacheURL: cacheURL,
+                maxBytesPerFile: 0,
+                maxTotalBytes: 0
+            ).currentActivity(now: now)
+        )
+    }
+
+    func testVersionTwoCacheMigrationRecoversCompletionFromAnotherFile() throws {
+        let startedAt = now.addingTimeInterval(-10)
+        let copiedFile = activeRoot.appendingPathComponent("rollout-legacy-copy.jsonl")
+        try writeLifecycle(.started, turnID: "legacy-copy", to: activeFile, at: startedAt)
+        try appendLifecycle(.completed, turnID: "legacy-copy", to: activeFile, at: now.addingTimeInterval(-5))
+        try writeLifecycle(.started, turnID: "legacy-copy", to: copiedFile, at: startedAt)
+        XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+        try mutateCache { object in
+            object["schemaVersion"] = 2
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            for index in cursors.indices {
+                let path = try XCTUnwrap(cursors[index]["path"] as? String)
+                cursors[index]["activeTurns"] = path == copiedFile.path ? [[
+                    "turnID": "legacy-copy",
+                    "startedAt": startedAt.timeIntervalSinceReferenceDate
+                ]] : []
+                cursors[index].removeValue(forKey: "turnStates")
+            }
+            object["cursors"] = cursors
+        }
+
+        XCTAssertFalse(
+            try makeProvider(
+                cacheURL: cacheURL,
+                maxBytesPerFile: 0,
+                maxTotalBytes: 0
+            ).currentActivity(now: now)
+        )
     }
 
     func testActiveAndArchiveCopiesWithSameBasenameAreDeduplicated() throws {

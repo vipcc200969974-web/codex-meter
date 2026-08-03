@@ -303,6 +303,9 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
     private static let readChunkBytes = 4 * 1_024 * 1_024
     private static let fingerprintSampleBytes: UInt64 = 4 * 1_024
+    private static let legacyCandidateLineLimitBytes = 64 * 1_024
+    private static let completedMarker = Data("task_complete".utf8)
+    private static let abortedMarker = Data("turn_aborted".utf8)
 
     private struct FileIdentity: Codable, Hashable {
         let device: UInt64
@@ -364,6 +367,27 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         let turnID: String
         let kind: CodexTaskLifecycleKind
         let timestamp: Date
+    }
+
+    private struct LegacyPersistentCache: Codable {
+        let schemaVersion: Int
+        let rootsFingerprint: String
+        let savedAt: Date
+        let cursors: [LegacyPersistentCursor]
+    }
+
+    private struct LegacyPersistentCursor: Codable {
+        let path: String
+        let basename: String
+        let identity: FileIdentity?
+        let completeLineOffset: UInt64
+        let generationFingerprint: String
+        let activeTurns: [LegacyPersistentActiveTurn]
+    }
+
+    private struct LegacyPersistentActiveTurn: Codable {
+        let turnID: String
+        let startedAt: Date
     }
 
     private struct BoundedRead {
@@ -465,19 +489,52 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
 
     private func loadCache(now: Date, lowerBound: Date) -> [CursorKey: FileCursor] {
         guard let cacheURL,
-              let data = readCacheData(at: cacheURL),
-              let cache = try? JSONDecoder().decode(PersistentCache.self, from: data),
-              cache.schemaVersion == Self.cacheSchemaVersion,
-              cache.rootsFingerprint == rootsFingerprint,
-              cache.savedAt.timeIntervalSinceReferenceDate.isFinite,
-              cache.savedAt >= lowerBound,
-              cache.savedAt <= now,
-              areValid(cache.cursors) else {
+              let data = readCacheData(at: cacheURL) else {
             return [:]
         }
 
+        if let cache = try? JSONDecoder().decode(PersistentCache.self, from: data),
+           cache.schemaVersion == Self.cacheSchemaVersion,
+           isValidCacheHeader(
+               rootsFingerprint: cache.rootsFingerprint,
+               savedAt: cache.savedAt,
+               now: now,
+               lowerBound: lowerBound
+           ),
+           areValid(cache.cursors) {
+            return restore(cache.cursors)
+        }
+
+        if let legacy = try? JSONDecoder().decode(LegacyPersistentCache.self, from: data),
+           legacy.schemaVersion == 2,
+           isValidCacheHeader(
+               rootsFingerprint: legacy.rootsFingerprint,
+               savedAt: legacy.savedAt,
+               now: now,
+               lowerBound: lowerBound
+           ),
+           areValid(legacy.cursors) {
+            return migrate(legacy.cursors, lowerBound: lowerBound)
+        }
+
+        return [:]
+    }
+
+    private func isValidCacheHeader(
+        rootsFingerprint: String,
+        savedAt: Date,
+        now: Date,
+        lowerBound: Date
+    ) -> Bool {
+        rootsFingerprint == self.rootsFingerprint
+            && savedAt.timeIntervalSinceReferenceDate.isFinite
+            && savedAt >= lowerBound
+            && savedAt <= now
+    }
+
+    private func restore(_ persistedCursors: [PersistentCursor]) -> [CursorKey: FileCursor] {
         var loaded: [CursorKey: FileCursor] = [:]
-        for persisted in cache.cursors {
+        for persisted in persistedCursors {
             let key = persisted.identity.map(CursorKey.identity) ?? .basename(persisted.basename)
             guard loaded[key] == nil else { return [:] }
 
@@ -497,6 +554,54 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 generationFingerprint: persisted.generationFingerprint,
                 needsBoundaryValidation: true
             )
+        }
+        return loaded
+    }
+
+    private func migrate(
+        _ persistedCursors: [LegacyPersistentCursor],
+        lowerBound: Date
+    ) -> [CursorKey: FileCursor] {
+        var loaded: [CursorKey: FileCursor] = [:]
+        var activeTurnIDs = Set<String>()
+        for persisted in persistedCursors {
+            let key = persisted.identity.map(CursorKey.identity) ?? .basename(persisted.basename)
+            guard loaded[key] == nil else { return [:] }
+
+            var turnStates: [String: CodexTaskLifecycleEvent] = [:]
+            for activeTurn in persisted.activeTurns where activeTurn.startedAt >= lowerBound {
+                let event = CodexTaskLifecycleEvent(
+                    kind: .started,
+                    turnID: activeTurn.turnID,
+                    timestamp: activeTurn.startedAt
+                )
+                turnStates[activeTurn.turnID] = event
+                activeTurnIDs.insert(activeTurn.turnID)
+            }
+            loaded[key] = FileCursor(
+                url: URL(fileURLWithPath: persisted.path),
+                offset: persisted.completeLineOffset,
+                turnStates: turnStates,
+                generationFingerprint: persisted.generationFingerprint,
+                needsBoundaryValidation: true
+            )
+        }
+
+        guard !activeTurnIDs.isEmpty else { return loaded }
+        for persisted in persistedCursors {
+            let key = persisted.identity.map(CursorKey.identity) ?? .basename(persisted.basename)
+            guard var cursor = loaded[key],
+                  let recovered = try? recoverLegacyTerminalEvents(
+                      from: URL(fileURLWithPath: persisted.path),
+                      through: persisted.completeLineOffset,
+                      matching: activeTurnIDs
+                  ) else {
+                continue
+            }
+            for event in recovered.values {
+                Self.merge(event, into: &cursor.turnStates)
+            }
+            loaded[key] = cursor
         }
         return loaded
     }
@@ -541,6 +646,27 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 guard !state.turnID.isEmpty,
                       turnIDs.insert(state.turnID).inserted,
                       state.timestamp.timeIntervalSinceReferenceDate.isFinite else {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    private func areValid(_ persisted: [LegacyPersistentCursor]) -> Bool {
+        for cursor in persisted {
+            guard !cursor.path.isEmpty,
+                  !cursor.basename.isEmpty,
+                  cursor.generationFingerprint.count == 64,
+                  cursor.generationFingerprint.allSatisfy({ $0.isHexDigit }) else {
+                return false
+            }
+
+            var turnIDs = Set<String>()
+            for activeTurn in cursor.activeTurns {
+                guard !activeTurn.turnID.isEmpty,
+                      turnIDs.insert(activeTurn.turnID).inserted,
+                      activeTurn.startedAt.timeIntervalSinceReferenceDate.isFinite else {
                     return false
                 }
             }
@@ -806,6 +932,121 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 && candidate.kind != .started) {
             states[candidate.turnID] = candidate
         }
+    }
+
+    private func recoverLegacyTerminalEvents(
+        from url: URL,
+        through completeLineOffset: UInt64,
+        matching turnIDs: Set<String>
+    ) throws -> [String: CodexTaskLifecycleEvent] {
+        guard completeLineOffset > 0, !turnIDs.isEmpty else { return [:] }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+
+            var remaining = completeLineOffset
+            var pendingLine = Data()
+            var discardingOversizedLine = false
+            var recovered: [String: CodexTaskLifecycleEvent] = [:]
+            while remaining > 0 {
+                let requested = Int(min(UInt64(Self.readChunkBytes), remaining))
+                guard let chunk = try handle.read(upToCount: requested), !chunk.isEmpty else {
+                    throw CodexTaskActivityProviderError.readFailed
+                }
+                remaining -= UInt64(chunk.count)
+
+                var segmentStart = chunk.startIndex
+                while segmentStart < chunk.endIndex {
+                    if let newline = chunk[segmentStart...].firstIndex(of: 0x0A) {
+                        consumeLegacyLineSegment(
+                            chunk[segmentStart..<newline],
+                            endsLine: true,
+                            pendingLine: &pendingLine,
+                            discardingOversizedLine: &discardingOversizedLine,
+                            matching: turnIDs,
+                            recovered: &recovered
+                        )
+                        segmentStart = chunk.index(after: newline)
+                    } else {
+                        consumeLegacyLineSegment(
+                            chunk[segmentStart..<chunk.endIndex],
+                            endsLine: false,
+                            pendingLine: &pendingLine,
+                            discardingOversizedLine: &discardingOversizedLine,
+                            matching: turnIDs,
+                            recovered: &recovered
+                        )
+                        break
+                    }
+                }
+            }
+            return recovered
+        } catch let error as CodexTaskActivityProviderError {
+            throw error
+        } catch {
+            throw CodexTaskActivityProviderError.readFailed
+        }
+    }
+
+    private func consumeLegacyLineSegment(
+        _ segment: Data.SubSequence,
+        endsLine: Bool,
+        pendingLine: inout Data,
+        discardingOversizedLine: inout Bool,
+        matching turnIDs: Set<String>,
+        recovered: inout [String: CodexTaskLifecycleEvent]
+    ) {
+        if discardingOversizedLine {
+            if endsLine {
+                discardingOversizedLine = false
+            }
+            return
+        }
+
+        guard pendingLine.count <= Self.legacyCandidateLineLimitBytes,
+              segment.count <= Self.legacyCandidateLineLimitBytes - pendingLine.count else {
+            pendingLine.removeAll(keepingCapacity: false)
+            discardingOversizedLine = !endsLine
+            return
+        }
+
+        if pendingLine.isEmpty, endsLine {
+            guard segment.range(of: Self.completedMarker) != nil
+                    || segment.range(of: Self.abortedMarker) != nil else {
+                return
+            }
+            recoverLegacyTerminalEvent(
+                from: Data(segment),
+                matching: turnIDs,
+                into: &recovered
+            )
+            return
+        }
+
+        pendingLine.append(contentsOf: segment)
+        guard endsLine else { return }
+        recoverLegacyTerminalEvent(
+            from: pendingLine,
+            matching: turnIDs,
+            into: &recovered
+        )
+        pendingLine.removeAll(keepingCapacity: true)
+    }
+
+    private func recoverLegacyTerminalEvent(
+        from line: Data,
+        matching turnIDs: Set<String>,
+        into recovered: inout [String: CodexTaskLifecycleEvent]
+    ) {
+        guard line.range(of: Self.completedMarker) != nil
+                || line.range(of: Self.abortedMarker) != nil,
+              let event = CodexTaskLifecycleParser.parseCompleteLines(in: line + Data([0x0A])).first,
+              event.kind != .started,
+              turnIDs.contains(event.turnID) else {
+            return
+        }
+        Self.merge(event, into: &recovered)
     }
 
     private static func readExactly(

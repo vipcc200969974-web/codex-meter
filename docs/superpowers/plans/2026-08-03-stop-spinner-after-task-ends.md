@@ -87,6 +87,7 @@ In `CodexTaskActivity.swift`:
 5. Merge every cursor's states by turn ID using the same ordering and return true only if one merged latest state is `.started`.
 6. Raise the cache schema to 3 and replace `PersistentActiveTurn` with a codable state containing `turnID`, `kind`, and `timestamp`.
 7. Validate unique turn IDs, finite timestamps, and valid lifecycle kinds when loading cache data.
+8. Migrate schema version 2 cursors without losing their offsets. Recover covered `task_complete` and `turn_aborted` events for legacy active turn IDs with a 64 KiB line cap so oversized private records are skipped without being cached.
 
 - [ ] **Step 4: Verify focused tests are GREEN**
 
@@ -100,7 +101,7 @@ Expected: all activity parser/provider tests pass with no warnings.
 
 - [ ] **Step 5: Add restart persistence coverage**
 
-Add a test that writes a start and abort, saves the cursor cache, constructs a new provider, and confirms the task remains idle. Extend the cache privacy assertion to require lifecycle state metadata while continuing to reject the private sentinel.
+Add a test that writes a start and abort, saves the cursor cache, constructs a new provider, and confirms the task remains idle. Extend the cache privacy assertion to require lifecycle state metadata while continuing to reject the private sentinel. Add schema version 2 migration tests that preserve an active turn, recover a covered abort, recover a completion from another file, and succeed with a zero-byte normal reconstruction budget.
 
 - [ ] **Step 6: Run the complete suite and commit**
 
