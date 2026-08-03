@@ -115,6 +115,12 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(CodexTaskLifecycleParser.parse(line: completed)).kind, .completed)
     }
 
+    func testParsesAbortedLifecycleEvent() throws {
+        let aborted = #"{"timestamp":"2026-08-02T02:01:00Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-a","reason":"interrupted"}}"#
+
+        XCTAssertEqual(try XCTUnwrap(CodexTaskLifecycleParser.parse(line: aborted)).kind, .aborted)
+    }
+
     func testRejectsUnrelatedPrivateAndMalformedCandidates() {
         let message = #"{"timestamp":"2026-08-02T02:00:00Z","type":"response_item","payload":{"type":"message","content":"private"}}"#
         let missingTurn = #"{"timestamp":"2026-08-02T02:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#
@@ -164,6 +170,38 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(try makeProvider().currentActivity(now: now))
 
         try appendLifecycle(.completed, turnID: "b", to: secondActiveFile, at: now)
+        XCTAssertFalse(try makeProvider().currentActivity(now: now))
+    }
+
+    func testAbortedTurnStopsActivity() throws {
+        try writeLifecycle(.started, turnID: "stopped", to: activeFile, at: now.addingTimeInterval(-10))
+        try appendLifecycle(.aborted, turnID: "stopped", to: activeFile, at: now)
+
+        XCTAssertFalse(try makeProvider().currentActivity(now: now))
+    }
+
+    func testNewerCompletionInOneFileOverridesCopiedStartInAnother() throws {
+        let copiedFile = activeRoot.appendingPathComponent("rollout-copy.jsonl")
+        try writeLifecycle(.started, turnID: "copied", to: activeFile, at: now.addingTimeInterval(-10))
+        try writeLifecycle(.started, turnID: "copied", to: copiedFile, at: now.addingTimeInterval(-10))
+        try appendLifecycle(.completed, turnID: "copied", to: activeFile, at: now.addingTimeInterval(-5))
+
+        XCTAssertFalse(try makeProvider().currentActivity(now: now))
+    }
+
+    func testNewerStartRemainsActiveAfterOlderTerminalState() throws {
+        let restartedFile = activeRoot.appendingPathComponent("rollout-restarted.jsonl")
+        try writeLifecycle(.completed, turnID: "ordered", to: activeFile, at: now.addingTimeInterval(-10))
+        try writeLifecycle(.started, turnID: "ordered", to: restartedFile, at: now.addingTimeInterval(-5))
+
+        XCTAssertTrue(try makeProvider().currentActivity(now: now))
+    }
+
+    func testTerminalStateWinsWhenDuplicateEventsHaveEqualTimestamps() throws {
+        let copiedFile = activeRoot.appendingPathComponent("rollout-equal.jsonl")
+        try writeLifecycle(.started, turnID: "equal", to: activeFile, at: now)
+        try writeLifecycle(.completed, turnID: "equal", to: copiedFile, at: now)
+
         XCTAssertFalse(try makeProvider().currentActivity(now: now))
     }
 
@@ -249,6 +287,16 @@ final class CodexTaskActivityTests: XCTestCase {
         let moved = archivedRoot.appendingPathComponent("renamed-archive.jsonl")
         try FileManager.default.moveItem(at: activeFile, to: moved)
         try appendLifecycle(.completed, turnID: "moving", to: moved, at: now)
+
+        XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+    }
+
+    func testRestartPreservesAbortedTerminalState() throws {
+        try writeLifecycle(.started, turnID: "stopped", to: activeFile, at: now.addingTimeInterval(-10))
+        try appendLifecycle(.aborted, turnID: "stopped", to: activeFile, at: now)
+        XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+        let cache = try String(decoding: Data(contentsOf: cacheURL), as: UTF8.self)
+        XCTAssertTrue(cache.contains("turn_aborted"))
 
         XCTAssertFalse(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
     }
@@ -347,6 +395,8 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(cache.contains("savedAt"))
         XCTAssertTrue(cache.contains("completeLineOffset"))
         XCTAssertTrue(cache.contains("generationFingerprint"))
+        XCTAssertTrue(cache.contains("turnStates"))
+        XCTAssertTrue(cache.contains("task_started"))
         XCTAssertTrue(cache.contains("safe-id"))
         XCTAssertFalse(cache.contains(sentinel))
     }
@@ -357,7 +407,7 @@ final class CodexTaskActivityTests: XCTestCase {
         try mutateCache { object in
             var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
             cursors[0]["completeLineOffset"] = 9_999_999
-            cursors[0]["activeTurns"] = []
+            cursors[0]["turnStates"] = []
             object["cursors"] = cursors
         }
 
@@ -370,7 +420,7 @@ final class CodexTaskActivityTests: XCTestCase {
         try mutateCache { object in
             var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
             cursors[0]["completeLineOffset"] = 10
-            cursors[0]["activeTurns"] = []
+            cursors[0]["turnStates"] = []
             object["cursors"] = cursors
         }
 

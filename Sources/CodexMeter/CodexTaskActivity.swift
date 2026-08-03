@@ -4,6 +4,7 @@ import Foundation
 enum CodexTaskLifecycleKind: String, Codable, Sendable {
     case started = "task_started"
     case completed = "task_complete"
+    case aborted = "turn_aborted"
 }
 
 struct CodexTaskLifecycleEvent: Equatable, Sendable {
@@ -94,6 +95,7 @@ enum CodexTaskLifecycleParser {
 private enum CodexTaskLifecycleLineDiscriminator {
     private static let started = Data("task_started".utf8)
     private static let completed = Data("task_complete".utf8)
+    private static let aborted = Data("turn_aborted".utf8)
 
     static func isLifecycleEvent(_ data: Data) -> Bool {
         var scanner = JSONLifecycleScanner(data: data)
@@ -102,7 +104,7 @@ private enum CodexTaskLifecycleLineDiscriminator {
 
     static func completeCandidateLineRanges(in data: Data) -> [Range<Data.Index>] {
         var ranges = Set<Range<Data.Index>>()
-        for marker in [started, completed] {
+        for marker in [started, completed, aborted] {
             var searchStart = data.startIndex
             while searchStart < data.endIndex,
                   let match = data.range(of: marker, options: [], in: searchStart..<data.endIndex),
@@ -169,7 +171,9 @@ private struct JSONLifecycleScanner {
 
             if key == "type" {
                 let value = parseString()
-                guard value == "task_started" || value == "task_complete" else {
+                guard value == "task_started"
+                    || value == "task_complete"
+                    || value == "turn_aborted" else {
                     return false
                 }
                 lifecycleType = true
@@ -294,7 +298,7 @@ enum CodexTaskActivityProviderError: Error, Equatable {
 }
 
 final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Sendable {
-    private static let cacheSchemaVersion = 2
+    private static let cacheSchemaVersion = 3
     private static let activityHorizon: TimeInterval = 86_400
     private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
     private static let readChunkBytes = 4 * 1_024 * 1_024
@@ -323,7 +327,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         var url: URL
         var offset: UInt64 = 0
         var partial = Data()
-        var activeTurns: [String: Date] = [:]
+        var turnStates: [String: CodexTaskLifecycleEvent] = [:]
         var generationFingerprint: String?
         var needsBoundaryValidation = false
     }
@@ -353,12 +357,13 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         let identity: FileIdentity?
         let completeLineOffset: UInt64
         let generationFingerprint: String
-        let activeTurns: [PersistentActiveTurn]
+        let turnStates: [PersistentTurnState]
     }
 
-    private struct PersistentActiveTurn: Codable {
+    private struct PersistentTurnState: Codable {
         let turnID: String
-        let startedAt: Date
+        let kind: CodexTaskLifecycleKind
+        let timestamp: Date
     }
 
     private struct BoundedRead {
@@ -426,7 +431,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 aggregate: &unreadAggregate
             )
             try updatePrepared(&cursor, from: candidate)
-            cursor.activeTurns = cursor.activeTurns.filter { $0.value >= lowerBound }
+            cursor.turnStates = cursor.turnStates.filter { $0.value.timestamp >= lowerBound }
             refreshed[key] = cursor
         }
         refreshed = refreshed.filter { discoveredKeys.contains($0.key) }
@@ -434,7 +439,13 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         saveCache(refreshed, at: now)
         cursors = refreshed
         didLoadCache = true
-        return refreshed.values.contains { !$0.activeTurns.isEmpty }
+        var latestStates: [String: CodexTaskLifecycleEvent] = [:]
+        for cursor in refreshed.values {
+            for event in cursor.turnStates.values {
+                Self.merge(event, into: &latestStates)
+            }
+        }
+        return latestStates.values.contains { $0.kind == .started }
     }
 
     private static func defaultCacheURL(fileManager: FileManager) -> URL? {
@@ -470,15 +481,19 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             let key = persisted.identity.map(CursorKey.identity) ?? .basename(persisted.basename)
             guard loaded[key] == nil else { return [:] }
 
-            var activeTurns: [String: Date] = [:]
-            for activeTurn in persisted.activeTurns {
-                guard activeTurns[activeTurn.turnID] == nil else { return [:] }
-                activeTurns[activeTurn.turnID] = activeTurn.startedAt
+            var turnStates: [String: CodexTaskLifecycleEvent] = [:]
+            for state in persisted.turnStates {
+                guard turnStates[state.turnID] == nil else { return [:] }
+                turnStates[state.turnID] = CodexTaskLifecycleEvent(
+                    kind: state.kind,
+                    turnID: state.turnID,
+                    timestamp: state.timestamp
+                )
             }
             loaded[key] = FileCursor(
                 url: URL(fileURLWithPath: persisted.path),
                 offset: persisted.completeLineOffset,
-                activeTurns: activeTurns,
+                turnStates: turnStates,
                 generationFingerprint: persisted.generationFingerprint,
                 needsBoundaryValidation: true
             )
@@ -522,10 +537,10 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             }
 
             var turnIDs = Set<String>()
-            for activeTurn in cursor.activeTurns {
-                guard !activeTurn.turnID.isEmpty,
-                      turnIDs.insert(activeTurn.turnID).inserted,
-                      activeTurn.startedAt.timeIntervalSinceReferenceDate.isFinite else {
+            for state in cursor.turnStates {
+                guard !state.turnID.isEmpty,
+                      turnIDs.insert(state.turnID).inserted,
+                      state.timestamp.timeIntervalSinceReferenceDate.isFinite else {
                     return false
                 }
             }
@@ -548,8 +563,14 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 basename = value
             }
             let completeOffset = cursor.offset - UInt64(cursor.partial.count)
-            let activeTurns = cursor.activeTurns
-                .map { PersistentActiveTurn(turnID: $0.key, startedAt: $0.value) }
+            let turnStates = cursor.turnStates.values
+                .map {
+                    PersistentTurnState(
+                        turnID: $0.turnID,
+                        kind: $0.kind,
+                        timestamp: $0.timestamp
+                    )
+                }
                 .sorted { $0.turnID < $1.turnID }
             return PersistentCursor(
                 path: cursor.url.path,
@@ -557,7 +578,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 identity: identity,
                 completeLineOffset: completeOffset,
                 generationFingerprint: cursor.generationFingerprint ?? "",
-                activeTurns: activeTurns
+                turnStates: turnStates
             )
         }.sorted { $0.path < $1.path }
         let cache = PersistentCache(
@@ -767,12 +788,23 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         cursor.partial = Data(cursor.partial[partialStart...])
 
         for event in CodexTaskLifecycleParser.parseCompleteLines(in: completeData) {
-            switch event.kind {
-            case .started:
-                cursor.activeTurns[event.turnID] = event.timestamp
-            case .completed:
-                cursor.activeTurns.removeValue(forKey: event.turnID)
-            }
+            Self.merge(event, into: &cursor.turnStates)
+        }
+    }
+
+    private static func merge(
+        _ candidate: CodexTaskLifecycleEvent,
+        into states: inout [String: CodexTaskLifecycleEvent]
+    ) {
+        guard let current = states[candidate.turnID] else {
+            states[candidate.turnID] = candidate
+            return
+        }
+        if candidate.timestamp > current.timestamp
+            || (candidate.timestamp == current.timestamp
+                && current.kind == .started
+                && candidate.kind != .started) {
+            states[candidate.turnID] = candidate
         }
     }
 
