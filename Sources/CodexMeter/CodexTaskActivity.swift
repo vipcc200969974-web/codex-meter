@@ -945,41 +945,55 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
 
-            var remaining = completeLineOffset
-            var pendingLine = Data()
-            var discardingOversizedLine = false
+            let overlap = UInt64(Self.legacyCandidateLineLimitBytes)
+            let markers = [Self.completedMarker, Self.abortedMarker]
             var recovered: [String: CodexTaskLifecycleEvent] = [:]
-            while remaining > 0 {
-                let requested = Int(min(UInt64(Self.readChunkBytes), remaining))
-                guard let chunk = try handle.read(upToCount: requested), !chunk.isEmpty else {
+            var coreStart: UInt64 = 0
+            while coreStart < completeLineOffset {
+                let coreEnd = coreStart + min(
+                    completeLineOffset - coreStart,
+                    UInt64(Self.readChunkBytes)
+                )
+                let windowStart = coreStart > overlap ? coreStart - overlap : 0
+                let windowEnd = coreEnd + min(completeLineOffset - coreEnd, overlap)
+                let requested = Int(windowEnd - windowStart)
+                try handle.seek(toOffset: windowStart)
+                guard let window = try handle.read(upToCount: requested),
+                      window.count == requested else {
                     throw CodexTaskActivityProviderError.readFailed
                 }
-                remaining -= UInt64(chunk.count)
 
-                var segmentStart = chunk.startIndex
-                while segmentStart < chunk.endIndex {
-                    if let newline = chunk[segmentStart...].firstIndex(of: 0x0A) {
-                        consumeLegacyLineSegment(
-                            chunk[segmentStart..<newline],
-                            endsLine: true,
-                            pendingLine: &pendingLine,
-                            discardingOversizedLine: &discardingOversizedLine,
-                            matching: turnIDs,
-                            recovered: &recovered
-                        )
-                        segmentStart = chunk.index(after: newline)
-                    } else {
-                        consumeLegacyLineSegment(
-                            chunk[segmentStart..<chunk.endIndex],
-                            endsLine: false,
-                            pendingLine: &pendingLine,
-                            discardingOversizedLine: &discardingOversizedLine,
-                            matching: turnIDs,
-                            recovered: &recovered
-                        )
-                        break
+                for marker in markers {
+                    var searchStart = window.startIndex
+                    while searchStart < window.endIndex,
+                          let match = window.range(
+                              of: marker,
+                              options: [],
+                              in: searchStart..<window.endIndex
+                          ) {
+                        guard let newline = window[match.upperBound...].firstIndex(of: 0x0A) else {
+                            break
+                        }
+                        let absoluteMatchStart = windowStart
+                            + UInt64(match.lowerBound - window.startIndex)
+                        if absoluteMatchStart >= coreStart,
+                           absoluteMatchStart < coreEnd,
+                           let lineRange = completeLegacyLineRange(
+                               containing: match,
+                               endingAt: newline,
+                               in: window,
+                               windowStart: windowStart
+                           ) {
+                            recoverLegacyTerminalEvent(
+                                from: window.subdata(in: lineRange),
+                                matching: turnIDs,
+                                into: &recovered
+                            )
+                        }
+                        searchStart = window.index(after: newline)
                     }
                 }
+                coreStart = coreEnd
             }
             return recovered
         } catch let error as CodexTaskActivityProviderError {
@@ -989,49 +1003,23 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         }
     }
 
-    private func consumeLegacyLineSegment(
-        _ segment: Data.SubSequence,
-        endsLine: Bool,
-        pendingLine: inout Data,
-        discardingOversizedLine: inout Bool,
-        matching turnIDs: Set<String>,
-        recovered: inout [String: CodexTaskLifecycleEvent]
-    ) {
-        if discardingOversizedLine {
-            if endsLine {
-                discardingOversizedLine = false
-            }
-            return
+    private func completeLegacyLineRange(
+        containing match: Range<Data.Index>,
+        endingAt newline: Data.Index,
+        in window: Data,
+        windowStart: UInt64
+    ) -> Range<Data.Index>? {
+        let lineStart: Data.Index
+        if let previousNewline = window[..<match.lowerBound].lastIndex(of: 0x0A) {
+            lineStart = window.index(after: previousNewline)
+        } else {
+            guard windowStart == 0 else { return nil }
+            lineStart = window.startIndex
         }
-
-        guard pendingLine.count <= Self.legacyCandidateLineLimitBytes,
-              segment.count <= Self.legacyCandidateLineLimitBytes - pendingLine.count else {
-            pendingLine.removeAll(keepingCapacity: false)
-            discardingOversizedLine = !endsLine
-            return
+        guard newline - lineStart <= Self.legacyCandidateLineLimitBytes else {
+            return nil
         }
-
-        if pendingLine.isEmpty, endsLine {
-            guard segment.range(of: Self.completedMarker) != nil
-                    || segment.range(of: Self.abortedMarker) != nil else {
-                return
-            }
-            recoverLegacyTerminalEvent(
-                from: Data(segment),
-                matching: turnIDs,
-                into: &recovered
-            )
-            return
-        }
-
-        pendingLine.append(contentsOf: segment)
-        guard endsLine else { return }
-        recoverLegacyTerminalEvent(
-            from: pendingLine,
-            matching: turnIDs,
-            into: &recovered
-        )
-        pendingLine.removeAll(keepingCapacity: true)
+        return lineStart..<newline
     }
 
     private func recoverLegacyTerminalEvent(
