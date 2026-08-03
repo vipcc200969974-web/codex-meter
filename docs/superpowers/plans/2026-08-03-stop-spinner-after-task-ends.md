@@ -12,6 +12,7 @@
 
 - Treat `task_started` as active.
 - Treat both `task_complete` and `turn_aborted` as terminal.
+- Expire unmatched `task_started` records after a 15-minute orphan-safety lease.
 - Keep the existing 24-hour lifecycle horizon and bounded incremental reads.
 - Persist only turn ID, lifecycle kind, timestamp, and cursor metadata; never persist prompt or response payloads.
 - Do not change the menu bar appearance, refresh interval, or quota/token behavior.
@@ -90,6 +91,7 @@ In `CodexTaskActivity.swift`:
 8. Migrate schema version 2 cursors without losing their offsets. Recover covered `task_complete` and `turn_aborted` events for legacy active turn IDs with a 64 KiB line cap so oversized private records are skipped without being cached.
 9. Track the uncommitted byte count independently from the bounded partial-line buffer. Discard normal incremental lines larger than 64 KiB and resume lifecycle parsing at the next newline without retaining the oversized payload in memory.
 10. Mark restored schema version 2 cursors for one-time catch-up. Scan from each legacy offset to the newest complete line with the bounded marker scanner before applying the normal byte budget, then persist schema version 3.
+11. When reporting activity, ignore unmatched starts older than 15 minutes so a crashed or interrupted task cannot spin forever.
 
 - [ ] **Step 4: Verify focused tests are GREEN**
 
@@ -108,6 +110,8 @@ Add a test that writes a start and abort, saves the cursor cache, constructs a n
 Add a migration catch-up test that appends an oversized private record plus a terminal event after the schema version 2 offset and still succeeds when the normal read budget is zero.
 
 Add provider tests proving that an oversized lifecycle-looking record is discarded and that a normal lifecycle event immediately after an oversized private record still applies.
+
+Add a boundary test proving an unmatched start is active at exactly 15 minutes old and idle once it is older.
 
 - [ ] **Step 6: Run the complete suite and commit**
 

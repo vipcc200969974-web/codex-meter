@@ -212,23 +212,23 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(try makeProvider().currentActivity(now: now))
     }
 
-    func testTwentyFourHourBoundaryIsActiveButOlderStartIsStale() throws {
+    func testFifteenMinuteOrphanBoundaryIsActiveButOlderStartIsIdle() throws {
         try writeLifecycle(
             .started,
             turnID: "boundary",
             to: activeFile,
-            at: now.addingTimeInterval(-86_400)
+            at: now.addingTimeInterval(-900)
         )
         XCTAssertTrue(try makeProvider().currentActivity(now: now))
 
-        try writeLifecycle(
+        try overwriteLifecycle(
             .started,
             turnID: "stale",
-            to: otherFile,
-            at: now.addingTimeInterval(-86_401)
+            in: activeFile,
+            at: now.addingTimeInterval(-901)
         )
         XCTAssertFalse(
-            try makeProvider(roots: [otherFile.deletingLastPathComponent()])
+            try makeProvider(roots: [activeRoot])
                 .currentActivity(now: now)
         )
     }

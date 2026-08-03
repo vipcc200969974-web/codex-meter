@@ -303,6 +303,7 @@ enum CodexTaskActivityProviderError: Error, Equatable {
 final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Sendable {
     private static let cacheSchemaVersion = 3
     private static let activityHorizon: TimeInterval = 86_400
+    private static let orphanedStartHorizon: TimeInterval = 15 * 60
     private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
     private static let readChunkBytes = 4 * 1_024 * 1_024
     private static let fingerprintSampleBytes: UInt64 = 4 * 1_024
@@ -478,7 +479,10 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 Self.merge(event, into: &latestStates)
             }
         }
-        return latestStates.values.contains { $0.kind == .started }
+        let activeLowerBound = now.addingTimeInterval(-Self.orphanedStartHorizon)
+        return latestStates.values.contains {
+            $0.kind == .started && $0.timestamp >= activeLowerBound
+        }
     }
 
     private static func defaultCacheURL(fileManager: FileManager) -> URL? {

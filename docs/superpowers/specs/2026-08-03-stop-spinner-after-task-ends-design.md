@@ -17,6 +17,7 @@ Keep incremental, bounded log reading, but retain the latest lifecycle event for
 - Across all discovered files, merge events by turn ID and keep the newest event.
 - If two lifecycle events for the same turn have the same timestamp, prefer a terminal event over a start.
 - Report global activity only when at least one turn's merged latest state is `task_started`.
+- Treat an unmatched start as orphaned after 15 minutes. Normal completion or abort records still stop the spinner immediately, while this lease prevents a crashed or interrupted writer from leaving it spinning forever.
 - Keep only lifecycle states inside the existing 24-hour horizon.
 - Bound both normal incremental parsing and legacy migration to 64 KiB per JSONL line. Oversized records are discarded without buffering, and parsing resumes at the next newline.
 
@@ -36,6 +37,7 @@ Add regressions proving that:
 - A completion in one file overrides an older copied start in another file.
 - A genuinely newer start remains active after an older terminal event.
 - Equal timestamps prefer terminal state.
+- An unmatched start is active at the 15-minute boundary and idle immediately after it.
 - Persistence preserves terminal states without storing private payload text.
 - A schema version 2 cache migrates without rereading source bytes through the normal reconstruction budget, preserves active turns, and recovers already-covered terminal events.
 - Oversized lifecycle-looking and private lines are discarded while the following normal lifecycle event still applies.
