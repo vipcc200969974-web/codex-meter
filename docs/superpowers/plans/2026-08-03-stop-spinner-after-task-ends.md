@@ -89,6 +89,7 @@ In `CodexTaskActivity.swift`:
 7. Validate unique turn IDs, finite timestamps, and valid lifecycle kinds when loading cache data.
 8. Migrate schema version 2 cursors without losing their offsets. Recover covered `task_complete` and `turn_aborted` events for legacy active turn IDs with a 64 KiB line cap so oversized private records are skipped without being cached.
 9. Track the uncommitted byte count independently from the bounded partial-line buffer. Discard normal incremental lines larger than 64 KiB and resume lifecycle parsing at the next newline without retaining the oversized payload in memory.
+10. Mark restored schema version 2 cursors for one-time catch-up. Scan from each legacy offset to the newest complete line with the bounded marker scanner before applying the normal byte budget, then persist schema version 3.
 
 - [ ] **Step 4: Verify focused tests are GREEN**
 
@@ -103,6 +104,8 @@ Expected: all activity parser/provider tests pass with no warnings.
 - [ ] **Step 5: Add restart persistence coverage**
 
 Add a test that writes a start and abort, saves the cursor cache, constructs a new provider, and confirms the task remains idle. Extend the cache privacy assertion to require lifecycle state metadata while continuing to reject the private sentinel. Add schema version 2 migration tests that preserve an active turn, recover a covered abort, recover a completion from another file, and succeed with a zero-byte normal reconstruction budget.
+
+Add a migration catch-up test that appends an oversized private record plus a terminal event after the schema version 2 offset and still succeeds when the normal read budget is zero.
 
 Add provider tests proving that an oversized lifecycle-looking record is discarded and that a normal lifecycle event immediately after an oversized private record still applies.
 

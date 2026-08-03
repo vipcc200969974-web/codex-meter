@@ -20,7 +20,7 @@ Keep incremental, bounded log reading, but retain the latest lifecycle event for
 - Keep only lifecycle states inside the existing 24-hour horizon.
 - Bound both normal incremental parsing and legacy migration to 64 KiB per JSONL line. Oversized records are discarded without buffering, and parsing resumes at the next newline.
 
-The persistent cursor cache will move to schema version 3 and store only turn ID, lifecycle kind, and timestamp. Schema version 2 is migrated in place so multi-gigabyte session files do not need a cold rebuild: existing offsets and active starts are retained, while a one-time bounded-line scan recovers covered completion and abort records for those active turn IDs. Lines larger than 64 KiB are discarded by the migration scanner, and no prompt, response, or other private payload is cached.
+The persistent cursor cache will move to schema version 3 and store only turn ID, lifecycle kind, and timestamp. Schema version 2 is migrated in place so multi-gigabyte session files do not need a cold rebuild: existing offsets and active starts are retained, while a one-time bounded-line scan recovers covered completion and abort records for those active turn IDs. The same bounded scanner catches up bytes appended after the legacy offset even when that one-time gap exceeds the normal incremental read budget. Lines larger than 64 KiB are discarded by the migration scanner, and no prompt, response, or other private payload is cached.
 
 ## Alternatives Considered
 

@@ -412,6 +412,39 @@ final class CodexTaskActivityTests: XCTestCase {
         )
     }
 
+    func testVersionTwoCacheCatchUpMayExceedNormalReadBudget() throws {
+        let startedAt = now.addingTimeInterval(-10)
+        try writeLifecycle(.started, turnID: "legacy-growing", to: activeFile, at: startedAt)
+        XCTAssertTrue(try makeProvider(cacheURL: cacheURL).currentActivity(now: now))
+        try mutateCache { object in
+            object["schemaVersion"] = 2
+            var cursors = try XCTUnwrap(object["cursors"] as? [[String: Any]])
+            cursors[0]["activeTurns"] = [[
+                "turnID": "legacy-growing",
+                "startedAt": startedAt.timeIntervalSinceReferenceDate
+            ]]
+            cursors[0].removeValue(forKey: "turnStates")
+            object["cursors"] = cursors
+        }
+        let oversizedPrivateLine = #"{"timestamp":"2026-08-02T02:00:00Z","type":"response_item","payload":{"type":"message","content":""#
+            + String(repeating: "task_complete private ", count: 5_000)
+            + #""}}"#
+        try append(Data((oversizedPrivateLine + "\n").utf8), to: activeFile)
+        try appendLifecycle(.completed, turnID: "legacy-growing", to: activeFile, at: now)
+
+        XCTAssertFalse(
+            try makeProvider(
+                cacheURL: cacheURL,
+                maxBytesPerFile: 0,
+                maxTotalBytes: 0
+            ).currentActivity(now: now)
+        )
+        let migrated = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as? [String: Any]
+        )
+        XCTAssertEqual(migrated["schemaVersion"] as? Int, 3)
+    }
+
     func testActiveAndArchiveCopiesWithSameBasenameAreDeduplicated() throws {
         let archivedCopy = archivedRoot.appendingPathComponent(activeFile.lastPathComponent)
         try writeLifecycle(.started, turnID: "copied", to: activeFile, at: now.addingTimeInterval(-10))

@@ -338,6 +338,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         var turnStates: [String: CodexTaskLifecycleEvent] = [:]
         var generationFingerprint: String?
         var needsBoundaryValidation = false
+        var needsLegacyCatchUp = false
     }
 
     private struct Candidate {
@@ -454,6 +455,9 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             discoveredKeys.insert(key)
             var cursor = refreshed[key] ?? FileCursor(url: candidate.url)
             try prepare(&cursor, for: candidate)
+            if cursor.needsLegacyCatchUp {
+                try catchUpLegacyCursor(&cursor, from: candidate)
+            }
             let unreadByteCount = candidate.byteCount - cursor.offset
             try validateBudget(
                 unreadByteCount: unreadByteCount,
@@ -588,7 +592,8 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 offset: persisted.completeLineOffset,
                 turnStates: turnStates,
                 generationFingerprint: persisted.generationFingerprint,
-                needsBoundaryValidation: true
+                needsBoundaryValidation: true,
+                needsLegacyCatchUp: true
             )
         }
 
@@ -874,7 +879,10 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         }
 
         if candidate.byteCount < cursor.offset || invalidBoundary || invalidGeneration {
-            cursor = FileCursor(url: candidate.url)
+            cursor = FileCursor(
+                url: candidate.url,
+                needsLegacyCatchUp: cursor.needsLegacyCatchUp
+            )
         }
         cursor.needsBoundaryValidation = false
     }
@@ -981,28 +989,107 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         }
     }
 
+    private func catchUpLegacyCursor(
+        _ cursor: inout FileCursor,
+        from candidate: Candidate
+    ) throws {
+        let catchUpEnd = try latestCompleteLineOffset(
+            in: candidate.url,
+            fileSize: candidate.byteCount,
+            notBefore: cursor.offset
+        )
+        let recovered = try scanLegacyLifecycleEvents(
+            from: candidate.url,
+            startingAt: cursor.offset,
+            through: catchUpEnd,
+            markers: [Self.startedMarker, Self.completedMarker, Self.abortedMarker],
+            matching: nil
+        )
+        for event in recovered.values {
+            Self.merge(event, into: &cursor.turnStates)
+        }
+        cursor.offset = catchUpEnd
+        cursor.partial.removeAll(keepingCapacity: false)
+        cursor.uncommittedByteCount = 0
+        cursor.discardingOversizedLine = false
+        cursor.generationFingerprint = try generationFingerprint(
+            of: candidate.url,
+            through: catchUpEnd
+        )
+        cursor.needsLegacyCatchUp = false
+    }
+
+    private func latestCompleteLineOffset(
+        in url: URL,
+        fileSize: UInt64,
+        notBefore lowerBound: UInt64
+    ) throws -> UInt64 {
+        guard fileSize > lowerBound else { return lowerBound }
+        if isCompleteLineBoundary(fileSize, in: url, fileSize: fileSize) {
+            return fileSize
+        }
+
+        let suffixCount = min(
+            fileSize - lowerBound,
+            UInt64(codexTaskLifecycleLineLimitBytes)
+        )
+        let suffixStart = fileSize - suffixCount
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: suffixStart)
+            let suffix = try Self.readExactly(from: handle, byteCount: suffixCount)
+            guard UInt64(suffix.data.count) == suffixCount,
+                  !suffix.hasMoreBytes,
+                  let newline = suffix.data.lastIndex(of: 0x0A) else {
+                return lowerBound
+            }
+            return suffixStart
+                + UInt64(suffix.data.distance(from: suffix.data.startIndex, to: newline))
+                + 1
+        } catch {
+            throw CodexTaskActivityProviderError.readFailed
+        }
+    }
+
     private func recoverLegacyTerminalEvents(
         from url: URL,
         through completeLineOffset: UInt64,
         matching turnIDs: Set<String>
     ) throws -> [String: CodexTaskLifecycleEvent] {
-        guard completeLineOffset > 0, !turnIDs.isEmpty else { return [:] }
+        guard !turnIDs.isEmpty else { return [:] }
+        return try scanLegacyLifecycleEvents(
+            from: url,
+            startingAt: 0,
+            through: completeLineOffset,
+            markers: [Self.completedMarker, Self.abortedMarker],
+            matching: turnIDs
+        )
+    }
+
+    private func scanLegacyLifecycleEvents(
+        from url: URL,
+        startingAt scanStart: UInt64,
+        through scanEnd: UInt64,
+        markers: [Data],
+        matching turnIDs: Set<String>?
+    ) throws -> [String: CodexTaskLifecycleEvent] {
+        guard scanEnd > scanStart else { return [:] }
 
         do {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
 
             let overlap = UInt64(codexTaskLifecycleLineLimitBytes)
-            let markers = [Self.completedMarker, Self.abortedMarker]
             var recovered: [String: CodexTaskLifecycleEvent] = [:]
-            var coreStart: UInt64 = 0
-            while coreStart < completeLineOffset {
+            var coreStart = scanStart
+            while coreStart < scanEnd {
                 let coreEnd = coreStart + min(
-                    completeLineOffset - coreStart,
+                    scanEnd - coreStart,
                     UInt64(Self.readChunkBytes)
                 )
-                let windowStart = coreStart > overlap ? coreStart - overlap : 0
-                let windowEnd = coreEnd + min(completeLineOffset - coreEnd, overlap)
+                let windowStart = coreStart - min(coreStart - scanStart, overlap)
+                let windowEnd = coreEnd + min(scanEnd - coreEnd, overlap)
                 let requested = Int(windowEnd - windowStart)
                 try handle.seek(toOffset: windowStart)
                 guard let window = try handle.read(upToCount: requested),
@@ -1029,9 +1116,10 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                                containing: match,
                                endingAt: newline,
                                in: window,
-                               windowStart: windowStart
+                               windowStart: windowStart,
+                               scanStart: scanStart
                            ) {
-                            recoverLegacyTerminalEvent(
+                            recoverLegacyLifecycleEvent(
                                 from: window.subdata(in: lineRange),
                                 matching: turnIDs,
                                 into: &recovered
@@ -1054,13 +1142,14 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         containing match: Range<Data.Index>,
         endingAt newline: Data.Index,
         in window: Data,
-        windowStart: UInt64
+        windowStart: UInt64,
+        scanStart: UInt64
     ) -> Range<Data.Index>? {
         let lineStart: Data.Index
         if let previousNewline = window[..<match.lowerBound].lastIndex(of: 0x0A) {
             lineStart = window.index(after: previousNewline)
         } else {
-            guard windowStart == 0 else { return nil }
+            guard windowStart == scanStart else { return nil }
             lineStart = window.startIndex
         }
         guard newline - lineStart <= codexTaskLifecycleLineLimitBytes else {
@@ -1069,16 +1158,15 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         return lineStart..<newline
     }
 
-    private func recoverLegacyTerminalEvent(
+    private func recoverLegacyLifecycleEvent(
         from line: Data,
-        matching turnIDs: Set<String>,
+        matching turnIDs: Set<String>?,
         into recovered: inout [String: CodexTaskLifecycleEvent]
     ) {
-        guard line.range(of: Self.completedMarker) != nil
-                || line.range(of: Self.abortedMarker) != nil,
-              let event = CodexTaskLifecycleParser.parseCompleteLines(in: line + Data([0x0A])).first,
-              event.kind != .started,
-              turnIDs.contains(event.turnID) else {
+        guard let event = CodexTaskLifecycleParser.parseCompleteLines(
+            in: line + Data([0x0A])
+        ).first,
+              turnIDs?.contains(event.turnID) ?? true else {
             return
         }
         Self.merge(event, into: &recovered)
