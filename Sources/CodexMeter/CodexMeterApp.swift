@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import CoreFoundation
 import SwiftUI
 import UserNotifications
 
@@ -17,7 +18,7 @@ struct CodexMeterApp: App {
 
 private enum PanelMetrics {
     static let cardWidth: CGFloat = 360
-    static let cardHeight: CGFloat = 220
+    static let cardHeight: CGFloat = 340
     static let windowPadding: CGFloat = 14
     static let width: CGFloat = cardWidth + windowPadding * 2
     static let height: CGFloat = cardHeight + windowPadding * 2
@@ -27,7 +28,10 @@ private enum PanelMetrics {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let quotaStore = QuotaStore()
+    private let usageStore = UsageStore(
+        cachedQuota: QuotaSnapshot.cached(),
+        cacheQuota: { $0.cache() }
+    )
     private var statusItem: NSStatusItem?
     private var statusView: CompactStatusItemView?
     private var panelWindow: NSPanel?
@@ -39,14 +43,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItem()
         configurePanelWindow()
         configureWakeRefreshObservers()
-        quotaStore.start()
+        usageStore.start()
 
-        snapshotCancellable = quotaStore.$snapshot.sink { [weak self] snapshot in
-            self?.updateStatusItem(with: snapshot)
+        snapshotCancellable = Publishers.CombineLatest(
+            usageStore.$snapshot,
+            usageStore.$isTaskActive
+        ).sink { [weak self] snapshot, isTaskActive in
+            self?.updateStatusItem(with: snapshot, isTaskActive: isTaskActive)
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        usageStore.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopOutsideClickMonitor()
     }
@@ -62,7 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.view = view
         statusView = view
 
-        updateStatusItem(with: quotaStore.snapshot)
+        updateStatusItem(with: usageStore.snapshot, isTaskActive: usageStore.isTaskActive)
     }
 
     private func configurePanelWindow() {
@@ -79,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentViewController = NSHostingController(
-            rootView: StatusPanelView(store: quotaStore)
+            rootView: StatusPanelView(store: usageStore)
                 .frame(width: PanelMetrics.width, height: PanelMetrics.height)
         )
         self.panelWindow = panel
@@ -107,14 +115,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func updateStatusItem(with snapshot: QuotaSnapshot) {
-        let title = snapshot.isUnavailable ? "未同步" : "\(snapshot.percentText) | \(snapshot.shortResetText)"
-        let tooltip = snapshot.isUnavailable ? "正在等待 Codex 会话额度数据" : "5h 额度剩余 \(snapshot.remainingPercent)% ，距离额度恢复 \(snapshot.resetText)"
+    private func updateStatusItem(with snapshot: UsageSnapshot, isTaskActive: Bool) {
+        let quota = snapshot.quota
+        let percentText = quota.isUnavailable ? "未同步" : quota.percentText
+        let resetText = quota.isUnavailable ? nil : quota.shortResetText
+        let tooltip = quota.isUnavailable
+            ? "正在等待 Codex 会话额度数据"
+            : "\(quota.mainQuotaSpokenName)剩余 \(quota.remainingPercent)% ，距离额度恢复 \(quota.resetText)"
         statusView?.update(
-            title: title,
-            color: snapshot.tagTextColor,
-            backgroundColor: snapshot.tagBackgroundColor,
-            tooltip: tooltip
+            percentText: percentText,
+            resetText: resetText,
+            color: quota.tagTextColor,
+            backgroundColor: quota.tagBackgroundColor,
+            tooltip: tooltip,
+            isTaskActive: isTaskActive
         )
         statusItem?.length = statusView?.frame.width ?? NSStatusItem.variableLength
     }
@@ -128,7 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             positionPanel(relativeTo: statusView)
             panelWindow.orderFrontRegardless()
             startOutsideClickMonitor()
-            quotaStore.refresh()
+            usageStore.refresh()
         }
     }
 
@@ -171,51 +185,257 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshAfterSleepOrUnlock(_ notification: Notification) {
-        quotaStore.refresh()
+        usageStore.refreshAfterWakeOrUnlock()
     }
 }
 
+struct CompactStatusItemLayout {
+    static let horizontalPadding: CGFloat = 5
+    static let dividerSpacing: CGFloat = 5
+    static let dividerHeight: CGFloat = 9
+    static let ringDiameter: CGFloat = 12.5
+    static let trailingPadding: CGFloat = 6
+
+    let percentFrame: NSRect
+    let quotaDividerFrame: NSRect?
+    let resetFrame: NSRect?
+    let activityDividerFrame: NSRect
+    let ringFrame: NSRect
+    let totalWidth: CGFloat
+
+    init(percentWidth: CGFloat, resetWidth: CGFloat?, statusHeight: CGFloat) {
+        percentFrame = NSRect(
+            x: Self.horizontalPadding,
+            y: 0,
+            width: percentWidth,
+            height: statusHeight
+        )
+
+        let quotaContentMaxX: CGFloat
+        if let resetWidth {
+            let divider = NSRect(
+                x: percentFrame.maxX + Self.dividerSpacing,
+                y: (statusHeight - Self.dividerHeight) / 2,
+                width: 1,
+                height: Self.dividerHeight
+            )
+            quotaDividerFrame = divider
+            let reset = NSRect(
+                x: divider.maxX + Self.dividerSpacing,
+                y: 0,
+                width: resetWidth,
+                height: statusHeight
+            )
+            resetFrame = reset
+            quotaContentMaxX = reset.maxX
+        } else {
+            quotaDividerFrame = nil
+            resetFrame = nil
+            quotaContentMaxX = percentFrame.maxX
+        }
+
+        activityDividerFrame = NSRect(
+            x: quotaContentMaxX + Self.dividerSpacing,
+            y: (statusHeight - Self.dividerHeight) / 2,
+            width: 1,
+            height: Self.dividerHeight
+        )
+        ringFrame = NSRect(
+            x: activityDividerFrame.maxX + Self.dividerSpacing,
+            y: (statusHeight - Self.ringDiameter) / 2,
+            width: Self.ringDiameter,
+            height: Self.ringDiameter
+        )
+        totalWidth = ringFrame.maxX + Self.trailingPadding
+    }
+}
+
+protocol StatusItemAnimationTask: AnyObject {
+    func cancel()
+}
+
+typealias StatusItemAnimationFactory = (
+    _ interval: TimeInterval,
+    _ tick: @escaping @MainActor () -> Void
+) -> any StatusItemAnimationTask
+
+func makeStatusItemAnimation(
+    interval: TimeInterval,
+    tick: @escaping @MainActor () -> Void
+) -> any StatusItemAnimationTask {
+    TimerStatusItemAnimationTask(interval: interval, tick: tick)
+}
+
+private final class TimerStatusItemAnimationTask: NSObject, StatusItemAnimationTask, @unchecked Sendable {
+    private let tick: @MainActor () -> Void
+    private var timer: Timer?
+
+    init(interval: TimeInterval, tick: @escaping @MainActor () -> Void) {
+        self.tick = tick
+        super.init()
+
+        let timer = Timer(
+            timeInterval: interval,
+            target: self,
+            selector: #selector(timerDidFire),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    @objc private func timerDidFire() {
+        MainActor.assumeIsolated {
+            tick()
+        }
+    }
+}
+
+enum StatusActivityRingPath {
+    static let lineWidth: CGFloat = 1.5
+    static let sweepDegrees: CGFloat = 285
+    static let dashPattern: [CGFloat] = [1.6, 2.4]
+
+    static func make(in frame: NSRect, angleDegrees: CGFloat) -> NSBezierPath {
+        let path = NSBezierPath()
+        path.lineWidth = lineWidth
+        path.lineCapStyle = .round
+        dashPattern.withUnsafeBufferPointer {
+            path.setLineDash($0.baseAddress, count: $0.count, phase: 0)
+        }
+        path.appendArc(
+            withCenter: NSPoint(x: frame.midX, y: frame.midY),
+            radius: (CompactStatusItemLayout.ringDiameter - lineWidth) / 2,
+            startAngle: angleDegrees,
+            endAngle: angleDegrees + sweepDegrees,
+            clockwise: false
+        )
+        return path
+    }
+}
+
+@MainActor
 final class CompactStatusItemView: NSView {
     var onClick: (() -> Void)?
 
     private let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-    private let horizontalPadding: CGFloat = 5
-    private var title = ""
+    private let animationFactory: StatusItemAnimationFactory
+    private var percentText = ""
+    private var resetText: String?
     private var color = NSColor.labelColor
     private var backgroundColor = NSColor.clear
+    private var isTaskActive = false
+    private var animationTask: (any StatusItemAnimationTask)?
+    private(set) var ringAngleDegrees: CGFloat = 90
 
-    func update(title: String, color: NSColor, backgroundColor: NSColor, tooltip: String) {
-        self.title = title
+    init(animationFactory: @escaping StatusItemAnimationFactory = makeStatusItemAnimation) {
+        self.animationFactory = animationFactory
+        super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) {
+        animationFactory = makeStatusItemAnimation
+        super.init(coder: coder)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    isolated deinit {
+        animationTask?.cancel()
+    }
+
+    func update(
+        percentText: String,
+        resetText: String?,
+        color: NSColor,
+        backgroundColor: NSColor,
+        tooltip: String,
+        isTaskActive: Bool
+    ) {
+        self.percentText = percentText
+        self.resetText = resetText
         self.color = color
         self.backgroundColor = backgroundColor
-        self.toolTip = tooltip
+        self.isTaskActive = isTaskActive
 
-        let width = ceil(attributedTitle.size().width + horizontalPadding * 2)
-        frame = NSRect(x: 0, y: 0, width: width, height: NSStatusBar.system.thickness)
+        let activityText = isTaskActive ? "ChatGPT 正在执行任务" : "当前无运行任务"
+        self.toolTip = "\(tooltip)\n\(activityText)"
+        let quotaText = [percentText, resetText].compactMap { $0 }.joined(separator: "，")
+        setAccessibilityLabel("\(quotaText)，\(activityText)")
+
+        let layout = CompactStatusItemLayout(
+            percentWidth: ceil(attributedText(percentText).size().width),
+            resetWidth: resetText.map { ceil(attributedText($0).size().width) },
+            statusHeight: NSStatusBar.system.thickness
+        )
+        frame = NSRect(
+            x: 0,
+            y: 0,
+            width: layout.totalWidth,
+            height: NSStatusBar.system.thickness
+        )
+        updateAnimation()
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let size = attributedTitle.size()
+        let percentTitle = attributedText(percentText)
+        let percentSize = percentTitle.size()
+        let resetTitle = resetText.map(attributedText)
+        let resetSize = resetTitle?.size()
+        let layout = CompactStatusItemLayout(
+            percentWidth: ceil(percentSize.width),
+            resetWidth: resetSize.map { ceil($0.width) },
+            statusHeight: bounds.height
+        )
         let tagRect = NSRect(
             x: 0,
             y: floor((bounds.height - 17) / 2),
-            width: bounds.width,
+            width: layout.totalWidth,
             height: 17
         )
         backgroundColor.setFill()
         NSBezierPath(roundedRect: tagRect, xRadius: 5, yRadius: 5).fill()
 
-        color.set()
-        let rect = NSRect(
-            x: horizontalPadding,
-            y: floor((bounds.height - size.height) / 2),
-            width: size.width,
-            height: size.height
+        let percentRect = NSRect(
+            x: layout.percentFrame.minX,
+            y: floor((bounds.height - percentSize.height) / 2),
+            width: percentSize.width,
+            height: percentSize.height
         )
-        attributedTitle.draw(in: rect)
+        percentTitle.draw(in: percentRect)
+
+        if let resetTitle, let resetSize, let resetFrame = layout.resetFrame {
+            let rect = NSRect(
+                x: resetFrame.minX,
+                y: floor((bounds.height - resetSize.height) / 2),
+                width: resetSize.width,
+                height: resetSize.height
+            )
+            resetTitle.draw(in: rect)
+        }
+
+        if let quotaDividerFrame = layout.quotaDividerFrame {
+            drawDivider(in: quotaDividerFrame)
+        }
+        drawDivider(in: layout.activityDividerFrame)
+
+        let ringPath = StatusActivityRingPath.make(
+            in: layout.ringFrame,
+            angleDegrees: ringAngleDegrees
+        )
+        color.setStroke()
+        ringPath.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -226,9 +446,24 @@ final class CompactStatusItemView: NSView {
         onClick?()
     }
 
-    private var attributedTitle: NSAttributedString {
+    private func updateAnimation() {
+        if isTaskActive {
+            guard animationTask == nil else { return }
+            animationTask = animationFactory(1.0 / 12.0) { [weak self] in
+                guard let self, self.isTaskActive else { return }
+                self.ringAngleDegrees = (self.ringAngleDegrees + 30)
+                    .truncatingRemainder(dividingBy: 360)
+                self.needsDisplay = true
+            }
+        } else {
+            animationTask?.cancel()
+            animationTask = nil
+        }
+    }
+
+    private func attributedText(_ text: String) -> NSAttributedString {
         NSAttributedString(
-            string: title,
+            string: text,
             attributes: [
                 .font: font,
                 .foregroundColor: color,
@@ -236,19 +471,25 @@ final class CompactStatusItemView: NSView {
             ]
         )
     }
+
+    private func drawDivider(in frame: NSRect) {
+        color.withAlphaComponent(0.35).setFill()
+        NSBezierPath(rect: frame).fill()
+    }
 }
 
 struct StatusPanelView: View {
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
 
     var body: some View {
         ZStack {
             ZStack {
-                PanelGlassBackground()
+                PanelGlassBackground(role: .mainPanel)
 
                 VStack(alignment: .leading, spacing: 12) {
                     header
                     quotaOverview
+                    dailyTokenOverview
                 }
                 .padding(18)
             }
@@ -260,9 +501,9 @@ struct StatusPanelView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 8) {
-            Text("\(store.snapshot.sourceName) · \(store.snapshot.lastUpdatedText)")
+            Text(headerStatusText)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(store.snapshot.isUnavailable ? .red : .secondary)
+                .foregroundStyle(headerStatusColor)
                 .lineLimit(1)
 
             Spacer()
@@ -275,14 +516,26 @@ struct StatusPanelView: View {
         }
     }
 
+    private var headerStatusText: String {
+        let quota = store.snapshot.quota
+        let status = "\(quota.sourceName) · \(quota.lastUpdatedText)"
+        return store.snapshot.freshness == .stale ? "\(status) · 暂未更新" : status
+    }
+
+    private var headerStatusColor: Color {
+        if store.snapshot.quota.isUnavailable { return .red }
+        if store.snapshot.freshness == .stale { return .orange }
+        return .secondary
+    }
+
     private var quotaOverview: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(store.snapshot.percentText)
+                    Text(store.snapshot.quota.percentText)
                         .font(.system(size: 44, weight: .bold, design: .rounded))
                         .monospacedDigit()
-                    Text("5 小时剩余")
+                    Text(store.snapshot.quota.mainQuotaLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
@@ -290,37 +543,167 @@ struct StatusPanelView: View {
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 3) {
-                    Text(store.snapshot.shortResetText)
+                    Text(store.snapshot.quota.shortResetText)
                         .font(.system(size: 23, weight: .semibold, design: .rounded))
                         .monospacedDigit()
-                    Text(store.snapshot.resetClockText)
+                    Text(store.snapshot.quota.resetClockText)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
             }
 
-            QuotaProgressBar(percent: store.snapshot.displayRemainingPercent, tint: store.snapshot.tint)
+            QuotaProgressBar(percent: store.snapshot.quota.displayRemainingPercent, tint: store.snapshot.quota.tint)
 
-            Divider()
-                .padding(.vertical, 1)
+            if store.snapshot.quota.showsWeeklySecondary {
+                Divider()
+                    .padding(.vertical, 1)
 
-            SecondaryQuotaRow(
-                title: "周额度",
-                percentText: store.snapshot.weeklyPercentText,
-                trailing: store.snapshot.weeklyResetDateText
-            )
+                SecondaryQuotaRow(
+                    title: "周额度",
+                    percentText: store.snapshot.quota.weeklyPercentText,
+                    trailing: store.snapshot.quota.weeklyResetDateText
+                )
+            }
         }
         .padding(14)
         .notificationInsetSurface(cornerRadius: 12)
     }
 
+    private var dailyTokenOverview: some View {
+        DailyTokenUsageCard(usage: store.snapshot.dailyTokens)
+            .padding(14)
+            .notificationInsetSurface(cornerRadius: 12)
+    }
+}
+
+struct DailyTokenUsageCard: View {
+    let usage: DailyTokenUsage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("今日 Token")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(usage.totalTokens == 0 ? "今日暂无使用" : TokenCountFormatter.exact(usage.totalTokens))
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+            }
+
+            TokenCompositionBar(usage: usage)
+
+            HStack(spacing: 12) {
+                TokenMetric(label: "缓存", value: usage.cachedInputTokens, color: .cyan)
+                TokenMetric(label: "非缓存", value: usage.nonCachedInputTokens, color: .purple)
+                TokenMetric(label: "输出", value: usage.outputTokens, color: .orange)
+            }
+
+            Text("推理 \(TokenCountFormatter.compact(usage.reasoningOutputTokens))（已包含在输出中）")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("今日 Token 使用")
+    }
+}
+
+struct TokenCompositionBar: View {
+    let usage: DailyTokenUsage
+
+    var body: some View {
+        GeometryReader { geometry in
+            let availableWidth = geometry.size.width.isFinite ? max(geometry.size.width, 0) : 0
+
+            if usage.totalTokens > 0 {
+                ZStack(alignment: .leading) {
+                    Color.secondary.opacity(0.15)
+
+                    HStack(spacing: 0) {
+                        Rectangle()
+                            .fill(Color.cyan)
+                            .frame(width: availableWidth * usage.cachedFraction)
+                        Rectangle()
+                            .fill(Color.purple)
+                            .frame(width: availableWidth * usage.nonCachedFraction)
+                        Rectangle()
+                            .fill(Color.orange)
+                            .frame(width: availableWidth * usage.outputFraction)
+                    }
+                }
+                .clipShape(Capsule())
+            } else {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.15))
+            }
+        }
+        .frame(height: 7)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Token 构成")
+        .accessibilityValue(compositionAccessibilityValue)
+    }
+
+    private var compositionAccessibilityValue: String {
+        "缓存 \(TokenCountFormatter.compact(usage.cachedInputTokens))，非缓存 \(TokenCountFormatter.compact(usage.nonCachedInputTokens))，输出 \(TokenCountFormatter.compact(usage.outputTokens))"
+    }
+}
+
+struct TokenMetric: View {
+    let label: String
+    let value: Int64
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(TokenCountFormatter.compact(value))
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(TokenCountFormatter.compact(value))
+    }
+}
+
+enum PanelGlassSurfaceRole {
+    case mainPanel
+    case actionsPopover
+
+    var castsOuterShadow: Bool {
+        self == .actionsPopover
+    }
+
+    @ViewBuilder
+    func applyingOuterShadow<Content: View>(to content: Content) -> some View {
+        if castsOuterShadow {
+            content
+                .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+        } else {
+            content
+        }
+    }
 }
 
 struct PanelGlassBackground: View {
+    let role: PanelGlassSurfaceRole
+
     var body: some View {
+        role.applyingOuterShadow(to: glassSurface)
+    }
+
+    private var glassSurface: some View {
         let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
 
-        ZStack {
+        return ZStack {
             shape
                 .fill(.ultraThinMaterial)
 
@@ -373,7 +756,6 @@ struct PanelGlassBackground: View {
                 .padding(1.2)
         }
         .clipShape(shape)
-        .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
     }
 }
 
@@ -522,7 +904,7 @@ struct PanelIconFrame: View {
 }
 
 struct MoreActionsMenu: View {
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
     @State private var isShowingActions = false
     @State private var isPressed = false
     @State private var isHovered = false
@@ -563,7 +945,7 @@ struct MoreActionsMenu: View {
 }
 
 struct ActionsPopover: View {
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -603,13 +985,13 @@ struct ActionsPopover: View {
             .buttonStyle(.plain)
         }
         .padding(10)
-        .background(PanelGlassBackground())
+        .background(PanelGlassBackground(role: .actionsPopover))
     }
 }
 
 struct BroadcastIntervalButton: View {
     let minutes: Int
-    @ObservedObject var store: QuotaStore
+    @ObservedObject var store: UsageStore
 
     var body: some View {
         Button {
@@ -707,63 +1089,470 @@ struct SecondaryQuotaRow: View {
     }
 }
 
+enum UsageFreshness: Equatable, Sendable {
+    case live
+    case stale
+    case unavailable
+}
+
+struct UsageSnapshot: Sendable {
+    let quota: QuotaSnapshot
+    let dailyTokens: DailyTokenUsage
+    let dailyTokenDay: Date?
+    let freshness: UsageFreshness
+
+    static let unavailable = UsageSnapshot(
+        quota: .unavailable(),
+        dailyTokens: .zero,
+        dailyTokenDay: nil,
+        freshness: .unavailable
+    )
+}
+
+struct UsageLoadResult: Sendable {
+    let quota: QuotaSnapshot?
+    let dailyTokens: DailyTokenUsage?
+    let isTaskActive: Bool?
+
+    init(
+        quota: QuotaSnapshot?,
+        dailyTokens: DailyTokenUsage?,
+        isTaskActive: Bool? = nil
+    ) {
+        self.quota = quota
+        self.dailyTokens = dailyTokens
+        self.isTaskActive = isTaskActive
+    }
+
+    static let empty = UsageLoadResult(quota: nil, dailyTokens: nil)
+}
+
+protocol UsageLoading: Sendable {
+    func load(now: Date) -> UsageLoadResult
+}
+
+protocol TaskActivityLoading: Sendable {
+    func loadActivity(now: Date) -> Bool?
+}
+
+final class LocalUsageLoader: UsageLoading, TaskActivityLoading, @unchecked Sendable {
+    private let quotaProvider: CompositeQuotaProvider
+    private let tokenProvider: any DailyTokenUsageProviding
+    private let taskActivityProvider: any CodexTaskActivityProviding
+
+    init(
+        quotaProvider: CompositeQuotaProvider = CompositeQuotaProvider(),
+        tokenProvider: any DailyTokenUsageProviding = DailyTokenUsageProvider(),
+        taskActivityProvider: any CodexTaskActivityProviding = CodexTaskActivityProvider()
+    ) {
+        self.quotaProvider = quotaProvider
+        self.tokenProvider = tokenProvider
+        self.taskActivityProvider = taskActivityProvider
+    }
+
+    func load(now: Date) -> UsageLoadResult {
+        let quota = quotaProvider.currentObservation(now: now).map(QuotaSnapshot.init(observation:))
+        let tokens = try? tokenProvider.currentUsage(now: now)
+        return UsageLoadResult(
+            quota: quota,
+            dailyTokens: tokens,
+            isTaskActive: loadActivity(now: now)
+        )
+    }
+
+    func loadActivity(now: Date) -> Bool? {
+        try? taskActivityProvider.currentActivity(now: now)
+    }
+}
+
+protocol UsageScheduledTask: AnyObject, Sendable {
+    func cancel()
+}
+
 @MainActor
-final class QuotaStore: ObservableObject {
-    @Published var snapshot: QuotaSnapshot
+protocol UsageScheduling: AnyObject {
+    func schedule(
+        after delay: TimeInterval,
+        repeating interval: TimeInterval?,
+        action: @escaping @MainActor () -> Void
+    ) -> any UsageScheduledTask
+}
+
+private final class FoundationUsageScheduledTask: UsageScheduledTask, @unchecked Sendable {
+    private let lock = NSLock()
+    private var timer: Timer?
+
+    init(timer: Timer) {
+        self.timer = timer
+    }
+
+    func cancel() {
+        lock.lock()
+        let timerToInvalidate = timer
+        timer = nil
+        lock.unlock()
+        timerToInvalidate?.invalidate()
+    }
+
+    deinit {
+        cancel()
+    }
+}
+
+@MainActor
+private final class FoundationUsageScheduler: UsageScheduling {
+    func schedule(
+        after delay: TimeInterval,
+        repeating interval: TimeInterval?,
+        action: @escaping @MainActor () -> Void
+    ) -> any UsageScheduledTask {
+        let timer = Timer(
+            fire: Date().addingTimeInterval(delay),
+            interval: interval ?? 0,
+            repeats: interval != nil
+        ) { _ in
+            Task { @MainActor in
+                action()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        return FoundationUsageScheduledTask(timer: timer)
+    }
+}
+
+typealias UsageWatcherFactory = (_ onChange: @escaping () -> Void) -> any CodexActivityWatching
+
+@MainActor
+final class UsageStore: ObservableObject {
+    @Published var snapshot: UsageSnapshot
+    @Published private(set) var isTaskActive = false
     @Published var voiceBroadcastEnabled = false
     @Published var voiceBroadcastIntervalMinutes: Int
 
-    private var timer: Timer?
+    private var fallbackTask: (any UsageScheduledTask)?
+    private var debounceTask: (any UsageScheduledTask)?
+    private var activityDebounceTask: (any UsageScheduledTask)?
+    private var midnightTask: (any UsageScheduledTask)?
     private var voiceTimer: Timer?
     private var isRefreshing = false
+    private var refreshPending = false
+    private var isActivityRefreshing = false
+    private var activityRefreshPending = false
+    private var isStarted = false
+    private var lifecycleGeneration: UInt = 0
+    private var debounceGeneration: UInt = 0
+    private var activityDebounceGeneration: UInt = 0
     private var speakAfterRefresh = false
     private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
+    private let activityRefreshQueue = DispatchQueue(label: "com.codexmeter.activity-refresh", qos: .utility)
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var notifiedLevels = Set<Int>()
-    private let provider: QuotaProvider
+    private var lastTaskActivitySuccessAt: Date?
+    private let loader: any UsageLoading
+    private let activityLoader: (any TaskActivityLoading)?
+    private var watcher: CodexActivityWatching?
+    private let createsWatcher: Bool
+    private let debounceInterval: TimeInterval
+    private let fallbackInterval: TimeInterval
+    private let scheduler: any UsageScheduling
+    private let calendar: Calendar
+    private let now: @Sendable () -> Date
+    private let watcherFactory: UsageWatcherFactory
+    private let cacheQuota: (QuotaSnapshot) -> Void
 
-    init(provider: QuotaProvider = CompositeQuotaProvider()) {
-        self.provider = provider
-        self.snapshot = QuotaSnapshot.unavailable()
+    init(
+        cachedQuota: QuotaSnapshot? = nil,
+        cacheQuota: @escaping (QuotaSnapshot) -> Void = { _ in },
+        loader: any UsageLoading = LocalUsageLoader(),
+        watcher: CodexActivityWatching? = nil,
+        debounceInterval: TimeInterval = 0.8,
+        fallbackInterval: TimeInterval = 60,
+        scheduler: any UsageScheduling = FoundationUsageScheduler(),
+        calendar: Calendar = .autoupdatingCurrent,
+        now: @escaping @Sendable () -> Date = Date.init,
+        watcherFactory: @escaping UsageWatcherFactory = {
+            CodexActivityWatcher(onChange: $0)
+        }
+    ) {
+        self.loader = loader
+        self.activityLoader = loader as? any TaskActivityLoading
+        self.watcher = watcher
+        self.createsWatcher = watcher == nil
+        self.debounceInterval = debounceInterval
+        self.fallbackInterval = fallbackInterval
+        self.scheduler = scheduler
+        self.calendar = calendar
+        self.now = now
+        self.watcherFactory = watcherFactory
+        self.cacheQuota = cacheQuota
+        let cachedQuota = cachedQuota ?? .unavailable()
+        self.snapshot = UsageSnapshot(
+            quota: cachedQuota,
+            dailyTokens: .zero,
+            dailyTokenDay: calendar.startOfDay(for: now()),
+            freshness: cachedQuota.isUnavailable ? .unavailable : .stale
+        )
         let savedInterval = UserDefaults.standard.integer(forKey: CacheKey.voiceBroadcastIntervalMinutes)
         self.voiceBroadcastIntervalMinutes = Self.allowedVoiceBroadcastIntervals.contains(savedInterval) ? savedInterval : 1
     }
 
     func start() {
+        guard !isStarted else { return }
+        isStarted = true
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        resetDailyTokensIfDayChanged(at: now())
+
+        if watcher == nil {
+            watcher = watcherFactory { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.isStarted,
+                          self.lifecycleGeneration == generation else {
+                        return
+                    }
+                    self.scheduleActivityRefresh()
+                    self.scheduleRefresh()
+                }
+            }
+        }
+        watcher?.start()
+        refreshActivity()
         refresh()
         requestNotificationPermission()
-        guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
+        fallbackTask = scheduler.schedule(
+            after: fallbackInterval,
+            repeating: fallbackInterval
+        ) { [weak self] in
+            guard let self,
+                  self.isStarted,
+                  self.lifecycleGeneration == generation else {
+                return
             }
+            self.refreshAfterWakeOrUnlock()
+        }
+        scheduleNextLocalMidnight(generation: generation)
+    }
+
+    func stop() {
+        let wasStarted = isStarted
+        lifecycleGeneration &+= 1
+        debounceGeneration &+= 1
+        activityDebounceGeneration &+= 1
+        isStarted = false
+        isRefreshing = false
+        refreshPending = false
+        isActivityRefreshing = false
+        activityRefreshPending = false
+        debounceTask?.cancel()
+        debounceTask = nil
+        activityDebounceTask?.cancel()
+        activityDebounceTask = nil
+        fallbackTask?.cancel()
+        fallbackTask = nil
+        midnightTask?.cancel()
+        midnightTask = nil
+        voiceTimer?.invalidate()
+        voiceTimer = nil
+        speakAfterRefresh = false
+        voiceBroadcastEnabled = false
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        if wasStarted {
+            watcher?.stop()
+        }
+        if createsWatcher {
+            watcher = nil
+        }
+    }
+
+    func scheduleRefresh() {
+        resetDailyTokensIfDayChanged(at: now())
+        debounceTask?.cancel()
+        let generation = lifecycleGeneration
+        debounceGeneration &+= 1
+        let scheduledDebounceGeneration = debounceGeneration
+        debounceTask = scheduler.schedule(after: debounceInterval, repeating: nil) { [weak self] in
+            guard let self,
+                  self.lifecycleGeneration == generation,
+                  self.debounceGeneration == scheduledDebounceGeneration else {
+                return
+            }
+            self.debounceTask = nil
+            self.refresh()
+        }
+    }
+
+    private func scheduleActivityRefresh() {
+        guard activityLoader != nil else { return }
+        activityDebounceTask?.cancel()
+        let generation = lifecycleGeneration
+        activityDebounceGeneration &+= 1
+        let scheduledDebounceGeneration = activityDebounceGeneration
+        activityDebounceTask = scheduler.schedule(after: debounceInterval, repeating: nil) { [weak self] in
+            guard let self,
+                  self.lifecycleGeneration == generation,
+                  self.activityDebounceGeneration == scheduledDebounceGeneration else {
+                return
+            }
+            self.activityDebounceTask = nil
+            self.refreshActivity()
+        }
+    }
+
+    func refreshAfterWakeOrUnlock() {
+        resetDailyTokensIfDayChanged(at: now())
+        watcher?.rebind()
+        refreshActivity()
+        refresh()
+        if isStarted {
+            scheduleNextLocalMidnight(generation: lifecycleGeneration)
         }
     }
 
     func refresh() {
-        guard isRefreshing == false else { return }
+        let loadDate = now()
+        let loadDay = resetDailyTokensIfDayChanged(at: loadDate)
+        guard !isRefreshing else {
+            refreshPending = true
+            return
+        }
         isRefreshing = true
-        let provider = provider
+        let loader = loader
+        let generation = lifecycleGeneration
 
         refreshQueue.async { [weak self] in
-            let liveSnapshot = provider.currentSnapshot()
+            let result = loader.load(now: loadDate)
 
             DispatchQueue.main.async {
-                guard let self else { return }
-                let shouldSpeak = self.speakAfterRefresh
-                self.speakAfterRefresh = false
-                if let liveSnapshot {
-                    self.snapshot = liveSnapshot
-                    liveSnapshot.cache()
-                } else {
-                    self.snapshot = .unavailable()
+                guard let self, self.lifecycleGeneration == generation else { return }
+                let currentDay = self.resetDailyTokensIfDayChanged(at: self.now())
+                let old = self.snapshot
+                let acceptedQuota = result.quota.flatMap { candidate in
+                    old.quota.isUnavailable || candidate.lastUpdated >= old.quota.lastUpdated
+                        ? candidate
+                        : nil
+                }
+                let quota = acceptedQuota ?? old.quota
+                let isCurrentDayLoad = loadDay == currentDay
+                let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
+                let hasFreshQuota = acceptedQuota != nil
+                let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
+                self.applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
+                self.snapshot = UsageSnapshot(
+                    quota: quota,
+                    dailyTokens: tokens,
+                    dailyTokenDay: currentDay,
+                    freshness: hasFreshQuota && hasFreshTokens ? .live : (quota.isUnavailable ? .unavailable : .stale)
+                )
+                if let acceptedQuota {
+                    self.cacheQuota(acceptedQuota)
+                }
+                if !isCurrentDayLoad {
+                    self.refreshPending = true
                 }
                 self.isRefreshing = false
-                self.evaluateNotifications()
-                if shouldSpeak, self.voiceBroadcastEnabled {
-                    self.speak(self.snapshot)
+                self.finishRefreshSideEffects()
+                if self.refreshPending {
+                    self.refreshPending = false
+                    self.refresh()
                 }
             }
+        }
+    }
+
+    private func refreshActivity() {
+        guard let activityLoader else { return }
+        let loadDate = now()
+        guard !isActivityRefreshing else {
+            activityRefreshPending = true
+            return
+        }
+        isActivityRefreshing = true
+        let generation = lifecycleGeneration
+
+        activityRefreshQueue.async { [weak self] in
+            let isTaskActive = activityLoader.loadActivity(now: loadDate)
+
+            DispatchQueue.main.async {
+                guard let self, self.lifecycleGeneration == generation else { return }
+                self.applyTaskActivity(isTaskActive, loadedAt: loadDate)
+                self.isActivityRefreshing = false
+                if self.activityRefreshPending {
+                    self.activityRefreshPending = false
+                    self.refreshActivity()
+                }
+            }
+        }
+    }
+
+    private func applyTaskActivity(_ result: Bool?, loadedAt loadDate: Date) {
+        guard lastTaskActivitySuccessAt.map({ loadDate >= $0 }) ?? true else { return }
+        if let result {
+            isTaskActive = result
+            lastTaskActivitySuccessAt = loadDate
+            return
+        }
+
+        let shouldRetainActive = isTaskActive
+            && lastTaskActivitySuccessAt.map {
+                loadDate.timeIntervalSince($0) < fallbackInterval
+            } == true
+        isTaskActive = shouldRetainActive
+    }
+
+    private func scheduleNextLocalMidnight(generation: UInt) {
+        midnightTask?.cancel()
+        let current = now()
+        let startOfToday = calendar.startOfDay(for: current)
+        guard let nextMidnight = calendar.date(byAdding: .day, value: 1, to: startOfToday) else {
+            midnightTask = nil
+            return
+        }
+        let delay = max(nextMidnight.timeIntervalSince(current), 0)
+        midnightTask = scheduler.schedule(after: delay, repeating: nil) { [weak self] in
+            guard let self,
+                  self.isStarted,
+                  self.lifecycleGeneration == generation else {
+                return
+            }
+            self.midnightTask = nil
+            self.resetDailyTokensIfDayChanged(at: self.now())
+            self.refresh()
+            self.scheduleNextLocalMidnight(generation: generation)
+        }
+    }
+
+    @discardableResult
+    private func resetDailyTokensIfDayChanged(at date: Date) -> Date {
+        let currentDay = calendar.startOfDay(for: date)
+        guard snapshot.dailyTokenDay != currentDay else { return currentDay }
+        let quota = snapshot.quota
+        snapshot = UsageSnapshot(
+            quota: quota,
+            dailyTokens: .zero,
+            dailyTokenDay: currentDay,
+            freshness: quota.isUnavailable ? .unavailable : .stale
+        )
+        return currentDay
+    }
+
+    isolated deinit {
+        debounceTask?.cancel()
+        activityDebounceTask?.cancel()
+        fallbackTask?.cancel()
+        midnightTask?.cancel()
+        voiceTimer?.invalidate()
+        if isStarted {
+            watcher?.stop()
+        }
+    }
+
+    private func finishRefreshSideEffects() {
+        let shouldSpeak = speakAfterRefresh
+        speakAfterRefresh = false
+        evaluateNotifications(snapshot.quota)
+        if shouldSpeak, voiceBroadcastEnabled {
+            speak(snapshot.quota)
         }
     }
 
@@ -783,9 +1572,15 @@ final class QuotaStore: ObservableObject {
 
     private func scheduleVoiceTimer() {
         voiceTimer?.invalidate()
+        let generation = lifecycleGeneration
         voiceTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(voiceBroadcastIntervalMinutes * 60), repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.requestVoiceBroadcast()
+                guard let self,
+                      self.lifecycleGeneration == generation,
+                      self.voiceBroadcastEnabled else {
+                    return
+                }
+                self.requestVoiceBroadcast()
             }
         }
     }
@@ -814,7 +1609,7 @@ final class QuotaStore: ObservableObject {
 
     private func speak(_ snapshot: QuotaSnapshot) {
         guard !snapshot.isUnavailable else { return }
-        let text = "Codex 五小时额度剩余 \(snapshot.remainingPercent)%，距离额度恢复 \(snapshot.resetText)。"
+        let text = "Codex \(snapshot.mainQuotaSpokenName)剩余 \(snapshot.remainingPercent)%，距离额度恢复 \(snapshot.resetText)。"
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
         utterance.rate = 0.48
@@ -822,18 +1617,27 @@ final class QuotaStore: ObservableObject {
         speechSynthesizer.speak(utterance)
     }
 
-    private func evaluateNotifications() {
+    private func evaluateNotifications(_ snapshot: QuotaSnapshot) {
         guard !snapshot.isUnavailable else { return }
         let remaining = snapshot.remainingPercent
 
         if remaining <= 10 {
-            notifyOnce(level: 10, title: "Codex 额度接近耗尽", body: "当前 5h 剩余 \(remaining)%，建议放慢高消耗任务。")
+            notifyOnce(
+                level: 10,
+                title: "Codex 额度接近耗尽",
+                body: "当前 \(snapshot.mainQuotaSpokenName)剩余 \(remaining)%，建议放慢高消耗任务。"
+            )
         } else if remaining <= 20 {
-            notifyOnce(level: 20, title: "Codex 额度偏低", body: "当前 5h 剩余 \(remaining)%，距离额度恢复 \(snapshot.resetText)。")
+            notifyOnce(
+                level: 20,
+                title: "Codex 额度偏低",
+                body: "当前 \(snapshot.mainQuotaSpokenName)剩余 \(remaining)%，距离额度恢复 \(snapshot.resetText)。"
+            )
         }
     }
 
     private func notifyOnce(level: Int, title: String, body: String) {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         guard notifiedLevels.insert(level).inserted else { return }
 
         let content = UNMutableNotificationContent()
@@ -851,100 +1655,157 @@ final class QuotaStore: ObservableObject {
     }
 
     private func requestNotificationPermission() {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     private static let allowedVoiceBroadcastIntervals = [1, 5, 10]
 }
 
-protocol QuotaProvider: Sendable {
-    func currentSnapshot() -> QuotaSnapshot?
+struct ObservedRateLimitWindow: Sendable {
+    let window: RateLimitWindow
+    let observedAt: Date
+    let sourceName: String
 }
 
-struct CompositeQuotaProvider: QuotaProvider {
-    private let logProvider = CodexLogQuotaProvider()
-    private let realProvider = CodexSessionQuotaProvider()
+struct QuotaObservation: Sendable {
+    let windowSet: RateLimitWindowSet
+    let observedAt: Date
+    let sourceName: String
+}
 
-    func currentSnapshot() -> QuotaSnapshot? {
-        logProvider.currentSnapshot() ?? realProvider.currentSnapshot()
+protocol QuotaObservationProviding: Sendable {
+    func currentWindowObservations() -> [ObservedRateLimitWindow]
+}
+
+struct CompositeQuotaProvider: Sendable {
+    private let providers: [any QuotaObservationProviding]
+
+    init(providers: [any QuotaObservationProviding] = [
+        CodexLogQuotaProvider(),
+        CodexSessionQuotaProvider()
+    ]) {
+        self.providers = providers
     }
-}
 
-struct CodexLogQuotaProvider {
-    func currentSnapshot() -> QuotaSnapshot? {
-        guard let record = newestHeaderRateLimitRecord() else {
+    func currentObservation(now: Date = Date()) -> QuotaObservation? {
+        for provider in providers {
+            if let observation = Self.merge(provider.currentWindowObservations(), now: now) {
+                return observation
+            }
+        }
+        return nil
+    }
+
+    static func merge(_ candidates: [ObservedRateLimitWindow], now: Date) -> QuotaObservation? {
+        let selected = RateLimitWindowReducer.bestWindows(from: candidates, now: now)
+        guard let newest = selected.max(by: RateLimitWindowReducer.observationPrecedes) else {
             return nil
         }
-
-        let now = Date()
-        let primaryUsed = Self.percent(record.primary.usedPercent)
-        let weeklyUsed = Self.percent(record.secondary.usedPercent)
-        return QuotaSnapshot(
-            remainingPercent: max(0, min(100, 100 - primaryUsed)),
-            weeklyRemainingPercent: max(0, min(100, 100 - weeklyUsed)),
-            resetDate: Date(timeIntervalSince1970: record.primary.resetsAt),
-            weeklyResetDate: Date(timeIntervalSince1970: record.secondary.resetsAt),
-            lastUpdated: now,
-            sourceName: "Codex 日志",
-            isUnavailable: false
+        let sourceNames = Set(selected.map(\.sourceName))
+        return QuotaObservation(
+            windowSet: RateLimitWindowSet(windows: selected.map(\.window), now: now),
+            observedAt: newest.observedAt,
+            sourceName: sourceNames.count == 1 ? newest.sourceName : "本机日志"
         )
     }
+}
 
-    private func newestHeaderRateLimitRecord() -> RateLimitRecord? {
-        let databaseURL = FileManager.default.homeDirectoryForCurrentUser
+struct CodexLogQuotaProvider: QuotaObservationProviding {
+    private let databaseURL: URL
+
+    init(
+        databaseURL: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/logs_2.sqlite")
-        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
-            return nil
-        }
+    ) {
+        self.databaseURL = databaseURL
+    }
 
-        let query = """
-        select ts || char(9) || feedback_log_body from logs
-        where feedback_log_body like '%x-codex-primary-used-percent%'
-        order by ts desc, ts_nanos desc, id desc
-        limit 1;
-        """
-        guard let output = runSQLite(databasePath: databaseURL.path, query: query) else {
-            return nil
-        }
-
-        let parts = output.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              let timestamp = TimeInterval(parts[0]),
-              let primaryUsed = Self.headerDouble("x-codex-primary-used-percent", in: String(parts[1])),
-              let weeklyUsed = Self.headerDouble("x-codex-secondary-used-percent", in: String(parts[1])),
-              let primaryResetAt = Self.headerDouble("x-codex-primary-reset-at", in: String(parts[1])),
-              let weeklyResetAt = Self.headerDouble("x-codex-secondary-reset-at", in: String(parts[1])),
-              let primaryWindowMinutes = Self.headerInt("x-codex-primary-window-minutes", in: String(parts[1])),
-              let weeklyWindowMinutes = Self.headerInt("x-codex-secondary-window-minutes", in: String(parts[1])) else {
-            return nil
-        }
-
-        let now = Date().timeIntervalSince1970
-        guard primaryResetAt > now, weeklyResetAt > now else {
-            return nil
-        }
-
-        return RateLimitRecord(
-            timestamp: Date(timeIntervalSince1970: timestamp),
-            fileModifiedAt: Date(timeIntervalSince1970: timestamp),
-            primary: RateLimitWindow(
-                usedPercent: primaryUsed,
-                resetsAt: primaryResetAt,
-                windowMinutes: primaryWindowMinutes
+    func currentWindowObservations() -> [ObservedRateLimitWindow] {
+        let now = Date()
+        return RateLimitWindowReducer.bestWindows(
+            from: RateLimitWindowReducer.observations(
+                from: recentHeaderRateLimitRecords(now: now),
+                sourceName: "Codex 日志"
             ),
-            secondary: RateLimitWindow(
-                usedPercent: weeklyUsed,
-                resetsAt: weeklyResetAt,
-                windowMinutes: weeklyWindowMinutes
-            )
+            now: now
         )
     }
 
-    private func runSQLite(databasePath: String, query: String) -> String? {
+    private func recentHeaderRateLimitRecords(now: Date) -> [RateLimitRecord] {
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            return []
+        }
+
+        let lowerBound = String(
+            format: "%.3f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            QuotaHistoryBounds.lowerBound(for: now).timeIntervalSince1970
+        )
+        let query = """
+        select ts, feedback_log_body from logs
+        where target = 'codex_http_client::client'
+          and ts >= \(lowerBound)
+          and (
+            feedback_log_body like '%x-codex-primary-used-percent%'
+            or feedback_log_body like '%x-codex-secondary-used-percent%'
+          )
+        order by ts desc, ts_nanos desc, id desc;
+        """
+        guard let rows = runSQLiteRows(databasePath: databaseURL.path, query: query) else {
+            return []
+        }
+
+        return rows.compactMap { row in
+            Self.parseHeaderRecord(
+                timestamp: row.ts,
+                text: row.feedbackLogBody,
+                now: now
+            )
+        }
+    }
+
+    static func parseHeaderRecord(
+        timestamp: TimeInterval,
+        text: String,
+        now: Date
+    ) -> RateLimitRecord? {
+        guard RateLimitWindow.isRepresentableEpoch(timestamp) else { return nil }
+        let windows = [
+            headerWindow(prefix: "primary", in: text),
+            headerWindow(prefix: "secondary", in: text)
+        ].compactMap { $0 }
+        let windowSet = RateLimitWindowSet(windows: windows, now: now)
+        guard !windowSet.isEmpty else { return nil }
+
+        let date = Date(timeIntervalSince1970: timestamp)
+        return RateLimitRecord(
+            timestamp: date,
+            fileModifiedAt: date,
+            windowSet: windowSet
+        )
+    }
+
+    private static func headerWindow(prefix: String, in text: String) -> RateLimitWindow? {
+        guard let usedPercent = headerDouble("x-codex-\(prefix)-used-percent", in: text),
+              let resetsAt = headerDouble("x-codex-\(prefix)-reset-at", in: text),
+              let windowMinutes = headerInt("x-codex-\(prefix)-window-minutes", in: text) else {
+            return nil
+        }
+
+        let window = RateLimitWindow(
+            usedPercent: usedPercent,
+            resetsAt: resetsAt,
+            windowMinutes: windowMinutes
+        )
+        return window.isValid ? window : nil
+    }
+
+    private func runSQLiteRows(databasePath: String, query: String) -> [SQLiteLogRow]? {
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        process.arguments = ["-readonly", databasePath, query]
+        process.arguments = ["-readonly", "-json", databasePath, query]
         process.standardOutput = output
         process.standardError = Pipe()
 
@@ -954,14 +1815,10 @@ struct CodexLogQuotaProvider {
             return nil
         }
 
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            return nil
-        }
-
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return try? JSONDecoder().decode([SQLiteLogRow].self, from: data)
     }
 
     private static func headerDouble(_ name: String, in text: String) -> Double? {
@@ -986,159 +1843,263 @@ struct CodexLogQuotaProvider {
         return String(text[valueStart..<valueEnd])
     }
 
-    private static func percent(_ value: Double) -> Int {
-        Int(value.rounded())
+    private struct SQLiteLogRow: Decodable {
+        let ts: Double
+        let feedbackLogBody: String
+
+        private enum CodingKeys: String, CodingKey {
+            case ts
+            case feedbackLogBody = "feedback_log_body"
+        }
     }
 }
 
-struct CodexSessionQuotaProvider {
-    func currentSnapshot() -> QuotaSnapshot? {
-        guard let record = newestRateLimitRecord() else {
-            return nil
-        }
+struct CodexSessionQuotaProvider: QuotaObservationProviding {
+    private let roots: [URL]
+    private let maxBytesPerFile: UInt64
+    private let maxTotalBytes: UInt64
+    private let fileDiscovery: any SessionFileDiscovering
+    private let now: @Sendable () -> Date
 
-        let now = Date()
-        let primaryUsed = Self.percent(record.primary.usedPercent)
-        let weeklyUsed = Self.percent(record.secondary.usedPercent)
-        let primaryRemaining = max(0, min(100, 100 - primaryUsed))
-        let weeklyRemaining = max(0, min(100, 100 - weeklyUsed))
-
-        return QuotaSnapshot(
-            remainingPercent: primaryRemaining,
-            weeklyRemainingPercent: weeklyRemaining,
-            resetDate: Date(timeIntervalSince1970: record.primary.resetsAt),
-            weeklyResetDate: Date(timeIntervalSince1970: record.secondary.resetsAt),
-            lastUpdated: now,
-            sourceName: "Codex 会话",
-            isUnavailable: false
-        )
-    }
-
-    private func newestRateLimitRecord() -> RateLimitRecord? {
-        let roots = [
+    init(
+        roots: [URL]? = nil,
+        maxBytesPerFile: UInt64 = 64 * 1_024 * 1_024,
+        maxTotalBytes: UInt64 = 256 * 1_024 * 1_024,
+        fileDiscovery: (any SessionFileDiscovering)? = nil,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.roots = roots ?? [
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
         ]
+        self.maxBytesPerFile = maxBytesPerFile
+        self.maxTotalBytes = maxTotalBytes
+        self.fileDiscovery = fileDiscovery ?? LocalSessionFileDiscovery()
+        self.now = now
+    }
 
-        let files = roots.flatMap { recentJSONLFiles(under: $0) }
-            .sorted { $0.modifiedAt > $1.modifiedAt }
-            .prefix(80)
+    func currentWindowObservations() -> [ObservedRateLimitWindow] {
+        let currentDate = now()
+        guard let records = recentRateLimitRecords(now: currentDate) else {
+            return []
+        }
+        return RateLimitWindowReducer.bestWindows(
+            from: RateLimitWindowReducer.observations(
+                from: records,
+                sourceName: "Codex 会话"
+            ),
+            now: currentDate
+        )
+    }
+
+    private func recentRateLimitRecords(now: Date) -> [RateLimitRecord]? {
+        let lowerBound = QuotaHistoryBounds.lowerBound(for: now)
+        let files: [SessionFile]
+        do {
+            files = try deduplicatedSessionFiles(overlapping: lowerBound)
+        } catch {
+            return nil
+        }
+        let filesToScan = filesWithinScanBudget(files)
 
         var records: [RateLimitRecord] = []
+        for file in filesToScan {
+            guard let fileRecords = rateLimitRecords(
+                in: file.url,
+                expectedByteCount: file.byteCount,
+                fileModifiedAt: file.modifiedAt,
+                now: now,
+                lowerBound: lowerBound
+            ) else {
+                return nil
+            }
+            records.append(contentsOf: fileRecords)
+        }
+
+        return records
+    }
+
+    private func filesWithinScanBudget(_ files: [SessionFile]) -> [SessionFile] {
+        var selected: [SessionFile] = []
+        var totalBytes: UInt64 = 0
+
         for file in files {
-            records.append(contentsOf: rateLimitRecords(in: file.url, fileModifiedAt: file.modifiedAt))
-            if let newestRecord = records.map(\.sortDate).max(),
-               Date().timeIntervalSince(newestRecord) < 15 * 60,
-               file.modifiedAt < newestRecord.addingTimeInterval(-15 * 60) {
-                break
-            }
-        }
-
-        return bestRateLimitRecord(from: records)
-    }
-
-    private func recentJSONLFiles(under root: URL) -> [SessionFile] {
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        var files: [SessionFile] = []
-        for case let url as URL in enumerator {
-            guard url.pathExtension == "jsonl" else { continue }
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
-                  values.isRegularFile == true,
-                  let modifiedAt = values.contentModificationDate else {
+            guard file.byteCount <= maxBytesPerFile,
+                  file.byteCount <= maxTotalBytes,
+                  totalBytes <= maxTotalBytes - file.byteCount else {
                 continue
             }
-            files.append(SessionFile(url: url, modifiedAt: modifiedAt))
+            selected.append(file)
+            totalBytes += file.byteCount
         }
-        return files
+        return selected
     }
 
-    private func rateLimitRecords(in url: URL, fileModifiedAt: Date) -> [RateLimitRecord] {
-        guard let text = readTailText(from: url) else {
-            return []
+    private func deduplicatedSessionFiles(overlapping lowerBound: Date) throws -> [SessionFile] {
+        var candidates: [SessionFile] = []
+        for root in roots {
+            candidates.append(contentsOf: try fileDiscovery.recentJSONLFiles(under: root))
+        }
+        candidates = candidates.filter { $0.modifiedAt >= lowerBound }
+        var filesByRolloutName: [String: SessionFile] = [:]
+
+        for candidate in candidates {
+            let rolloutName = candidate.url.lastPathComponent
+            guard let existing = filesByRolloutName[rolloutName] else {
+                filesByRolloutName[rolloutName] = candidate
+                continue
+            }
+            if candidate.modifiedAt > existing.modifiedAt
+                || (candidate.modifiedAt == existing.modifiedAt
+                    && candidate.url.path < existing.url.path) {
+                filesByRolloutName[rolloutName] = candidate
+            }
         }
 
+        return filesByRolloutName.values.sorted { lhs, rhs in
+            if lhs.modifiedAt != rhs.modifiedAt {
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
+            return lhs.url.path < rhs.url.path
+        }
+    }
+
+    private func rateLimitRecords(
+        in url: URL,
+        expectedByteCount: UInt64,
+        fileModifiedAt: Date,
+        now: Date,
+        lowerBound: Date
+    ) -> [RateLimitRecord]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        let chunkSize = 64 * 1_024
         var records: [RateLimitRecord] = []
-        for line in text.split(separator: "\n").reversed() {
-            guard line.contains("\"rate_limits\"") else { continue }
-            guard let data = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = object["payload"] as? [String: Any],
-                  let rateLimits = payload["rate_limits"] as? [String: Any],
-                  Self.isAggregateCodexLimit(rateLimits),
-                  let primary = parseWindow(rateLimits["primary"]),
-                  let secondary = parseWindow(rateLimits["secondary"]),
-                  primary.windowMinutes == 300,
-                  secondary.windowMinutes == 10_080 else {
-                continue
+        var earlierOffset: UInt64
+        do {
+            earlierOffset = try handle.seekToEnd()
+        } catch {
+            return nil
+        }
+        guard earlierOffset == expectedByteCount else { return nil }
+        var laterFragment = Data()
+
+        while earlierOffset > 0 {
+            let byteCount = Int(min(UInt64(chunkSize), earlierOffset))
+            earlierOffset -= UInt64(byteCount)
+
+            let chunk: Data
+            do {
+                try handle.seek(toOffset: earlierOffset)
+                chunk = try handle.read(upToCount: byteCount) ?? Data()
+            } catch {
+                return nil
+            }
+            guard chunk.count == byteCount else { return nil }
+
+            var combined = chunk
+            combined.append(laterFragment)
+            let fragments = combined.split(separator: 0x0A, omittingEmptySubsequences: false)
+            let firstCompleteIndex: Int
+            if earlierOffset > 0 {
+                if let firstFragment = fragments.first {
+                    laterFragment = Data(firstFragment)
+                } else {
+                    laterFragment = Data()
+                }
+                firstCompleteIndex = 1
+            } else {
+                laterFragment = Data()
+                firstCompleteIndex = 0
             }
 
-            records.append(
-                RateLimitRecord(
-                    timestamp: parseDate(object["timestamp"] as? String),
+            guard firstCompleteIndex < fragments.count else { continue }
+            for fragment in fragments[firstCompleteIndex...].reversed() {
+                guard !fragment.isEmpty else { continue }
+                guard fragment.range(of: rateLimitsMarker) != nil else { continue }
+                let line = String(decoding: fragment, as: UTF8.self)
+                guard let record = Self.parseRecord(
+                    line: line,
                     fileModifiedAt: fileModifiedAt,
-                    primary: primary,
-                    secondary: secondary
-                )
-            )
-            if records.count >= 40 {
-                break
+                    now: now
+                ), record.sortDate >= lowerBound else { continue }
+                records.append(record)
             }
         }
 
         return records
     }
 
-    private func bestRateLimitRecord(from records: [RateLimitRecord]) -> RateLimitRecord? {
-        let now = Date().timeIntervalSince1970
-        let currentWindowRecords = records.filter { record in
-            record.primary.resetsAt > now && record.secondary.resetsAt > now
-        }
-
-        return currentWindowRecords.max { lhs, rhs in
-            lhs.sortDate < rhs.sortDate
-        }
-    }
-
-    private func readTailText(from url: URL, maxBytes: UInt64 = 4 * 1024 * 1024) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
-        }
-        defer {
-            try? handle.close()
-        }
-
-        let fileSize = (try? handle.seekToEnd()) ?? 0
-        let offset = fileSize > maxBytes ? fileSize - maxBytes : 0
-        try? handle.seek(toOffset: offset)
-
-        guard let data = try? handle.readToEnd() else {
+    static func parseRecord(
+        line: String,
+        fileModifiedAt: Date,
+        now: Date
+    ) -> RateLimitRecord? {
+        guard let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let timestamp = parseDate(object["timestamp"] as? String),
+              let payload = object["payload"] as? [String: Any],
+              let rateLimits = payload["rate_limits"] as? [String: Any],
+              isAggregateCodexLimit(rateLimits) else {
             return nil
         }
 
-        return String(decoding: data, as: UTF8.self)
+        let windows = [
+            parseWindow(rateLimits["primary"]),
+            parseWindow(rateLimits["secondary"])
+        ].compactMap { $0 }
+        let windowSet = RateLimitWindowSet(windows: windows, now: now)
+        guard !windowSet.isEmpty else { return nil }
+
+        return RateLimitRecord(
+            timestamp: timestamp,
+            fileModifiedAt: fileModifiedAt,
+            windowSet: windowSet
+        )
     }
 
-    private func parseWindow(_ value: Any?) -> RateLimitWindow? {
+    static func bestRateLimitRecord(
+        from records: [RateLimitRecord],
+        now: Date
+    ) -> RateLimitRecord? {
+        let selected = RateLimitWindowReducer.bestWindows(
+            from: RateLimitWindowReducer.observations(
+                from: records,
+                sourceName: "Codex 会话"
+            ),
+            now: now
+        )
+        let windowSet = RateLimitWindowSet(windows: selected.map(\.window), now: now)
+        guard !windowSet.isEmpty,
+              let newest = selected.max(by: RateLimitWindowReducer.observationPrecedes) else {
+            return nil
+        }
+
+        return RateLimitRecord(
+            timestamp: newest.observedAt,
+            fileModifiedAt: newest.observedAt,
+            windowSet: windowSet
+        )
+    }
+
+    private let rateLimitsMarker = Data("\"rate_limits\"".utf8)
+
+    private static func parseWindow(_ value: Any?) -> RateLimitWindow? {
         guard let dictionary = value as? [String: Any],
               let usedPercent = Self.double(dictionary["used_percent"]),
               let resetsAt = Self.double(dictionary["resets_at"]) else {
             return nil
         }
-        return RateLimitWindow(
+        let window = RateLimitWindow(
             usedPercent: usedPercent,
             resetsAt: resetsAt,
             windowMinutes: Self.int(dictionary["window_minutes"])
         )
+        return window.isValid ? window : nil
     }
 
-    private func parseDate(_ value: String?) -> Date? {
+    private static func parseDate(_ value: String?) -> Date? {
         guard let value else { return nil }
         let fractionalFormatter = ISO8601DateFormatter()
         fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1151,82 +2112,510 @@ struct CodexSessionQuotaProvider {
         return formatter.date(from: value)
     }
 
-    private static func percent(_ value: Double) -> Int {
-        Int(value.rounded())
-    }
-
     private static func isAggregateCodexLimit(_ rateLimits: [String: Any]) -> Bool {
         (rateLimits["limit_id"] as? String) == "codex"
     }
 
     private static func double(_ value: Any?) -> Double? {
+        guard !isJSONBoolean(value) else { return nil }
+        let result: Double?
         if let double = value as? Double {
-            return double
+            result = double
+        } else if let int = value as? Int {
+            result = Double(int)
+        } else if let string = value as? String {
+            result = Double(string)
+        } else {
+            result = nil
         }
-        if let int = value as? Int {
-            return Double(int)
-        }
-        if let string = value as? String {
-            return Double(string)
-        }
-        return nil
+        guard let result, result.isFinite else { return nil }
+        return result
     }
 
     private static func int(_ value: Any?) -> Int? {
+        guard !isJSONBoolean(value) else { return nil }
         if let int = value as? Int {
             return int
         }
         if let double = value as? Double {
-            return Int(double)
+            return Int(exactly: double)
         }
         if let string = value as? String {
             return Int(string)
         }
         return nil
     }
+
+    private static func isJSONBoolean(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
+    }
 }
 
-private struct SessionFile {
+private enum QuotaHistoryBounds {
+    static let tolerance: TimeInterval = 6 * 60 * 60
+    static let maximumWindowDuration = TimeInterval(QuotaWindowKind.weekly.rawValue * 60)
+
+    static func lowerBound(for now: Date) -> Date {
+        now.addingTimeInterval(-(maximumWindowDuration + tolerance))
+    }
+}
+
+private enum RateLimitWindowReducer {
+    private static let resetDriftToleranceSeconds: Int64 = 60
+
+    static func observations(
+        from records: [RateLimitRecord],
+        sourceName: String
+    ) -> [ObservedRateLimitWindow] {
+        records.flatMap { record in
+            [record.windowSet.fiveHour, record.windowSet.weekly].compactMap { window in
+                window.map {
+                    ObservedRateLimitWindow(
+                        window: $0,
+                        observedAt: record.sortDate,
+                        sourceName: sourceName
+                    )
+                }
+            }
+        }
+    }
+
+    static func bestWindows(
+        from candidates: [ObservedRateLimitWindow],
+        now: Date
+    ) -> [ObservedRateLimitWindow] {
+        let active = candidates.filter {
+            $0.window.kind != nil
+                && $0.window.canonicalResetEpochSecond != nil
+                && $0.window.resetsAt > now.timeIntervalSince1970
+        }
+
+        return QuotaWindowKind.allCases.compactMap { kind in
+            let candidatesForKind = active.filter { $0.window.kind == kind }
+            guard let newestReset = candidatesForKind.compactMap({
+                $0.window.canonicalResetEpochSecond
+            }).max() else {
+                return nil
+            }
+            let sameResetCycle = candidatesForKind.filter {
+                guard let reset = $0.window.canonicalResetEpochSecond else { return false }
+                return newestReset - reset <= resetDriftToleranceSeconds
+            }
+            guard let highestUsage = sameResetCycle.max(by: usagePrecedes),
+                  let latestObservation = sameResetCycle.max(by: observationPrecedes),
+                  let latestReset = latestObservation.window.canonicalResetEpochSecond else {
+                return nil
+            }
+            return ObservedRateLimitWindow(
+                window: RateLimitWindow(
+                    usedPercent: highestUsage.window.usedPercent,
+                    resetsAt: Double(latestReset),
+                    windowMinutes: latestObservation.window.windowMinutes
+                ),
+                observedAt: latestObservation.observedAt,
+                sourceName: latestObservation.sourceName
+            )
+        }
+    }
+
+    static func observationPrecedes(
+        _ lhs: ObservedRateLimitWindow,
+        _ rhs: ObservedRateLimitWindow
+    ) -> Bool {
+        if lhs.observedAt != rhs.observedAt {
+            return lhs.observedAt < rhs.observedAt
+        }
+        if lhs.window.canonicalResetEpochSecond != rhs.window.canonicalResetEpochSecond {
+            return (lhs.window.canonicalResetEpochSecond ?? .min)
+                < (rhs.window.canonicalResetEpochSecond ?? .min)
+        }
+
+        let lhsPriority = sourcePriority(lhs.sourceName)
+        let rhsPriority = sourcePriority(rhs.sourceName)
+        if lhsPriority != rhsPriority {
+            return lhsPriority < rhsPriority
+        }
+        if lhs.sourceName != rhs.sourceName {
+            return lhs.sourceName < rhs.sourceName
+        }
+        return lhs.window.usedPercent < rhs.window.usedPercent
+    }
+
+    private static func usagePrecedes(
+        _ lhs: ObservedRateLimitWindow,
+        _ rhs: ObservedRateLimitWindow
+    ) -> Bool {
+        if lhs.window.usedPercent != rhs.window.usedPercent {
+            return lhs.window.usedPercent < rhs.window.usedPercent
+        }
+        return observationPrecedes(lhs, rhs)
+    }
+
+    private static func sourcePriority(_ sourceName: String) -> Int {
+        switch sourceName {
+        case "Codex 日志":
+            return 2
+        case "Codex 会话":
+            return 1
+        default:
+            return 0
+        }
+    }
+}
+
+protocol SessionFileDiscovering: Sendable {
+    func recentJSONLFiles(under root: URL) throws -> [SessionFile]
+}
+
+final class LocalSessionFileDiscovery: SessionFileDiscovering, @unchecked Sendable {
+    typealias EnumeratorFactory = (
+        URL,
+        [URLResourceKey],
+        @escaping (URL, Error) -> Bool
+    ) -> FileManager.DirectoryEnumerator?
+
+    private let fileManager: FileManager
+    private let enumeratorFactory: EnumeratorFactory
+
+    init(
+        fileManager: FileManager = .default,
+        enumeratorFactory: EnumeratorFactory? = nil
+    ) {
+        self.fileManager = fileManager
+        self.enumeratorFactory = enumeratorFactory ?? { root, keys, errorHandler in
+            fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles],
+                errorHandler: errorHandler
+            )
+        }
+    }
+
+    func recentJSONLFiles(under root: URL) throws -> [SessionFile] {
+        guard try directoryExists(at: root) else { return [] }
+        let keys: [URLResourceKey] = [
+            .contentModificationDateKey,
+            .isRegularFileKey,
+            .fileSizeKey
+        ]
+        var traversalError: Error?
+        guard let enumerator = enumeratorFactory(root, keys, { _, error in
+            traversalError = error
+            return false
+        }) else {
+            throw SessionFileDiscoveryError.cannotEnumerateRoot(root)
+        }
+
+        var files: [SessionFile] = []
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            let attributes = try fileManager.attributesOfItem(atPath: url.path)
+            guard let fileType = attributes[.type] as? FileAttributeType else {
+                throw SessionFileDiscoveryError.missingRequiredMetadata(url)
+            }
+            guard fileType == .typeRegular else { continue }
+            guard let modifiedAt = attributes[.modificationDate] as? Date,
+                  let fileSize = attributes[.size] as? NSNumber,
+                  fileSize.int64Value >= 0 else {
+                throw SessionFileDiscoveryError.missingRequiredMetadata(url)
+            }
+            files.append(SessionFile(
+                url: url,
+                modifiedAt: modifiedAt,
+                byteCount: fileSize.uint64Value
+            ))
+        }
+        if let traversalError {
+            throw traversalError
+        }
+        return files
+    }
+
+    private func directoryExists(at root: URL) throws -> Bool {
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try fileManager.attributesOfItem(atPath: root.path)
+        } catch {
+            let cocoaError = error as NSError
+            if cocoaError.domain == NSCocoaErrorDomain,
+               [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(cocoaError.code) {
+                return false
+            }
+            throw error
+        }
+        guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+            throw SessionFileDiscoveryError.rootIsNotDirectory(root)
+        }
+        return true
+    }
+}
+
+enum SessionFileDiscoveryError: Error {
+    case cannotEnumerateRoot(URL)
+    case missingRequiredMetadata(URL)
+    case rootIsNotDirectory(URL)
+}
+
+struct SessionFile: Sendable {
     let url: URL
     let modifiedAt: Date
+    let byteCount: UInt64
 }
 
-private struct RateLimitRecord {
+struct RateLimitRecord {
     let timestamp: Date?
     let fileModifiedAt: Date
-    let primary: RateLimitWindow
-    let secondary: RateLimitWindow
+    let windowSet: RateLimitWindowSet
+
+    init(timestamp: Date?, fileModifiedAt: Date, windowSet: RateLimitWindowSet) {
+        self.timestamp = timestamp
+        self.fileModifiedAt = fileModifiedAt
+        self.windowSet = windowSet
+    }
+
+    init(
+        timestamp: Date?,
+        fileModifiedAt: Date,
+        primary: RateLimitWindow,
+        secondary: RateLimitWindow
+    ) {
+        self.init(
+            timestamp: timestamp,
+            fileModifiedAt: fileModifiedAt,
+            windowSet: RateLimitWindowSet(windows: [primary, secondary], now: Date())
+        )
+    }
+
+    var primary: RateLimitWindow {
+        windowSet.fiveHour ?? windowSet.weekly!
+    }
+
+    var secondary: RateLimitWindow {
+        windowSet.weekly ?? windowSet.fiveHour!
+    }
 
     var sortDate: Date {
         timestamp ?? fileModifiedAt
     }
 }
 
-private struct RateLimitWindow {
+enum QuotaWindowKind: Int, CaseIterable, Sendable {
+    case fiveHour = 300
+    case weekly = 10_080
+
+    var displayLabel: String {
+        switch self {
+        case .fiveHour:
+            return "5 小时剩余"
+        case .weekly:
+            return "7 天剩余"
+        }
+    }
+
+    var spokenName: String {
+        switch self {
+        case .fiveHour:
+            return "五小时额度"
+        case .weekly:
+            return "七天额度"
+        }
+    }
+}
+
+struct RateLimitWindow: Sendable {
+    private static let maximumExactlyRepresentableInteger = 9_007_199_254_740_991.0
+
     let usedPercent: Double
     let resetsAt: Double
     let windowMinutes: Int?
+
+    var isValid: Bool {
+        // Ingress is intentionally strict: quota usage is 0...100 and only
+        // the two window durations rendered by the app are accepted.
+        usedPercent.isFinite
+            && (0...100).contains(usedPercent)
+            && Self.isRepresentableEpoch(resetsAt)
+            && windowMinutes.flatMap(QuotaWindowKind.init(rawValue:)) != nil
+    }
+
+    static func isRepresentableEpoch(_ value: Double) -> Bool {
+        value.isFinite && value >= 0 && value <= maximumExactlyRepresentableInteger
+    }
+
+    var kind: QuotaWindowKind? {
+        windowMinutes.flatMap { QuotaWindowKind(rawValue: $0) }
+    }
+
+    var canonicalResetEpochSecond: Int64? {
+        guard Self.isRepresentableEpoch(resetsAt) else { return nil }
+        return Int64(resetsAt.rounded(.toNearestOrAwayFromZero))
+    }
 }
 
-struct QuotaSnapshot {
-    var remainingPercent: Int
-    var weeklyRemainingPercent: Int
-    var resetDate: Date
-    var weeklyResetDate: Date
-    var lastUpdated: Date
-    var sourceName: String
-    var isUnavailable: Bool
+struct RateLimitWindowSet: Sendable {
+    let fiveHour: RateLimitWindow?
+    let weekly: RateLimitWindow?
+
+    init(windows: [RateLimitWindow], now: Date) {
+        let active = windows.filter { $0.isValid && $0.resetsAt > now.timeIntervalSince1970 }
+        fiveHour = active.last { $0.kind == .fiveHour }
+        weekly = active.last { $0.kind == .weekly }
+    }
+
+    var isEmpty: Bool {
+        fiveHour == nil && weekly == nil
+    }
+}
+
+struct QuotaWindowSnapshot: Sendable {
+    let kind: QuotaWindowKind
+    let remainingPercent: Int
+    let resetDate: Date
+
+    init(kind: QuotaWindowKind, remainingPercent: Int, resetDate: Date) {
+        self.kind = kind
+        self.remainingPercent = max(0, min(100, remainingPercent))
+        self.resetDate = resetDate
+    }
+
+    init?(window: RateLimitWindow) {
+        guard window.isValid, let kind = window.kind else { return nil }
+        let usedPercent = Int(window.usedPercent.rounded())
+        self.init(
+            kind: kind,
+            remainingPercent: 100 - usedPercent,
+            resetDate: Date(timeIntervalSince1970: window.resetsAt)
+        )
+    }
+}
+
+enum QuotaColorBand: Equatable {
+    case critical
+    case warning
+    case healthy
+
+    init(remainingPercent: Int) {
+        switch remainingPercent {
+        case 0...20:
+            self = .critical
+        case 21...50:
+            self = .warning
+        default:
+            self = .healthy
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .critical:
+            return .red
+        case .warning:
+            return .orange
+        case .healthy:
+            return .green
+        }
+    }
+
+    var tagBackgroundColor: NSColor {
+        switch self {
+        case .critical:
+            return NSColor(calibratedRed: 1.0, green: 0.784, blue: 0.780, alpha: 0.92)
+        case .warning:
+            return NSColor(calibratedRed: 1.000, green: 0.820, blue: 0.550, alpha: 0.94)
+        case .healthy:
+            return NSColor(calibratedRed: 0.722, green: 0.953, blue: 0.820, alpha: 0.92)
+        }
+    }
+
+    var tagTextColor: NSColor {
+        switch self {
+        case .critical:
+            return NSColor(calibratedRed: 0.290, green: 0.071, blue: 0.075, alpha: 1)
+        case .warning:
+            return NSColor(calibratedRed: 0.400, green: 0.200, blue: 0.000, alpha: 1)
+        case .healthy:
+            return NSColor(calibratedRed: 0.063, green: 0.247, blue: 0.157, alpha: 1)
+        }
+    }
+}
+
+struct QuotaSnapshot: Sendable {
+    let mainWindow: QuotaWindowSnapshot?
+    let weeklyWindow: QuotaWindowSnapshot?
+    let lastUpdated: Date
+    let sourceName: String
+
+    init(record: RateLimitRecord, sourceName: String, lastUpdated: Date) {
+        let fiveHour = record.windowSet.fiveHour.flatMap(QuotaWindowSnapshot.init(window:))
+        let weekly = record.windowSet.weekly.flatMap(QuotaWindowSnapshot.init(window:))
+
+        self.mainWindow = fiveHour ?? weekly
+        self.weeklyWindow = fiveHour == nil ? nil : weekly
+        self.lastUpdated = lastUpdated
+        self.sourceName = sourceName
+    }
+
+    init(observation: QuotaObservation) {
+        self.init(
+            record: RateLimitRecord(
+                timestamp: observation.observedAt,
+                fileModifiedAt: observation.observedAt,
+                windowSet: observation.windowSet
+            ),
+            sourceName: observation.sourceName,
+            lastUpdated: observation.observedAt
+        )
+    }
+
+    private init(
+        mainWindow: QuotaWindowSnapshot?,
+        weeklyWindow: QuotaWindowSnapshot?,
+        lastUpdated: Date,
+        sourceName: String
+    ) {
+        self.mainWindow = mainWindow
+        self.weeklyWindow = weeklyWindow
+        self.lastUpdated = lastUpdated
+        self.sourceName = sourceName
+    }
+
+    var isUnavailable: Bool {
+        mainWindow == nil
+    }
+
+    var remainingPercent: Int {
+        mainWindow?.remainingPercent ?? 0
+    }
+
+    var weeklyRemainingPercent: Int {
+        weeklyWindow?.remainingPercent ?? 0
+    }
+
+    var mainQuotaLabel: String {
+        mainWindow?.kind.displayLabel ?? "额度未获取"
+    }
+
+    var mainQuotaSpokenName: String {
+        mainWindow?.kind.spokenName ?? "Codex 额度"
+    }
+
+    var showsWeeklySecondary: Bool {
+        mainWindow?.kind == .fiveHour && weeklyWindow != nil
+    }
 
     var percentText: String {
-        isUnavailable ? "—" : "\(remainingPercent)%"
+        guard let mainWindow else { return "—" }
+        return "\(mainWindow.remainingPercent)%"
     }
 
     var weeklyPercentText: String {
-        isUnavailable ? "—" : "\(weeklyRemainingPercent)%"
+        guard let weeklyWindow else { return "—" }
+        return "\(weeklyWindow.remainingPercent)%"
     }
 
     var displayRemainingPercent: Int {
-        isUnavailable ? 0 : remainingPercent
+        mainWindow?.remainingPercent ?? 0
     }
 
     var usedPercent: Int {
@@ -1239,96 +2628,87 @@ struct QuotaSnapshot {
 
     static func cached() -> QuotaSnapshot? {
         let defaults = UserDefaults.standard
-        guard defaults.object(forKey: CacheKey.remainingPercent) != nil else {
+        guard defaults.object(forKey: CacheKey.mainKind) != nil,
+              defaults.object(forKey: CacheKey.mainRemainingPercent) != nil,
+              defaults.object(forKey: CacheKey.mainResetDate) != nil,
+              let mainKind = QuotaWindowKind(rawValue: defaults.integer(forKey: CacheKey.mainKind)) else {
             return nil
         }
 
+        let mainWindow = QuotaWindowSnapshot(
+            kind: mainKind,
+            remainingPercent: defaults.integer(forKey: CacheKey.mainRemainingPercent),
+            resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.mainResetDate))
+        )
+        let weeklyWindow: QuotaWindowSnapshot?
+        if defaults.object(forKey: CacheKey.weeklyRemainingPercent) != nil,
+           defaults.object(forKey: CacheKey.weeklyResetDate) != nil {
+            weeklyWindow = QuotaWindowSnapshot(
+                kind: .weekly,
+                remainingPercent: defaults.integer(forKey: CacheKey.weeklyRemainingPercent),
+                resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.weeklyResetDate))
+            )
+        } else {
+            weeklyWindow = nil
+        }
+
         return QuotaSnapshot(
-            remainingPercent: defaults.integer(forKey: CacheKey.remainingPercent),
-            weeklyRemainingPercent: defaults.integer(forKey: CacheKey.weeklyRemainingPercent),
-            resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.resetDate)),
-            weeklyResetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.weeklyResetDate)),
+            mainWindow: mainWindow,
+            weeklyWindow: mainKind == .fiveHour ? weeklyWindow : nil,
             lastUpdated: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.lastUpdated)),
-            sourceName: "本机缓存",
-            isUnavailable: false
+            sourceName: "本机缓存"
         )
     }
 
     func cache() {
-        guard !isUnavailable else { return }
+        guard let mainWindow else { return }
 
         let defaults = UserDefaults.standard
-        defaults.set(remainingPercent, forKey: CacheKey.remainingPercent)
-        defaults.set(weeklyRemainingPercent, forKey: CacheKey.weeklyRemainingPercent)
-        defaults.set(resetDate.timeIntervalSince1970, forKey: CacheKey.resetDate)
-        defaults.set(weeklyResetDate.timeIntervalSince1970, forKey: CacheKey.weeklyResetDate)
+        defaults.set(mainWindow.kind.rawValue, forKey: CacheKey.mainKind)
+        defaults.set(mainWindow.remainingPercent, forKey: CacheKey.mainRemainingPercent)
+        defaults.set(mainWindow.resetDate.timeIntervalSince1970, forKey: CacheKey.mainResetDate)
         defaults.set(lastUpdated.timeIntervalSince1970, forKey: CacheKey.lastUpdated)
+
+        if let weeklyWindow {
+            defaults.set(weeklyWindow.remainingPercent, forKey: CacheKey.weeklyRemainingPercent)
+            defaults.set(weeklyWindow.resetDate.timeIntervalSince1970, forKey: CacheKey.weeklyResetDate)
+        } else {
+            defaults.removeObject(forKey: CacheKey.weeklyRemainingPercent)
+            defaults.removeObject(forKey: CacheKey.weeklyResetDate)
+        }
     }
 
     var tint: Color {
-        guard !isUnavailable else { return .secondary }
-        return Self.tint(for: remainingPercent)
+        guard let mainWindow else { return .secondary }
+        return QuotaColorBand(remainingPercent: mainWindow.remainingPercent).tint
     }
 
     var tagBackgroundColor: NSColor {
-        guard !isUnavailable else { return NSColor(calibratedWhite: 1, alpha: 0.36) }
-        return Self.tagBackgroundColor(for: remainingPercent)
+        guard let mainWindow else { return NSColor(calibratedWhite: 1, alpha: 0.36) }
+        return QuotaColorBand(remainingPercent: mainWindow.remainingPercent).tagBackgroundColor
     }
 
     var tagTextColor: NSColor {
-        guard !isUnavailable else { return .labelColor }
-        return Self.tagTextColor(for: remainingPercent)
+        guard let mainWindow else { return .labelColor }
+        return QuotaColorBand(remainingPercent: mainWindow.remainingPercent).tagTextColor
     }
 
     var weeklyTint: Color {
-        Self.tint(for: weeklyRemainingPercent)
-    }
-
-    private static func tint(for percent: Int) -> Color {
-        switch percent {
-        case 0...20:
-            return .red
-        case 21...45:
-            return .yellow
-        default:
-            return .green
-        }
-    }
-
-    private static func tagBackgroundColor(for percent: Int) -> NSColor {
-        switch percent {
-        case 0...20:
-            return NSColor(calibratedRed: 1.0, green: 0.784, blue: 0.780, alpha: 0.92)
-        case 21...45:
-            return NSColor(calibratedRed: 0.973, green: 0.910, blue: 0.714, alpha: 0.92)
-        default:
-            return NSColor(calibratedRed: 0.722, green: 0.953, blue: 0.820, alpha: 0.92)
-        }
-    }
-
-    private static func tagTextColor(for percent: Int) -> NSColor {
-        switch percent {
-        case 0...20:
-            return NSColor(calibratedRed: 0.290, green: 0.071, blue: 0.075, alpha: 1)
-        case 21...45:
-            return NSColor(calibratedRed: 0.227, green: 0.176, blue: 0.043, alpha: 1)
-        default:
-            return NSColor(calibratedRed: 0.063, green: 0.247, blue: 0.157, alpha: 1)
-        }
+        QuotaColorBand(remainingPercent: weeklyWindow?.remainingPercent ?? 0).tint
     }
 
     var resetText: String {
-        guard !isUnavailable else { return "暂无重置信息" }
+        guard let resetDate = mainWindow?.resetDate else { return "暂无重置信息" }
         return relativeResetText(for: resetDate)
     }
 
     var shortResetText: String {
-        guard !isUnavailable else { return "—" }
+        guard let resetDate = mainWindow?.resetDate else { return "—" }
         return compactResetText(for: resetDate)
     }
 
     var resetClockText: String {
-        guard !isUnavailable else { return "未同步" }
+        guard let resetDate = mainWindow?.resetDate else { return "未同步" }
         return resetDate.formatted(date: .omitted, time: .shortened)
     }
 
@@ -1338,8 +2718,8 @@ struct QuotaSnapshot {
     }
 
     var weeklyResetDateText: String {
-        guard !isUnavailable else { return "—" }
-        let dateText = weeklyResetDate.formatted(
+        guard let weeklyWindow else { return "—" }
+        let dateText = weeklyWindow.resetDate.formatted(
             Date.FormatStyle()
                 .month(.wide)
                 .day(.defaultDigits)
@@ -1377,25 +2757,22 @@ struct QuotaSnapshot {
     }
 
     static func unavailable() -> QuotaSnapshot {
-        let now = Date()
         return QuotaSnapshot(
-            remainingPercent: 0,
-            weeklyRemainingPercent: 0,
-            resetDate: now,
-            weeklyResetDate: now,
-            lastUpdated: now,
-            sourceName: "额度未获取",
-            isUnavailable: true
+            mainWindow: nil,
+            weeklyWindow: nil,
+            lastUpdated: Date(),
+            sourceName: "额度未获取"
         )
     }
 
 }
 
 private enum CacheKey {
-    static let remainingPercent = "quota.remainingPercent"
-    static let weeklyRemainingPercent = "quota.weeklyRemainingPercent"
-    static let resetDate = "quota.resetDate"
-    static let weeklyResetDate = "quota.weeklyResetDate"
+    static let mainKind = "quota.main.kind"
+    static let mainRemainingPercent = "quota.main.remainingPercent"
+    static let mainResetDate = "quota.main.resetDate"
+    static let weeklyRemainingPercent = "quota.weekly.remainingPercent"
+    static let weeklyResetDate = "quota.weekly.resetDate"
     static let lastUpdated = "quota.lastUpdated"
     static let voiceBroadcastIntervalMinutes = "voiceBroadcast.intervalMinutes"
 }
