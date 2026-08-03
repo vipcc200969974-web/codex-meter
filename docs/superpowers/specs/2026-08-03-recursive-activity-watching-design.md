@@ -4,6 +4,8 @@
 
 Codex session files stay in the date directory where their task was created. A project created on July 31 can still append lifecycle events on August 3. The current watcher binds only the current calendar day's directory and files, so an older project's start or completion is invisible until the 60-second fallback refresh.
 
+There is a second delay after an event is detected: `LocalUsageLoader` reads quota and token data before activity, and `UsageStore` publishes all three only after the combined load finishes. A slow full refresh can therefore delay the ring even when the filesystem event arrived promptly.
+
 ## Chosen Design
 
 Replace the date-specific session file bindings with one native recursive FSEvents stream rooted at `~/.codex`.
@@ -18,10 +20,19 @@ Replace the date-specific session file bindings with one native recursive FSEven
 
 This uses one recursive stream instead of one file descriptor per active file. It detects writes for old and new projects without frequent directory scans or faster polling.
 
+Add an activity-only loading path alongside the existing combined usage load:
+
+- `LocalUsageLoader` exposes a fast method that calls only `CodexTaskActivityProvider`.
+- `UsageStore` runs that method on a separate serial queue at startup, after watcher events, and after wake or unlock.
+- Activity-only loads have their own debounce, in-flight, and pending state so they never wait for quota or token work and never overlap themselves.
+- The existing combined refresh still updates quota and daily tokens; the fast result only updates `isTaskActive` and its success timestamp.
+- Test loaders that do not implement the activity-only interface keep their existing behavior.
+
 ## Alternatives Considered
 
 - Bind every recently modified JSONL file: smaller change, but the first write to a long-dormant project can still be missed until fallback polling.
 - Poll task activity every two seconds: reliable but repeatedly enumerates session data and risks restoring the high CPU and memory use already removed.
+- Reorder activity to the start of the combined load: parsing would happen earlier, but the UI still could not publish it until quota and token work returned.
 
 ## Tests
 
@@ -29,8 +40,10 @@ This uses one recursive stream instead of one file descriptor per active file. I
 - Appending to a current session file still emits a change.
 - Unrelated nested files under `.codex` do not emit a change.
 - Start, stop, restart, and callback-triggered stop remain safe.
+- A watcher event publishes activity while an intentionally blocked full usage load is still running.
+- Burst watcher events produce one activity-only follow-up rather than concurrent activity scans.
 - The full activity and application test suites remain green.
 
 ## Acceptance
 
-While any Codex project is working, its lifecycle append triggers a menu-bar refresh promptly regardless of the project's creation date. When the lifecycle becomes complete or aborted, the same recursive watcher triggers the refresh that stops the ring. Idle resource use remains bounded and the 60-second fallback stays enabled.
+While any Codex project is working, its lifecycle append triggers an activity-only menu-bar refresh promptly regardless of the project's creation date or the duration of quota and token loading. When the lifecycle becomes complete or aborted, the same path stops the ring. Idle resource use remains bounded and the 60-second fallback stays enabled.
