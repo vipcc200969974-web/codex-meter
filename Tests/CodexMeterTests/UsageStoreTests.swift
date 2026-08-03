@@ -33,6 +33,59 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertNil(result.isTaskActive)
     }
 
+    func testStartPublishesActivityWhileFullUsageLoadIsBlocked() async {
+        let loader = BlockingUsageAndActivityLoader(activity: true)
+        let store = UsageStore(loader: loader, watcher: SpyActivityWatcher())
+        let active = expectation(description: "activity published before full load")
+        let subscription = store.$isTaskActive.dropFirst().sink { value in
+            if value { active.fulfill() }
+        }
+        defer {
+            loader.releaseUsage()
+            store.stop()
+            subscription.cancel()
+        }
+
+        store.start()
+        await loader.waitUntilUsageStarted()
+        await fulfillment(of: [active], timeout: 1)
+
+        XCTAssertTrue(store.isTaskActive)
+    }
+
+    func testWatcherPublishesActivityWhileFullUsageLoadIsBlocked() async {
+        let loader = BlockingUsageAndActivityLoader(activity: false)
+        let watcher = CallbackActivityWatcher()
+        let store = UsageStore(
+            loader: loader,
+            watcher: nil,
+            debounceInterval: 0.01,
+            watcherFactory: { onChange in
+                watcher.setOnChange(onChange)
+                return watcher
+            }
+        )
+        let active = expectation(description: "watcher activity published before full load")
+        let subscription = store.$isTaskActive.dropFirst().sink { value in
+            if value { active.fulfill() }
+        }
+        defer {
+            loader.releaseUsage()
+            store.stop()
+            subscription.cancel()
+        }
+
+        store.start()
+        await loader.waitUntilUsageStarted()
+        await loader.waitUntilActivityLoaded(count: 1)
+        loader.setActivity(true)
+        await watcher.emitFromBackground()
+        await fulfillment(of: [active], timeout: 1)
+
+        XCTAssertTrue(store.isTaskActive)
+        XCTAssertGreaterThanOrEqual(loader.activityCallCount, 2)
+    }
+
     func testRefreshRequestedDuringLoadRunsOneFollowUp() async throws {
         let loader = BlockingUsageLoader()
         let store = UsageStore(loader: loader, watcher: nil, debounceInterval: 0.01)
@@ -874,6 +927,92 @@ final class BlockingUsageLoader: UsageLoading, @unchecked Sendable {
                 condition.unlock()
             }
         }
+    }
+}
+
+final class BlockingUsageAndActivityLoader: UsageLoading, TaskActivityLoading, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var activity: Bool
+    private var activityCalls = 0
+    private var usageStarted = false
+    private var usageReleased = false
+    private var usageStartedContinuation: CheckedContinuation<Void, Never>?
+    private var activityWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(activity: Bool) {
+        self.activity = activity
+    }
+
+    func load(now: Date) -> UsageLoadResult {
+        condition.lock()
+        usageStarted = true
+        let continuation = usageStartedContinuation
+        usageStartedContinuation = nil
+        condition.unlock()
+        continuation?.resume()
+
+        condition.lock()
+        while !usageReleased {
+            condition.wait()
+        }
+        condition.unlock()
+        return .empty
+    }
+
+    func loadActivity(now: Date) -> Bool? {
+        condition.lock()
+        activityCalls += 1
+        let result = activity
+        let readyWaiters = activityWaiters.filter { $0.count <= activityCalls }
+        activityWaiters.removeAll { $0.count <= activityCalls }
+        condition.unlock()
+        readyWaiters.forEach { $0.continuation.resume() }
+        return result
+    }
+
+    var activityCallCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return activityCalls
+    }
+
+    func setActivity(_ activity: Bool) {
+        condition.lock()
+        self.activity = activity
+        condition.unlock()
+    }
+
+    func waitUntilActivityLoaded(count: Int) async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if activityCalls >= count {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                activityWaiters.append((count, continuation))
+                condition.unlock()
+            }
+        }
+    }
+
+    func waitUntilUsageStarted() async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if usageStarted {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                usageStartedContinuation = continuation
+                condition.unlock()
+            }
+        }
+    }
+
+    func releaseUsage() {
+        condition.lock()
+        usageReleased = true
+        condition.broadcast()
+        condition.unlock()
     }
 }
 

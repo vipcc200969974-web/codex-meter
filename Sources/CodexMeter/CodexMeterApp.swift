@@ -1131,7 +1131,11 @@ protocol UsageLoading: Sendable {
     func load(now: Date) -> UsageLoadResult
 }
 
-final class LocalUsageLoader: UsageLoading, @unchecked Sendable {
+protocol TaskActivityLoading: Sendable {
+    func loadActivity(now: Date) -> Bool?
+}
+
+final class LocalUsageLoader: UsageLoading, TaskActivityLoading, @unchecked Sendable {
     private let quotaProvider: CompositeQuotaProvider
     private let tokenProvider: any DailyTokenUsageProviding
     private let taskActivityProvider: any CodexTaskActivityProviding
@@ -1149,12 +1153,15 @@ final class LocalUsageLoader: UsageLoading, @unchecked Sendable {
     func load(now: Date) -> UsageLoadResult {
         let quota = quotaProvider.currentObservation(now: now).map(QuotaSnapshot.init(observation:))
         let tokens = try? tokenProvider.currentUsage(now: now)
-        let isTaskActive = try? taskActivityProvider.currentActivity(now: now)
         return UsageLoadResult(
             quota: quota,
             dailyTokens: tokens,
-            isTaskActive: isTaskActive
+            isTaskActive: loadActivity(now: now)
         )
+    }
+
+    func loadActivity(now: Date) -> Bool? {
+        try? taskActivityProvider.currentActivity(now: now)
     }
 }
 
@@ -1224,19 +1231,25 @@ final class UsageStore: ObservableObject {
 
     private var fallbackTask: (any UsageScheduledTask)?
     private var debounceTask: (any UsageScheduledTask)?
+    private var activityDebounceTask: (any UsageScheduledTask)?
     private var midnightTask: (any UsageScheduledTask)?
     private var voiceTimer: Timer?
     private var isRefreshing = false
     private var refreshPending = false
+    private var isActivityRefreshing = false
+    private var activityRefreshPending = false
     private var isStarted = false
     private var lifecycleGeneration: UInt = 0
     private var debounceGeneration: UInt = 0
+    private var activityDebounceGeneration: UInt = 0
     private var speakAfterRefresh = false
     private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
+    private let activityRefreshQueue = DispatchQueue(label: "com.codexmeter.activity-refresh", qos: .utility)
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var notifiedLevels = Set<Int>()
     private var lastTaskActivitySuccessAt: Date?
     private let loader: any UsageLoading
+    private let activityLoader: (any TaskActivityLoading)?
     private var watcher: CodexActivityWatching?
     private let createsWatcher: Bool
     private let debounceInterval: TimeInterval
@@ -1262,6 +1275,7 @@ final class UsageStore: ObservableObject {
         }
     ) {
         self.loader = loader
+        self.activityLoader = loader as? any TaskActivityLoading
         self.watcher = watcher
         self.createsWatcher = watcher == nil
         self.debounceInterval = debounceInterval
@@ -1297,11 +1311,13 @@ final class UsageStore: ObservableObject {
                           self.lifecycleGeneration == generation else {
                         return
                     }
+                    self.scheduleActivityRefresh()
                     self.scheduleRefresh()
                 }
             }
         }
         watcher?.start()
+        refreshActivity()
         refresh()
         requestNotificationPermission()
         fallbackTask = scheduler.schedule(
@@ -1322,11 +1338,16 @@ final class UsageStore: ObservableObject {
         let wasStarted = isStarted
         lifecycleGeneration &+= 1
         debounceGeneration &+= 1
+        activityDebounceGeneration &+= 1
         isStarted = false
         isRefreshing = false
         refreshPending = false
+        isActivityRefreshing = false
+        activityRefreshPending = false
         debounceTask?.cancel()
         debounceTask = nil
+        activityDebounceTask?.cancel()
+        activityDebounceTask = nil
         fallbackTask?.cancel()
         fallbackTask = nil
         midnightTask?.cancel()
@@ -1361,9 +1382,27 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    private func scheduleActivityRefresh() {
+        guard activityLoader != nil else { return }
+        activityDebounceTask?.cancel()
+        let generation = lifecycleGeneration
+        activityDebounceGeneration &+= 1
+        let scheduledDebounceGeneration = activityDebounceGeneration
+        activityDebounceTask = scheduler.schedule(after: debounceInterval, repeating: nil) { [weak self] in
+            guard let self,
+                  self.lifecycleGeneration == generation,
+                  self.activityDebounceGeneration == scheduledDebounceGeneration else {
+                return
+            }
+            self.activityDebounceTask = nil
+            self.refreshActivity()
+        }
+    }
+
     func refreshAfterWakeOrUnlock() {
         resetDailyTokensIfDayChanged(at: now())
         watcher?.rebind()
+        refreshActivity()
         refresh()
         if isStarted {
             scheduleNextLocalMidnight(generation: lifecycleGeneration)
@@ -1398,16 +1437,7 @@ final class UsageStore: ObservableObject {
                 let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
                 let hasFreshQuota = acceptedQuota != nil
                 let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
-                if let isTaskActive = result.isTaskActive {
-                    self.isTaskActive = isTaskActive
-                    self.lastTaskActivitySuccessAt = loadDate
-                } else {
-                    let shouldRetainActive = self.isTaskActive
-                        && self.lastTaskActivitySuccessAt.map {
-                            loadDate.timeIntervalSince($0) < self.fallbackInterval
-                        } == true
-                    self.isTaskActive = shouldRetainActive
-                }
+                self.applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
                 self.snapshot = UsageSnapshot(
                     quota: quota,
                     dailyTokens: tokens,
@@ -1428,6 +1458,46 @@ final class UsageStore: ObservableObject {
                 }
             }
         }
+    }
+
+    private func refreshActivity() {
+        guard let activityLoader else { return }
+        let loadDate = now()
+        guard !isActivityRefreshing else {
+            activityRefreshPending = true
+            return
+        }
+        isActivityRefreshing = true
+        let generation = lifecycleGeneration
+
+        activityRefreshQueue.async { [weak self] in
+            let isTaskActive = activityLoader.loadActivity(now: loadDate)
+
+            DispatchQueue.main.async {
+                guard let self, self.lifecycleGeneration == generation else { return }
+                self.applyTaskActivity(isTaskActive, loadedAt: loadDate)
+                self.isActivityRefreshing = false
+                if self.activityRefreshPending {
+                    self.activityRefreshPending = false
+                    self.refreshActivity()
+                }
+            }
+        }
+    }
+
+    private func applyTaskActivity(_ result: Bool?, loadedAt loadDate: Date) {
+        guard lastTaskActivitySuccessAt.map({ loadDate >= $0 }) ?? true else { return }
+        if let result {
+            isTaskActive = result
+            lastTaskActivitySuccessAt = loadDate
+            return
+        }
+
+        let shouldRetainActive = isTaskActive
+            && lastTaskActivitySuccessAt.map {
+                loadDate.timeIntervalSince($0) < fallbackInterval
+            } == true
+        isTaskActive = shouldRetainActive
     }
 
     private func scheduleNextLocalMidnight(generation: UInt) {
@@ -1468,6 +1538,7 @@ final class UsageStore: ObservableObject {
 
     isolated deinit {
         debounceTask?.cancel()
+        activityDebounceTask?.cancel()
         fallbackTask?.cancel()
         midnightTask?.cancel()
         voiceTimer?.invalidate()
