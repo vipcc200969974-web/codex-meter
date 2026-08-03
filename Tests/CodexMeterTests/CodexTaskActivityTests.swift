@@ -219,6 +219,7 @@ final class CodexTaskActivityTests: XCTestCase {
             to: activeFile,
             at: now.addingTimeInterval(-900)
         )
+        try setModificationDate(now.addingTimeInterval(-900), for: activeFile)
         XCTAssertTrue(try makeProvider().currentActivity(now: now))
 
         try overwriteLifecycle(
@@ -227,10 +228,23 @@ final class CodexTaskActivityTests: XCTestCase {
             in: activeFile,
             at: now.addingTimeInterval(-901)
         )
+        try setModificationDate(now.addingTimeInterval(-901), for: activeFile)
         XCTAssertFalse(
             try makeProvider(roots: [activeRoot])
                 .currentActivity(now: now)
         )
+    }
+
+    func testOldStartRemainsActiveWhileItsSessionFileIsStillChanging() throws {
+        try writeLifecycle(
+            .started,
+            turnID: "long-running",
+            to: activeFile,
+            at: now.addingTimeInterval(-3_600)
+        )
+        try setModificationDate(now, for: activeFile)
+
+        XCTAssertTrue(try makeProvider().currentActivity(now: now))
     }
 
     func testIncrementalAppendDoesNotReapplyCoveredLifecycleEvents() throws {
@@ -745,6 +759,13 @@ final class CodexTaskActivityTests: XCTestCase {
         defer { try? handle.close() }
         try handle.truncate(atOffset: 0)
         try handle.write(contentsOf: Data((lifecycleLine(kind, turnID: turnID, at: date) + "\n").utf8))
+    }
+
+    private func setModificationDate(_ date: Date, for url: URL) throws {
+        try FileManager.default.setAttributes(
+            [.modificationDate: date],
+            ofItemAtPath: url.path
+        )
     }
 
     private func mutateCache(_ mutation: (inout [String: Any]) throws -> Void) throws {

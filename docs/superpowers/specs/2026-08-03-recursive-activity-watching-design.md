@@ -28,6 +28,8 @@ Add an activity-only loading path alongside the existing combined usage load:
 - The existing combined refresh still updates quota and daily tokens; the fast result only updates `isTaskActive` and its success timestamp.
 - Test loaders that do not implement the activity-only interface keep their existing behavior.
 
+The 15-minute orphan lease must use the newer of the unmatched start timestamp and its session file's modification time. A long-running task therefore stays active while its project log continues changing, even when the original start is older than 15 minutes. A terminal lifecycle event still wins globally and stops immediately; a genuinely abandoned start becomes idle only when both the start and its source file have been quiet for longer than the lease.
+
 ## Alternatives Considered
 
 - Bind every recently modified JSONL file: smaller change, but the first write to a long-dormant project can still be missed until fallback polling.
@@ -42,6 +44,7 @@ Add an activity-only loading path alongside the existing combined usage load:
 - Start, stop, restart, and callback-triggered stop remain safe.
 - A watcher event publishes activity while an intentionally blocked full usage load is still running.
 - Burst watcher events produce one activity-only follow-up rather than concurrent activity scans.
+- A start older than 15 minutes remains active when its session file was modified recently, while an equally old quiet file remains idle.
 - The full activity and application test suites remain green.
 
 ## Acceptance

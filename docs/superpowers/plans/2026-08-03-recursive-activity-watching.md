@@ -226,7 +226,29 @@ git add Sources/CodexMeter/CodexMeterApp.swift Tests/CodexMeterTests/UsageStoreT
 git commit -m "fix: refresh task activity independently"
 ```
 
-### Task 4: Verify, Build, Install, and Observe
+### Task 4: Keep Long-Running Projects Active
+
+**Files:**
+- Modify: `Sources/CodexMeter/CodexTaskActivity.swift`
+- Modify: `Tests/CodexMeterTests/CodexTaskActivityTests.swift`
+
+**Interfaces:**
+- Consumes: each candidate session file's content modification date and merged lifecycle state.
+- Produces: activity lease evaluation based on the newer of start time and source-file activity.
+
+- [ ] **Step 1: Add and verify a failing long-task regression**
+
+Write a start timestamped one hour ago, set its file modification date to `now`, and require `currentActivity(now:)` to return true. Preserve the orphan boundary test by setting its file modification date to the same quiet timestamp as its start. Run the new test and require it to fail before implementation.
+
+- [ ] **Step 2: Merge source-file liveness with lifecycle state**
+
+While merging states globally by turn ID, retain the source candidate's modification date. Keep lifecycle timestamp ordering and terminal tie precedence unchanged. For a merged start, compare the orphan cutoff against `max(event.timestamp, fileModifiedAt)`.
+
+- [ ] **Step 3: Verify activity tests and commit**
+
+Run `swift test --filter CodexTaskActivityTests`, require zero failures, then commit the provider and regression tests with `fix: keep active projects alive from log writes`.
+
+### Task 5: Verify, Build, Install, and Observe
 
 **Files:**
 - Use: `scripts/build-app.sh`

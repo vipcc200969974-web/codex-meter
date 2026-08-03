@@ -354,6 +354,11 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         }
     }
 
+    private struct GlobalTurnState {
+        let event: CodexTaskLifecycleEvent
+        let fileModifiedAt: Date
+    }
+
     private struct PersistentCache: Codable {
         let schemaVersion: Int
         let rootsFingerprint: String
@@ -447,6 +452,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         let candidates = try discoverCandidates(modifiedAtOrAfter: lowerBound)
 
         var discoveredKeys = Set<CursorKey>()
+        var modifiedAtByKey: [CursorKey: Date] = [:]
         var unreadAggregate: UInt64 = 0
         for candidate in candidates {
             let key = candidate.key
@@ -454,6 +460,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 continue
             }
             discoveredKeys.insert(key)
+            modifiedAtByKey[key] = candidate.modifiedAt
             var cursor = refreshed[key] ?? FileCursor(url: candidate.url)
             try prepare(&cursor, for: candidate)
             if cursor.needsLegacyCatchUp {
@@ -473,15 +480,21 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         saveCache(refreshed, at: now)
         cursors = refreshed
         didLoadCache = true
-        var latestStates: [String: CodexTaskLifecycleEvent] = [:]
-        for cursor in refreshed.values {
+        var latestStates: [String: GlobalTurnState] = [:]
+        for (key, cursor) in refreshed {
+            let fileModifiedAt = modifiedAtByKey[key] ?? .distantPast
             for event in cursor.turnStates.values {
-                Self.merge(event, into: &latestStates)
+                Self.mergeGlobal(
+                    event,
+                    fileModifiedAt: fileModifiedAt,
+                    into: &latestStates
+                )
             }
         }
         let activeLowerBound = now.addingTimeInterval(-Self.orphanedStartHorizon)
         return latestStates.values.contains {
-            $0.kind == .started && $0.timestamp >= activeLowerBound
+            $0.event.kind == .started
+                && max($0.event.timestamp, $0.fileModifiedAt) >= activeLowerBound
         }
     }
 
@@ -990,6 +1003,33 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 && current.kind == .started
                 && candidate.kind != .started) {
             states[candidate.turnID] = candidate
+        }
+    }
+
+    private static func mergeGlobal(
+        _ candidate: CodexTaskLifecycleEvent,
+        fileModifiedAt: Date,
+        into states: inout [String: GlobalTurnState]
+    ) {
+        guard let current = states[candidate.turnID] else {
+            states[candidate.turnID] = GlobalTurnState(
+                event: candidate,
+                fileModifiedAt: fileModifiedAt
+            )
+            return
+        }
+        let candidateWins = candidate.timestamp > current.event.timestamp
+            || (candidate.timestamp == current.event.timestamp
+                && current.event.kind == .started
+                && candidate.kind != .started)
+            || (candidate.timestamp == current.event.timestamp
+                && candidate.kind == current.event.kind
+                && fileModifiedAt > current.fileModifiedAt)
+        if candidateWins {
+            states[candidate.turnID] = GlobalTurnState(
+                event: candidate,
+                fileModifiedAt: fileModifiedAt
+            )
         }
     }
 
