@@ -238,11 +238,11 @@ git commit -m "fix: refresh task activity independently"
 
 - [ ] **Step 1: Add and verify a failing long-task regression**
 
-Write a start timestamped one hour ago, set its file modification date to `now`, and require `currentActivity(now:)` to return true. Preserve the orphan boundary test by setting its file modification date to the same quiet timestamp as its start. Run the new test and require it to fail before implementation.
+Write a start timestamped one hour ago, set its file modification date to `now`, and require `currentActivity(now:)` to return true. Preserve the orphan boundary test by setting its file modification date to the same quiet timestamp as its start. Add a second regression where an old unmatched start is followed by a newer terminal event for another turn in the same recently modified file; require that file to remain idle. Run both new tests and require each to fail before its implementation.
 
 - [ ] **Step 2: Merge source-file liveness with lifecycle state**
 
-While merging states globally by turn ID, retain the source candidate's modification date. Keep lifecycle timestamp ordering and terminal tie precedence unchanged. For a merged start, compare the orphan cutoff against `max(event.timestamp, fileModifiedAt)`.
+Find the latest lifecycle event in each file using timestamp ordering and terminal tie precedence. Apply the source candidate's modification date only to that event when it is a start; use each older state's own timestamp so recent unrelated writes cannot revive it. Then merge states globally by turn ID and compare each merged start against `max(event.timestamp, eligibleFileModifiedAt)`.
 
 - [ ] **Step 3: Verify activity tests and commit**
 

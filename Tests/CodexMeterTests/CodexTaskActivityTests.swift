@@ -247,6 +247,24 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(try makeProvider().currentActivity(now: now))
     }
 
+    func testRecentFileWriteDoesNotReviveOlderStartAfterLatestLifecycleIsTerminal() throws {
+        try writeLifecycle(
+            .started,
+            turnID: "stale",
+            to: activeFile,
+            at: now.addingTimeInterval(-3_600)
+        )
+        try appendLifecycle(
+            .completed,
+            turnID: "newer-finished",
+            to: activeFile,
+            at: now
+        )
+        try setModificationDate(now, for: activeFile)
+
+        XCTAssertFalse(try makeProvider().currentActivity(now: now))
+    }
+
     func testIncrementalAppendDoesNotReapplyCoveredLifecycleEvents() throws {
         try writeLifecycle(.started, turnID: "a", to: activeFile, at: now.addingTimeInterval(-10))
         let provider = makeProvider()

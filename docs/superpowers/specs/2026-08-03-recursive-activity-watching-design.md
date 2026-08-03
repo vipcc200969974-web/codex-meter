@@ -28,7 +28,7 @@ Add an activity-only loading path alongside the existing combined usage load:
 - The existing combined refresh still updates quota and daily tokens; the fast result only updates `isTaskActive` and its success timestamp.
 - Test loaders that do not implement the activity-only interface keep their existing behavior.
 
-The 15-minute orphan lease must use the newer of the unmatched start timestamp and its session file's modification time. A long-running task therefore stays active while its project log continues changing, even when the original start is older than 15 minutes. A terminal lifecycle event still wins globally and stops immediately; a genuinely abandoned start becomes idle only when both the start and its source file have been quiet for longer than the lease.
+The 15-minute orphan lease must use the newer of the unmatched start timestamp and its session file's modification time, but file liveness applies only when that start is the file's latest lifecycle event. A long-running task therefore stays active while its project log continues changing, even when the original start is older than 15 minutes. A newer terminal event prevents unrelated old starts in the same file from being revived. A terminal lifecycle event still wins globally and stops immediately; a genuinely abandoned start becomes idle only when both the start and its source file have been quiet for longer than the lease.
 
 ## Alternatives Considered
 
@@ -45,6 +45,7 @@ The 15-minute orphan lease must use the newer of the unmatched start timestamp a
 - A watcher event publishes activity while an intentionally blocked full usage load is still running.
 - Burst watcher events produce one activity-only follow-up rather than concurrent activity scans.
 - A start older than 15 minutes remains active when its session file was modified recently, while an equally old quiet file remains idle.
+- A recent file write cannot revive an older unmatched start when that file's latest lifecycle event is terminal.
 - The full activity and application test suites remain green.
 
 ## Acceptance

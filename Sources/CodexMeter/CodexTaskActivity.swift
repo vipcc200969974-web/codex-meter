@@ -483,10 +483,17 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         var latestStates: [String: GlobalTurnState] = [:]
         for (key, cursor) in refreshed {
             let fileModifiedAt = modifiedAtByKey[key] ?? .distantPast
+            let latestFileEvent = cursor.turnStates.values.reduce(nil as CodexTaskLifecycleEvent?) {
+                current, candidate in
+                guard let current else { return candidate }
+                return Self.isPreferred(candidate, over: current) ? candidate : current
+            }
             for event in cursor.turnStates.values {
+                let isLatestActiveEvent = latestFileEvent?.turnID == event.turnID
+                    && latestFileEvent?.kind == .started
                 Self.mergeGlobal(
                     event,
-                    fileModifiedAt: fileModifiedAt,
+                    fileModifiedAt: isLatestActiveEvent ? fileModifiedAt : event.timestamp,
                     into: &latestStates
                 )
             }
@@ -998,12 +1005,19 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             states[candidate.turnID] = candidate
             return
         }
-        if candidate.timestamp > current.timestamp
-            || (candidate.timestamp == current.timestamp
-                && current.kind == .started
-                && candidate.kind != .started) {
+        if Self.isPreferred(candidate, over: current) {
             states[candidate.turnID] = candidate
         }
+    }
+
+    private static func isPreferred(
+        _ candidate: CodexTaskLifecycleEvent,
+        over current: CodexTaskLifecycleEvent
+    ) -> Bool {
+        candidate.timestamp > current.timestamp
+            || (candidate.timestamp == current.timestamp
+                && current.kind == .started
+                && candidate.kind != .started)
     }
 
     private static func mergeGlobal(
@@ -1018,10 +1032,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             )
             return
         }
-        let candidateWins = candidate.timestamp > current.event.timestamp
-            || (candidate.timestamp == current.event.timestamp
-                && current.event.kind == .started
-                && candidate.kind != .started)
+        let candidateWins = Self.isPreferred(candidate, over: current.event)
             || (candidate.timestamp == current.event.timestamp
                 && candidate.kind == current.event.kind
                 && fileModifiedAt > current.fileModifiedAt)
