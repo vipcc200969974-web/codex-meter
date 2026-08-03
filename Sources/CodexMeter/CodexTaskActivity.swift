@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 
+private let codexTaskLifecycleLineLimitBytes = 64 * 1_024
+
 enum CodexTaskLifecycleKind: String, Codable, Sendable {
     case started = "task_started"
     case completed = "task_complete"
@@ -112,7 +114,8 @@ private enum CodexTaskLifecycleLineDiscriminator {
                 let lineStart = data[..<match.lowerBound].lastIndex(of: 0x0A)
                     .map { data.index(after: $0) } ?? data.startIndex
                 let range = lineStart..<lineEnd
-                if isLifecycleEvent(data.subdata(in: range)) {
+                if range.count <= codexTaskLifecycleLineLimitBytes,
+                   isLifecycleEvent(data.subdata(in: range)) {
                     ranges.insert(range)
                 }
                 searchStart = data.index(after: lineEnd)
@@ -303,7 +306,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
     private static let readChunkBytes = 4 * 1_024 * 1_024
     private static let fingerprintSampleBytes: UInt64 = 4 * 1_024
-    private static let legacyCandidateLineLimitBytes = 64 * 1_024
+    private static let startedMarker = Data("task_started".utf8)
     private static let completedMarker = Data("task_complete".utf8)
     private static let abortedMarker = Data("turn_aborted".utf8)
 
@@ -330,6 +333,8 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         var url: URL
         var offset: UInt64 = 0
         var partial = Data()
+        var uncommittedByteCount: UInt64 = 0
+        var discardingOversizedLine = false
         var turnStates: [String: CodexTaskLifecycleEvent] = [:]
         var generationFingerprint: String?
         var needsBoundaryValidation = false
@@ -688,7 +693,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 identity = nil
                 basename = value
             }
-            let completeOffset = cursor.offset - UInt64(cursor.partial.count)
+            let completeOffset = cursor.offset - cursor.uncommittedByteCount
             let turnStates = cursor.turnStates.values
                 .map {
                     PersistentTurnState(
@@ -850,7 +855,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
 
     private func prepare(_ cursor: inout FileCursor, for candidate: Candidate) throws {
         cursor.url = candidate.url
-        let completeOffset = cursor.offset - UInt64(cursor.partial.count)
+        let completeOffset = cursor.offset - cursor.uncommittedByteCount
         let invalidBoundary = cursor.needsBoundaryValidation
             && !isCompleteLineBoundary(
                 completeOffset,
@@ -899,7 +904,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         }
 
         cursor.offset = readStart + approvedByteCount
-        let completeOffset = cursor.offset - UInt64(cursor.partial.count)
+        let completeOffset = cursor.offset - cursor.uncommittedByteCount
         cursor.generationFingerprint = try generationFingerprint(
             of: candidate.url,
             through: completeOffset
@@ -907,14 +912,56 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
     }
 
     private func consume(_ newData: Data, into cursor: inout FileCursor) {
-        cursor.partial.append(newData)
-        guard let finalNewline = cursor.partial.lastIndex(of: 0x0A) else { return }
-        let partialStart = cursor.partial.index(after: finalNewline)
-        let completeData = cursor.partial.subdata(in: cursor.partial.startIndex..<partialStart)
-        cursor.partial = Data(cursor.partial[partialStart...])
+        var segmentStart = newData.startIndex
+        while segmentStart < newData.endIndex {
+            if let newline = newData[segmentStart...].firstIndex(of: 0x0A) {
+                appendIncompleteLineSegment(
+                    newData[segmentStart..<newline],
+                    into: &cursor
+                )
+                if !cursor.discardingOversizedLine {
+                    applyLifecycleLine(cursor.partial, into: &cursor.turnStates)
+                }
+                cursor.partial.removeAll(keepingCapacity: true)
+                cursor.uncommittedByteCount = 0
+                cursor.discardingOversizedLine = false
+                segmentStart = newData.index(after: newline)
+            } else {
+                appendIncompleteLineSegment(
+                    newData[segmentStart..<newData.endIndex],
+                    into: &cursor
+                )
+                break
+            }
+        }
+    }
 
-        for event in CodexTaskLifecycleParser.parseCompleteLines(in: completeData) {
-            Self.merge(event, into: &cursor.turnStates)
+    private func appendIncompleteLineSegment(
+        _ segment: Data.SubSequence,
+        into cursor: inout FileCursor
+    ) {
+        cursor.uncommittedByteCount += UInt64(segment.count)
+        guard !cursor.discardingOversizedLine else { return }
+        guard cursor.partial.count <= codexTaskLifecycleLineLimitBytes,
+              segment.count <= codexTaskLifecycleLineLimitBytes - cursor.partial.count else {
+            cursor.partial.removeAll(keepingCapacity: false)
+            cursor.discardingOversizedLine = true
+            return
+        }
+        cursor.partial.append(contentsOf: segment)
+    }
+
+    private func applyLifecycleLine(
+        _ line: Data,
+        into states: inout [String: CodexTaskLifecycleEvent]
+    ) {
+        guard line.range(of: Self.startedMarker) != nil
+                || line.range(of: Self.completedMarker) != nil
+                || line.range(of: Self.abortedMarker) != nil else {
+            return
+        }
+        for event in CodexTaskLifecycleParser.parseCompleteLines(in: line + Data([0x0A])) {
+            Self.merge(event, into: &states)
         }
     }
 
@@ -945,7 +992,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
 
-            let overlap = UInt64(Self.legacyCandidateLineLimitBytes)
+            let overlap = UInt64(codexTaskLifecycleLineLimitBytes)
             let markers = [Self.completedMarker, Self.abortedMarker]
             var recovered: [String: CodexTaskLifecycleEvent] = [:]
             var coreStart: UInt64 = 0
@@ -1016,7 +1063,7 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
             guard windowStart == 0 else { return nil }
             lineStart = window.startIndex
         }
-        guard newline - lineStart <= Self.legacyCandidateLineLimitBytes else {
+        guard newline - lineStart <= codexTaskLifecycleLineLimitBytes else {
             return nil
         }
         return lineStart..<newline

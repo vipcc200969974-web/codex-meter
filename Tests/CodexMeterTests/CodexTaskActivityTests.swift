@@ -253,6 +253,30 @@ final class CodexTaskActivityTests: XCTestCase {
         XCTAssertTrue(try provider.currentActivity(now: now))
     }
 
+    func testOversizedLifecycleLineIsDiscarded() throws {
+        let oversized = lifecycleLine(
+            .started,
+            turnID: "oversized",
+            at: now,
+            sentinel: String(repeating: "x", count: 70 * 1_024)
+        )
+        try Data((oversized + "\n").utf8).write(to: activeFile)
+
+        XCTAssertFalse(try makeProvider().currentActivity(now: now))
+    }
+
+    func testNormalLifecycleAfterOversizedPrivateLineStillApplies() throws {
+        let privateLine = #"{"timestamp":"2026-08-02T02:00:00Z","type":"response_item","payload":{"type":"message","content":""#
+            + String(repeating: "task_started private ", count: 5_000)
+            + #""}}"#
+        try Data((privateLine + "\n").utf8).write(to: activeFile)
+        let provider = makeProvider()
+        XCTAssertFalse(try provider.currentActivity(now: now))
+
+        try appendLifecycle(.started, turnID: "normal", to: activeFile, at: now)
+        XCTAssertTrue(try provider.currentActivity(now: now))
+    }
+
     func testTruncationRebuildsLifecycleState() throws {
         try writeLifecycle(.started, turnID: "old", to: activeFile, at: now.addingTimeInterval(-10))
         try appendLifecycle(.started, turnID: "padding", to: activeFile, at: now.addingTimeInterval(-9))

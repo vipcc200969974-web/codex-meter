@@ -18,6 +18,7 @@ Keep incremental, bounded log reading, but retain the latest lifecycle event for
 - If two lifecycle events for the same turn have the same timestamp, prefer a terminal event over a start.
 - Report global activity only when at least one turn's merged latest state is `task_started`.
 - Keep only lifecycle states inside the existing 24-hour horizon.
+- Bound both normal incremental parsing and legacy migration to 64 KiB per JSONL line. Oversized records are discarded without buffering, and parsing resumes at the next newline.
 
 The persistent cursor cache will move to schema version 3 and store only turn ID, lifecycle kind, and timestamp. Schema version 2 is migrated in place so multi-gigabyte session files do not need a cold rebuild: existing offsets and active starts are retained, while a one-time bounded-line scan recovers covered completion and abort records for those active turn IDs. Lines larger than 64 KiB are discarded by the migration scanner, and no prompt, response, or other private payload is cached.
 
@@ -37,5 +38,6 @@ Add regressions proving that:
 - Equal timestamps prefer terminal state.
 - Persistence preserves terminal states without storing private payload text.
 - A schema version 2 cache migrates without rereading source bytes through the normal reconstruction budget, preserves active turns, and recovers already-covered terminal events.
+- Oversized lifecycle-looking and private lines are discarded while the following normal lifecycle event still applies.
 
 Run the focused activity tests, then the complete test suite, build the app, replace the installed copy, and verify the live cache no longer retains completed or aborted turns as active.
