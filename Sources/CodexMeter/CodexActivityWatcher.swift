@@ -1,4 +1,4 @@
-import Darwin
+import CoreServices
 import Foundation
 
 struct CodexActivityPaths: Sendable {
@@ -21,26 +21,31 @@ protocol CodexActivityWatching: AnyObject {
 
 final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
     private let paths: CodexActivityPaths
-    private var calendar: Calendar
     private let queue = DispatchQueue(label: "com.codexmeter.activity-watcher", qos: .utility)
     private let queueKey = DispatchSpecificKey<UInt8>()
-    private let now: () -> Date
     private let onChange: () -> Void
-    private var sources: [DispatchSourceFileSystemObject] = []
-    private var descriptors: [Int32] = []
+    private var stream: FSEventStreamRef?
     private var isRunning = false
+
+    private static let streamCallback: FSEventStreamCallback = {
+        _, info, eventCount, eventPaths, _, _ in
+        guard let info else { return }
+        let watcher = Unmanaged<CodexActivityWatcher>
+            .fromOpaque(info)
+            .takeUnretainedValue()
+        let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+        watcher.handleEventPaths(Array(paths.prefix(eventCount)))
+    }
 
     /// Creates a watcher whose `onChange` callback runs synchronously on the
     /// watcher's private serial queue. Lifecycle methods are callback-safe.
     init(
         paths: CodexActivityPaths = .live,
-        calendar: Calendar = .autoupdatingCurrent,
-        now: @escaping () -> Date = Date.init,
+        calendar _: Calendar = .autoupdatingCurrent,
+        now _: @escaping () -> Date = Date.init,
         onChange: @escaping () -> Void
     ) {
         self.paths = paths
-        self.calendar = calendar
-        self.now = now
         self.onChange = onChange
         queue.setSpecific(key: queueKey, value: 1)
     }
@@ -74,73 +79,62 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
 
     private func bindAll() {
         tearDown()
+        guard directoryExists(at: paths.codexRoot) else { return }
 
-        bind(paths.codexRoot, isDirectory: true)
-        bind(paths.codexRoot.appendingPathComponent("logs_2.sqlite-wal"), isDirectory: false)
-        bind(paths.sessionsRoot, isDirectory: true)
-
-        let components = calendar.dateComponents([.year, .month, .day], from: now())
-        if let year = components.year,
-           let month = components.month,
-           let day = components.day {
-            bindCurrentSessionChain(year: year, month: month, day: day)
-        }
-
-        bind(paths.archivedSessionsRoot, isDirectory: true)
-    }
-
-    private func bindCurrentSessionChain(year: Int, month: Int, day: Int) {
-        let yearDirectory = paths.sessionsRoot.appendingPathComponent(String(format: "%04d", year))
-        guard directoryExists(at: yearDirectory) else { return }
-        bind(yearDirectory, isDirectory: true)
-
-        let monthDirectory = yearDirectory.appendingPathComponent(String(format: "%02d", month))
-        guard directoryExists(at: monthDirectory) else { return }
-        bind(monthDirectory, isDirectory: true)
-
-        let dayDirectory = monthDirectory.appendingPathComponent(String(format: "%02d", day))
-        guard directoryExists(at: dayDirectory) else { return }
-        bind(dayDirectory, isDirectory: true)
-
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: dayDirectory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-
-        for file in files.sorted(by: { $0.path < $1.path }) where file.pathExtension == "jsonl" {
-            guard (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-                continue
-            }
-            bind(file, isDirectory: false)
-        }
-    }
-
-    private func bind(_ url: URL, isDirectory: Bool) {
-        let descriptor = open(url.path, O_EVTONLY)
-        guard descriptor >= 0 else { return }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor,
-            eventMask: [.write, .extend, .rename, .delete, .revoke],
-            queue: queue
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
         )
-        source.setEventHandler { [weak self] in
-            guard let self else { return }
-            let event = source.data
-            self.onChange()
+        let flags = FSEventStreamCreateFlags(
+            kFSEventStreamCreateFlagFileEvents
+                | kFSEventStreamCreateFlagNoDefer
+                | kFSEventStreamCreateFlagUseCFTypes
+        )
+        guard let stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            Self.streamCallback,
+            &context,
+            [paths.codexRoot.standardizedFileURL.path] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0.2,
+            flags
+        ) else {
+            return
+        }
 
-            let pathBindingChanged = !event.intersection([.rename, .delete, .revoke]).isEmpty
-            if pathBindingChanged || (isDirectory && event.contains(.write)) {
-                self.rebind()
-            }
+        FSEventStreamSetDispatchQueue(stream, queue)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamSetDispatchQueue(stream, nil)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            return
         }
-        source.setCancelHandler {
-            close(descriptor)
+        self.stream = stream
+    }
+
+    private func handleEventPaths(_ eventPaths: [String]) {
+        guard eventPaths.contains(where: shouldRefresh(for:)) else { return }
+        onChange()
+    }
+
+    private func shouldRefresh(for eventPath: String) -> Bool {
+        let eventPath = URL(fileURLWithPath: eventPath).standardizedFileURL.path
+        let sessionsPrefix = paths.sessionsRoot.standardizedFileURL.path + "/"
+        let archivedPrefix = paths.archivedSessionsRoot.standardizedFileURL.path + "/"
+        if eventPath.hasSuffix(".jsonl"),
+           eventPath.hasPrefix(sessionsPrefix) || eventPath.hasPrefix(archivedPrefix) {
+            return true
         }
-        sources.append(source)
-        descriptors.append(descriptor)
-        source.resume()
+
+        let databasePath = paths.codexRoot
+            .appendingPathComponent("logs_2.sqlite")
+            .standardizedFileURL.path
+        return eventPath == databasePath
+            || eventPath == databasePath + "-wal"
+            || eventPath == databasePath + "-shm"
     }
 
     private func directoryExists(at url: URL) -> Bool {
@@ -157,8 +151,11 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
     }
 
     private func tearDown() {
-        sources.forEach { $0.cancel() }
-        sources.removeAll()
-        descriptors.removeAll()
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamSetDispatchQueue(stream, nil)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        self.stream = nil
     }
 }

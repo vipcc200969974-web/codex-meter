@@ -35,6 +35,65 @@ final class CodexActivityWatcherTests: XCTestCase {
         wait(for: [changed], timeout: 3)
     }
 
+    func testAppendToOlderSessionFileEmitsChange() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let olderSessions = root.appendingPathComponent("sessions/2042/07/29")
+        let currentSessions = root.appendingPathComponent("sessions/2042/08/01")
+        let archived = root.appendingPathComponent("archived_sessions")
+        try FileManager.default.createDirectory(at: olderSessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: currentSessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
+        let file = olderSessions.appendingPathComponent("rollout-old-project.jsonl")
+        try Data().write(to: file)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let changed = expectation(description: "older project emitted change")
+        let watcher = CodexActivityWatcher(
+            paths: CodexActivityPaths(
+                codexRoot: root,
+                sessionsRoot: root.appendingPathComponent("sessions"),
+                archivedSessionsRoot: archived
+            ),
+            calendar: shanghaiCalendar(),
+            now: { self.fixedNow },
+            onChange: { changed.fulfill() }
+        )
+        watcher.start()
+        defer { watcher.stop() }
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.write(contentsOf: Data("{}\n".utf8))
+        try handle.close()
+
+        wait(for: [changed], timeout: 3)
+    }
+
+    func testUnrelatedCodexFileDoesNotEmitChange() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let sessions = root.appendingPathComponent("sessions/2042/08/01")
+        let archived = root.appendingPathComponent("archived_sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let changed = expectation(description: "unrelated file stayed ignored")
+        changed.isInverted = true
+        let watcher = CodexActivityWatcher(
+            paths: CodexActivityPaths(
+                codexRoot: root,
+                sessionsRoot: root.appendingPathComponent("sessions"),
+                archivedSessionsRoot: archived
+            ),
+            calendar: shanghaiCalendar(),
+            now: { self.fixedNow },
+            onChange: { changed.fulfill() }
+        )
+        watcher.start()
+        defer { watcher.stop() }
+
+        try Data("unrelated\n".utf8).write(to: root.appendingPathComponent("config.toml"))
+
+        wait(for: [changed], timeout: 0.8)
+    }
+
     func testCallbackCanStopWatcherWithoutDeadlock() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let sessions = root.appendingPathComponent("sessions/2042/08/01")
