@@ -575,6 +575,36 @@ final class DailyTokenUsageTests: XCTestCase {
         XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 330)
     }
 
+    func testFileReaderBoundsEachReadToKeepLargeLogsLightweight() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("large.jsonl")
+        try Data(repeating: 0x78, count: 2 * 1_024 * 1_024).write(to: file)
+
+        let data = try FileHandleDailyTokenFileReader().read(from: file, offset: 0)
+
+        XCTAssertGreaterThan(data.count, 0)
+        XCTAssertLessThanOrEqual(data.count, 1 * 1_024 * 1_024)
+    }
+
+    func testProviderContinuesAcrossBoundedReadsWithoutLosingTokenEvents() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let eventPrefix = #"{"timestamp":"2026-08-01T02:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":1}}},"content":"# + "\""
+        let event = eventPrefix + String(repeating: "x", count: 700_000) + "\"}\n"
+        try String(repeating: event, count: 4).write(
+            to: root.appendingPathComponent("large.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let provider = DailyTokenUsageProvider(roots: [root], calendar: calendar)
+        let now = ISO8601DateFormatter().date(from: "2026-08-01T03:00:00Z")!
+
+        XCTAssertEqual(try provider.currentUsage(now: now).totalTokens, 4)
+    }
+
     func testConcurrentCurrentUsageCallsSerializeTheFullProviderTransition() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

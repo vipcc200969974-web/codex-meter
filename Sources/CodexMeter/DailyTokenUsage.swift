@@ -242,14 +242,45 @@ enum DailyTokenLogParser {
         decoder: any DailyTokenEventDecoding
     ) -> [DailyTokenEvent] {
         var events: [DailyTokenEvent] = []
-        for lineRange in DailyTokenLineDiscriminator.completeCandidateLineRanges(in: data) {
-            let line = data.subdata(in: lineRange)
-            if let event = decodeCandidate(data: line, inside: interval, decoder: decoder) {
-                events.append(event)
-            }
+        forEachCompleteLines(in: data, inside: interval, decoder: decoder) {
+            events.append($0)
         }
-
         return events
+    }
+
+    static func forEachCompleteLines(
+        in data: Data,
+        inside interval: DateInterval,
+        _ body: (DailyTokenEvent) throws -> Void
+    ) rethrows {
+        try forEachCompleteLines(
+            in: data,
+            inside: interval,
+            decoder: decoder,
+            body
+        )
+    }
+
+    static func forEachCompleteLines(
+        in data: Data,
+        inside interval: DateInterval,
+        decoder: any DailyTokenEventDecoding,
+        _ body: (DailyTokenEvent) throws -> Void
+    ) rethrows {
+        var lineStart = data.startIndex
+        while lineStart < data.endIndex,
+              let lineEnd = data[lineStart...].firstIndex(of: 0x0A) {
+            let line = data[lineStart..<lineEnd]
+            if DailyTokenLineDiscriminator.isTokenCount(line),
+               let event = decodeCandidate(
+                   data: Data(line),
+                   inside: interval,
+                   decoder: decoder
+               ) {
+                try body(event)
+            }
+            lineStart = data.index(after: lineEnd)
+        }
     }
 
     private static func parse(
@@ -283,25 +314,6 @@ private enum DailyTokenLineDiscriminator {
         data.range(of: rawTokenCount) != nil || data.range(of: unicodeEscape) != nil
     }
 
-    static func completeCandidateLineRanges(in data: Data) -> [Range<Data.Index>] {
-        var lineRanges = Set<Range<Data.Index>>()
-        for needle in [rawTokenCount, unicodeEscape] {
-            var searchStart = data.startIndex
-            while searchStart < data.endIndex,
-                  let match = data.range(
-                    of: needle,
-                    options: [],
-                    in: searchStart..<data.endIndex
-                  ),
-                  let lineEnd = data[match.upperBound...].firstIndex(of: 0x0A) {
-                let lineStart = data[..<match.lowerBound].lastIndex(of: 0x0A)
-                    .map { data.index(after: $0) } ?? data.startIndex
-                lineRanges.insert(lineStart..<lineEnd)
-                searchStart = data.index(after: lineEnd)
-            }
-        }
-        return lineRanges.sorted { $0.lowerBound < $1.lowerBound }
-    }
 }
 
 enum TokenCountFormatter {
@@ -330,11 +342,13 @@ protocol DailyTokenFileReading: Sendable {
 }
 
 struct FileHandleDailyTokenFileReader: DailyTokenFileReading {
+    private static let maxBytesPerRead = 1 * 1_024 * 1_024
+
     func read(from url: URL, offset: UInt64) throws -> Data {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         try handle.seek(toOffset: offset)
-        return try handle.readToEnd() ?? Data()
+        return try handle.read(upToCount: Self.maxBytesPerRead) ?? Data()
     }
 
     func readByte(from url: URL, offset: UInt64) throws -> UInt8? {
@@ -719,26 +733,26 @@ final class DailyTokenUsageProvider: DailyTokenUsageProviding, @unchecked Sendab
         fileSize: UInt64,
         interval: DateInterval
     ) throws {
-        let readStart = cursor.offset
-        let newData: Data
-        if fileSize == readStart, cursor.partial.isEmpty {
-            newData = Data()
-        } else {
-            newData = try fileReader.read(from: url, offset: readStart)
-        }
+        var nextOffset = cursor.offset
+        while nextOffset < fileSize {
+            let chunk = try fileReader.read(from: url, offset: nextOffset)
+            guard !chunk.isEmpty else {
+                throw CocoaError(.fileReadUnknown)
+            }
 
-        var combined = cursor.partial
-        combined.append(newData)
-        if let finalNewline = combined.lastIndex(of: 0x0A) {
-            let partialStart = combined.index(after: finalNewline)
-            cursor.partial = Data(combined[partialStart...])
-        } else {
-            cursor.partial = combined
+            var combined = cursor.partial
+            combined.append(chunk)
+            try DailyTokenLogParser.forEachCompleteLines(in: combined, inside: interval) { event in
+                cursor.usage = try Self.adding(cursor.usage, event.usage)
+            }
+            if let finalNewline = combined.lastIndex(of: 0x0A) {
+                cursor.partial = Data(combined[combined.index(after: finalNewline)...])
+            } else {
+                cursor.partial = combined
+            }
+            nextOffset += UInt64(chunk.count)
         }
-        for event in DailyTokenLogParser.parseCompleteLines(in: combined, inside: interval) {
-            cursor.usage = try Self.adding(cursor.usage, event.usage)
-        }
-        cursor.offset = readStart + UInt64(newData.count)
+        cursor.offset = nextOffset
     }
 
     private func isCompleteLineBoundary(

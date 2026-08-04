@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-VERSION="${CODEX_METER_VERSION:-0.1.0}"
+VERSION="${CODEX_METER_VERSION:-0.1.1}"
 BUILD_NUMBER="${CODEX_METER_BUILD_NUMBER:-1}"
 
 swift build -c release
