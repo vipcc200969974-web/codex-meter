@@ -10,6 +10,11 @@
 - Removed mock quota fallback so the app now prefers real local session-derived quotas.
 - Menu bar now displays unavailable state when no quota record is available.
 
+## [0.1.2] - 2026-09-21
+
+### Changed
+- Published the lightweight memory-optimized build with the latest quota refresh and menu-bar fixes.
+
 ## [0.1.1] - 2026-08-04
 
 ### Changed
