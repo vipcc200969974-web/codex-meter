@@ -53,6 +53,29 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertTrue(store.isTaskActive)
     }
 
+    func testIndependentActivityLoadCannotBeOverwrittenByFullUsageLoad() async {
+        let loader = ActivityWinsUsageLoader()
+        let store = UsageStore(loader: loader, watcher: SpyActivityWatcher())
+        let active = expectation(description: "activity published before full load")
+        let subscription = store.$isTaskActive.dropFirst().sink { value in
+            if value { active.fulfill() }
+        }
+        defer {
+            loader.releaseUsage()
+            store.stop()
+            subscription.cancel()
+        }
+
+        store.start()
+        await loader.waitUntilUsageStarted()
+        await fulfillment(of: [active], timeout: 1)
+        _ = await nextSnapshot(from: store) {
+            loader.releaseUsage()
+        }
+
+        XCTAssertTrue(store.isTaskActive)
+    }
+
     func testWatcherPublishesActivityWhileFullUsageLoadIsBlocked() async {
         let loader = BlockingUsageAndActivityLoader(activity: false)
         let watcher = CallbackActivityWatcher()
@@ -112,6 +135,19 @@ final class UsageStoreTests: XCTestCase {
         XCTAssertEqual(loader.callCount, 2)
         XCTAssertEqual(loader.activeCallCount, 0)
         XCTAssertEqual(loader.maxConcurrentLoads, 1)
+    }
+
+    func testRefreshPublishesRefreshingUntilLoadCompletes() async {
+        let loader = BlockingUsageLoader()
+        let store = UsageStore(loader: loader, watcher: nil)
+
+        store.refresh()
+        await loader.waitUntilStarted()
+        XCTAssertTrue(store.isRefreshing)
+
+        loader.release()
+        await loader.waitUntilCompleted(count: 1)
+        XCTAssertFalse(store.isRefreshing)
     }
 
     func testFailedQuotaReadKeepsPreviousValueAndMarksStale() async throws {
@@ -375,6 +411,33 @@ final class UsageStoreTests: XCTestCase {
         }
         XCTAssertEqual(watcher.rebindCount, 2)
         XCTAssertEqual(loader.callCount, 3)
+        XCTAssertTrue(store.isTaskActive)
+    }
+
+    func testActivityPollFindsTaskWhenFilesystemEventIsMissed() async {
+        let loader = MutableActivityUsageLoader(activity: false)
+        let scheduler = ManualUsageScheduler()
+        let store = UsageStore(
+            loader: loader,
+            watcher: SpyActivityWatcher(),
+            activityPollInterval: 5,
+            scheduler: scheduler
+        )
+        let active = expectation(description: "activity poll published active state")
+        let subscription = store.$isTaskActive.dropFirst().sink { value in
+            if value { active.fulfill() }
+        }
+        defer {
+            store.stop()
+            subscription.cancel()
+        }
+
+        store.start()
+        await loader.waitUntilActivityLoaded(count: 1)
+        loader.setActivity(true)
+        scheduler.advance(by: 5)
+
+        await fulfillment(of: [active], timeout: 1)
         XCTAssertTrue(store.isTaskActive)
     }
 
@@ -1013,6 +1076,98 @@ final class BlockingUsageAndActivityLoader: UsageLoading, TaskActivityLoading, @
         usageReleased = true
         condition.broadcast()
         condition.unlock()
+    }
+}
+
+final class ActivityWinsUsageLoader: UsageLoading, TaskActivityLoading, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var usageStarted = false
+    private var usageReleased = false
+    private var usageStartedContinuation: CheckedContinuation<Void, Never>?
+
+    func load(now: Date) -> UsageLoadResult {
+        condition.lock()
+        usageStarted = true
+        let started = usageStartedContinuation
+        usageStartedContinuation = nil
+        condition.unlock()
+        started?.resume()
+
+        condition.lock()
+        while !usageReleased {
+            condition.wait()
+        }
+        condition.unlock()
+        return UsageLoadResult(quota: nil, dailyTokens: nil, isTaskActive: false)
+    }
+
+    func loadActivity(now: Date) -> Bool? {
+        true
+    }
+
+    func waitUntilUsageStarted() async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if usageStarted {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                usageStartedContinuation = continuation
+                condition.unlock()
+            }
+        }
+    }
+
+    func releaseUsage() {
+        condition.lock()
+        usageReleased = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+final class MutableActivityUsageLoader: UsageLoading, TaskActivityLoading, @unchecked Sendable {
+    private let lock = NSLock()
+    private var activity: Bool
+    private var activityCalls = 0
+    private var activityWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(activity: Bool) {
+        self.activity = activity
+    }
+
+    func load(now: Date) -> UsageLoadResult {
+        .empty
+    }
+
+    func loadActivity(now: Date) -> Bool? {
+        lock.lock()
+        activityCalls += 1
+        let result = activity
+        let ready = activityWaiters.filter { $0.count <= activityCalls }
+        activityWaiters.removeAll { $0.count <= activityCalls }
+        lock.unlock()
+        ready.forEach { $0.continuation.resume() }
+        return result
+    }
+
+    func setActivity(_ activity: Bool) {
+        lock.lock()
+        self.activity = activity
+        lock.unlock()
+    }
+
+    func waitUntilActivityLoaded(count: Int) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if activityCalls >= count {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                activityWaiters.append((count, continuation))
+                lock.unlock()
+            }
+        }
     }
 }
 

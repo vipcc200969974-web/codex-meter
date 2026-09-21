@@ -21,8 +21,8 @@ final class CompactStatusItemViewTests: XCTestCase {
         XCTAssertEqual(resetFrame.maxX + 5, layout.activityDividerFrame.minX)
         XCTAssertEqual(layout.activityDividerFrame.size, quotaDivider.size)
         XCTAssertEqual(layout.activityDividerFrame.midY, quotaDivider.midY)
-        XCTAssertEqual(layout.ringFrame.width, 12.5)
-        XCTAssertEqual(layout.ringFrame.height, 12.5)
+        XCTAssertEqual(layout.ringFrame.width, 14)
+        XCTAssertEqual(layout.ringFrame.height, 14)
         XCTAssertEqual(layout.ringFrame.midY, 12)
         XCTAssertEqual(layout.activityDividerFrame.maxX + 5, layout.ringFrame.minX)
         XCTAssertEqual(layout.ringFrame.maxX + 6, layout.totalWidth)
@@ -42,23 +42,17 @@ final class CompactStatusItemViewTests: XCTestCase {
         XCTAssertEqual(layout.activityDividerFrame.maxX + 5, layout.ringFrame.minX)
     }
 
-    func testActivityRingPathUsesRoundedShortDashes() {
-        let path = StatusActivityRingPath.make(
-            in: NSRect(x: 0, y: 0, width: 12.5, height: 12.5),
+    func testActivityGearPathHasTeethAndHub() {
+        let path = StatusActivityGearPath.make(
+            in: NSRect(x: 0, y: 0, width: 14, height: 14),
             angleDegrees: 90
         )
-        var count = 0
-        var phase: CGFloat = 0
-        path.getLineDash(nil, count: &count, phase: &phase)
-        var pattern = [CGFloat](repeating: 0, count: count)
-        pattern.withUnsafeMutableBufferPointer {
-            path.getLineDash($0.baseAddress, count: &count, phase: &phase)
-        }
 
-        XCTAssertEqual(path.lineWidth, 1.5)
+        XCTAssertEqual(path.lineWidth, 2.0, accuracy: 0.01)
+        XCTAssertEqual(path.lineJoinStyle, .round)
         XCTAssertEqual(path.lineCapStyle, .round)
-        XCTAssertEqual(pattern, [1.6, 2.4])
-        XCTAssertEqual(phase, 0)
+        XCTAssertEqual(StatusActivityGearPath.toothCount, 6)
+        XCTAssertGreaterThanOrEqual(path.elementCount, StatusActivityGearPath.toothCount * 4 + 2)
     }
 
     func testIdleLaunchKeepsTopFacingRingWithoutTimer() {
@@ -91,6 +85,49 @@ final class CompactStatusItemViewTests: XCTestCase {
 
         update(view, isTaskActive: false)
         update(view, isTaskActive: false)
+
+        XCTAssertEqual(factory.cancelledCount, 1)
+    }
+
+    func testRefreshingStateStartsAnimationWithoutTaskActivity() {
+        let factory = SpyStatusAnimationFactory()
+        let view = CompactStatusItemView(animationFactory: factory.make)
+
+        view.update(
+            percentText: "64%",
+            resetText: "6d0h",
+            color: .labelColor,
+            backgroundColor: .systemGreen,
+            tooltip: "test",
+            isTaskActive: false,
+            isRefreshing: true
+        )
+
+        XCTAssertEqual(factory.createdCount, 1)
+    }
+
+    func testRefreshingStateStopsAnimationWhenRefreshFinishes() {
+        let factory = SpyStatusAnimationFactory()
+        let view = CompactStatusItemView(animationFactory: factory.make)
+
+        view.update(
+            percentText: "64%",
+            resetText: "6d0h",
+            color: .labelColor,
+            backgroundColor: .systemGreen,
+            tooltip: "test",
+            isTaskActive: false,
+            isRefreshing: true
+        )
+        view.update(
+            percentText: "64%",
+            resetText: "6d0h",
+            color: .labelColor,
+            backgroundColor: .systemGreen,
+            tooltip: "test",
+            isTaskActive: false,
+            isRefreshing: false
+        )
 
         XCTAssertEqual(factory.cancelledCount, 1)
     }

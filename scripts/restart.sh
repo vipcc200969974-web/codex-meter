@@ -9,4 +9,4 @@ if [ ! -d "$APP_PATH" ]; then
 fi
 
 pkill -x CodexMeter 2>/dev/null || true
-open -n -a "$APP_PATH"
+open -n "$APP_PATH"

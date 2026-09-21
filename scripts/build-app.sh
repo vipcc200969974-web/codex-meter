@@ -7,7 +7,11 @@ cd "$ROOT_DIR"
 VERSION="${CODEX_METER_VERSION:-0.1.1}"
 BUILD_NUMBER="${CODEX_METER_BUILD_NUMBER:-1}"
 
-swift build -c release
+BUILD_ARGS=(--build-system native --disable-sandbox -c release)
+if [[ -n "${CODEX_METER_SDK:-}" ]]; then
+  BUILD_ARGS+=(--sdk "$CODEX_METER_SDK")
+fi
+swift build "${BUILD_ARGS[@]}"
 
 APP_DIR="$ROOT_DIR/build/Codex Meter.app"
 rm -rf "$APP_DIR"

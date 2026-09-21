@@ -6,24 +6,26 @@ import SwiftUI
 import UserNotifications
 
 @main
-struct CodexMeterApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-
-    var body: some Scene {
-        Settings {
-            EmptyView()
+struct CodexMeterApp {
+    @MainActor
+    static func main() {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) {
+            application.run()
         }
     }
 }
 
 private enum PanelMetrics {
     static let cardWidth: CGFloat = 360
-    static let cardHeight: CGFloat = 340
+    static let cardHeight: CGFloat = 380
     static let windowPadding: CGFloat = 14
     static let width: CGFloat = cardWidth + windowPadding * 2
     static let height: CGFloat = cardHeight + windowPadding * 2
     static let verticalGap: CGFloat = 14
-    static let screenPadding: CGFloat = 8
+    static let screenPadding: CGFloat = 18
 }
 
 @MainActor
@@ -47,9 +49,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         snapshotCancellable = Publishers.CombineLatest(
             usageStore.$snapshot,
-            usageStore.$isTaskActive
-        ).sink { [weak self] snapshot, isTaskActive in
-            self?.updateStatusItem(with: snapshot, isTaskActive: isTaskActive)
+            Publishers.CombineLatest(
+                usageStore.$isTaskActive,
+                usageStore.$isRefreshing
+            )
+        ).sink { [weak self] snapshot, activity in
+            self?.updateStatusItem(
+                with: snapshot,
+                isTaskActive: activity.0,
+                isRefreshing: activity.1
+            )
         }
     }
 
@@ -70,7 +79,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.view = view
         statusView = view
 
-        updateStatusItem(with: usageStore.snapshot, isTaskActive: usageStore.isTaskActive)
+        updateStatusItem(
+            with: usageStore.snapshot,
+            isTaskActive: usageStore.isTaskActive,
+            isRefreshing: usageStore.isRefreshing
+        )
     }
 
     private func configurePanelWindow() {
@@ -115,7 +128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func updateStatusItem(with snapshot: UsageSnapshot, isTaskActive: Bool) {
+    private func updateStatusItem(
+        with snapshot: UsageSnapshot,
+        isTaskActive: Bool,
+        isRefreshing: Bool
+    ) {
         let quota = snapshot.quota
         let percentText = quota.isUnavailable ? "未同步" : quota.percentText
         let resetText = quota.isUnavailable ? nil : quota.shortResetText
@@ -128,7 +145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             color: quota.tagTextColor,
             backgroundColor: quota.tagBackgroundColor,
             tooltip: tooltip,
-            isTaskActive: isTaskActive
+            isTaskActive: isTaskActive,
+            isRefreshing: isRefreshing
         )
         statusItem?.length = statusView?.frame.width ?? NSStatusItem.variableLength
     }
@@ -161,7 +179,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             max(proposedX, visibleFrame.minX + PanelMetrics.screenPadding),
             visibleFrame.maxX - PanelMetrics.width - PanelMetrics.screenPadding
         )
-        let y = anchorRect.minY - PanelMetrics.height - PanelMetrics.verticalGap
+        let proposedY = anchorRect.minY - PanelMetrics.height - PanelMetrics.verticalGap
+        let y: CGFloat
+        if visibleFrame.height >= PanelMetrics.height + PanelMetrics.screenPadding * 2 {
+            y = min(
+                max(proposedY, visibleFrame.minY + PanelMetrics.screenPadding),
+                visibleFrame.maxY - PanelMetrics.height - PanelMetrics.screenPadding
+            )
+        } else {
+            // Keep the whole panel visible on short screens instead of letting
+            // the top or bottom rounded edge fall outside the screen.
+            y = visibleFrame.minY + PanelMetrics.screenPadding
+        }
         panelWindow?.setFrame(
             NSRect(x: x, y: y, width: PanelMetrics.width, height: PanelMetrics.height),
             display: true
@@ -193,7 +222,7 @@ struct CompactStatusItemLayout {
     static let horizontalPadding: CGFloat = 5
     static let dividerSpacing: CGFloat = 5
     static let dividerHeight: CGFloat = 9
-    static let ringDiameter: CGFloat = 12.5
+    static let ringDiameter: CGFloat = 14
     static let trailingPadding: CGFloat = 6
 
     let percentFrame: NSRect
@@ -297,24 +326,53 @@ private final class TimerStatusItemAnimationTask: NSObject, StatusItemAnimationT
     }
 }
 
-enum StatusActivityRingPath {
-    static let lineWidth: CGFloat = 1.5
-    static let sweepDegrees: CGFloat = 285
-    static let dashPattern: [CGFloat] = [1.6, 2.4]
+enum StatusActivityGearPath {
+    static let toothCount = 6
+    static let lineWidth: CGFloat = 2.0
 
     static func make(in frame: NSRect, angleDegrees: CGFloat) -> NSBezierPath {
         let path = NSBezierPath()
         path.lineWidth = lineWidth
+        path.lineJoinStyle = .round
         path.lineCapStyle = .round
-        dashPattern.withUnsafeBufferPointer {
-            path.setLineDash($0.baseAddress, count: $0.count, phase: 0)
+
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        let radius = min(frame.width, frame.height) / 2 - lineWidth / 2
+        let rootRadius = radius * 0.68
+        let sector = 360 / CGFloat(toothCount)
+        let points: [(CGFloat, CGFloat)] = [
+            (-0.50, rootRadius),
+            (-0.34, rootRadius),
+            (-0.28, radius),
+            (0.28, radius),
+            (0.34, rootRadius),
+            (0.50, rootRadius)
+        ]
+
+        for tooth in 0..<toothCount {
+            for (offset, pointRadius) in points {
+                let angle = (angleDegrees + CGFloat(tooth) * sector + offset * sector) * .pi / 180
+                let point = NSPoint(
+                    x: center.x + cos(angle) * pointRadius,
+                    y: center.y + sin(angle) * pointRadius
+                )
+                if path.elementCount == 0 {
+                    path.move(to: point)
+                } else {
+                    path.line(to: point)
+                }
+            }
         }
-        path.appendArc(
-            withCenter: NSPoint(x: frame.midX, y: frame.midY),
-            radius: (CompactStatusItemLayout.ringDiameter - lineWidth) / 2,
-            startAngle: angleDegrees,
-            endAngle: angleDegrees + sweepDegrees,
-            clockwise: false
+        path.close()
+
+        let hubRadius = rootRadius * 0.42
+        path.appendOval(
+            in: NSRect(
+                x: center.x - hubRadius,
+                y: center.y - hubRadius,
+                width: hubRadius * 2,
+                height: hubRadius * 2
+            )
         )
         return path
     }
@@ -331,6 +389,7 @@ final class CompactStatusItemView: NSView {
     private var color = NSColor.labelColor
     private var backgroundColor = NSColor.clear
     private var isTaskActive = false
+    private var isRefreshing = false
     private var animationTask: (any StatusItemAnimationTask)?
     private(set) var ringAngleDegrees: CGFloat = 90
 
@@ -358,13 +417,15 @@ final class CompactStatusItemView: NSView {
         color: NSColor,
         backgroundColor: NSColor,
         tooltip: String,
-        isTaskActive: Bool
+        isTaskActive: Bool,
+        isRefreshing: Bool = false
     ) {
         self.percentText = percentText
         self.resetText = resetText
         self.color = color
         self.backgroundColor = backgroundColor
         self.isTaskActive = isTaskActive
+        self.isRefreshing = isRefreshing
 
         let activityText = isTaskActive ? "ChatGPT 正在执行任务" : "当前无运行任务"
         self.toolTip = "\(tooltip)\n\(activityText)"
@@ -430,12 +491,12 @@ final class CompactStatusItemView: NSView {
         }
         drawDivider(in: layout.activityDividerFrame)
 
-        let ringPath = StatusActivityRingPath.make(
+        let gearPath = StatusActivityGearPath.make(
             in: layout.ringFrame,
             angleDegrees: ringAngleDegrees
         )
         color.setStroke()
-        ringPath.stroke()
+        gearPath.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -447,13 +508,14 @@ final class CompactStatusItemView: NSView {
     }
 
     private func updateAnimation() {
-        if isTaskActive {
+        if isTaskActive || isRefreshing {
             guard animationTask == nil else { return }
             animationTask = animationFactory(1.0 / 12.0) { [weak self] in
-                guard let self, self.isTaskActive else { return }
+                guard let self, self.isTaskActive || self.isRefreshing else { return }
                 self.ringAngleDegrees = (self.ringAngleDegrees + 30)
                     .truncatingRemainder(dividingBy: 360)
                 self.needsDisplay = true
+                self.display()
             }
         } else {
             animationTask?.cancel()
@@ -511,6 +573,8 @@ struct StatusPanelView: View {
             RefreshIconButton {
                 store.refresh()
             }
+
+            CodexCleanupButton(isTaskActive: store.isTaskActive)
 
             MoreActionsMenu(store: store)
         }
@@ -679,7 +743,7 @@ enum PanelGlassSurfaceRole {
     case actionsPopover
 
     var castsOuterShadow: Bool {
-        self == .actionsPopover
+        true
     }
 
     @ViewBuilder
@@ -756,6 +820,9 @@ struct PanelGlassBackground: View {
                 .padding(1.2)
         }
         .clipShape(shape)
+        .overlay(
+            shape.stroke(Color.black.opacity(0.18), lineWidth: 1)
+        )
     }
 }
 
@@ -768,7 +835,11 @@ private extension View {
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .stroke(Color.white.opacity(0.28), lineWidth: 0.8)
+                .stroke(Color.white.opacity(0.46), lineWidth: 0.8)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .stroke(Color.black.opacity(0.12), lineWidth: 0.6)
         )
     }
 
@@ -885,6 +956,140 @@ struct RefreshIconButton: View {
                 }
         )
         .help("刷新")
+    }
+}
+
+struct CodexCleanupButton: View {
+    let isTaskActive: Bool
+    @ObservedObject private var cleanup = CodexCleanupController.shared
+    @State private var isShowingOptions = false
+
+    var body: some View {
+        Button { isShowingOptions.toggle() } label: {
+            PanelIconFrame(systemImage: cleanup.isRunning ? "hourglass" : "sparkles")
+        }
+        .buttonStyle(.plain)
+        .help("清理 Codex 缓存与内存")
+        .accessibilityLabel("清理 Codex 缓存与内存")
+        .popover(isPresented: $isShowingOptions, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("清理 Codex").font(.headline)
+                Button {
+                    let url = URL(string: "codex://settings/browser-use")!
+                    if NSWorkspace.shared.open(url) {
+                        cleanup.message = "已打开官方浏览器设置。请选择清除缓存的图片和文件，无需重启。"
+                        isShowingOptions = false
+                    } else {
+                        cleanup.message = "无法打开清理页，请在 Codex 设置 → 浏览器中清除缓存的图片和文件。"
+                    }
+                } label: {
+                    ActionMenuRow(systemImage: "sparkles", title: "仅清缓存（不重启）", trailing: nil)
+                }
+                .buttonStyle(.plain)
+                .disabled(cleanup.isRunning)
+                Text("打开官方清理页，选择“缓存的图片和文件”。只释放磁盘空间，不保证降低运行内存。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
+                Text(isTaskActive ? "任务正在运行。下方重启操作会中断任务。" : "下方操作会重启 Codex / ChatGPT，中断运行任务。")
+                    .font(.caption).foregroundStyle(.orange)
+                Button {
+                    Task { await cleanup.run(clearCache: false) }
+                } label: {
+                    ActionMenuRow(systemImage: "arrow.clockwise", title: "重启释放内存", trailing: nil)
+                }
+                .buttonStyle(.plain)
+                .disabled(cleanup.isRunning)
+                Button {
+                    Task { await cleanup.run(clearCache: true) }
+                } label: {
+                    ActionMenuRow(systemImage: "arrow.triangle.2.circlepath", title: "清缓存并重启", trailing: nil)
+                }
+                .buttonStyle(.plain)
+                .disabled(cleanup.isRunning)
+                if let message = cleanup.message {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(12)
+            .frame(width: 280)
+            .background(PanelGlassBackground(role: .actionsPopover))
+        }
+    }
+}
+
+@MainActor
+final class CodexCleanupController: ObservableObject {
+    static let shared = CodexCleanupController()
+    @Published private(set) var isRunning = false
+    @Published var message: String?
+
+    func run(clearCache: Bool) async {
+        guard !isRunning else { return }
+        isRunning = true
+        message = "正在等待应用正常退出…"
+        defer { isRunning = false }
+        do {
+            let bundleID = "com.openai.codex"
+            let applications = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            guard let appURL = applications.first?.bundleURL
+                    ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+                  Bundle(url: appURL)?.bundleIdentifier == bundleID else {
+                throw CodexCacheCleanup.failure("未找到 Codex / ChatGPT 应用。")
+            }
+            guard applications.allSatisfy({ $0.bundleURL == appURL }) else {
+                throw CodexCacheCleanup.failure("检测到多个 Codex 安装同时运行，请先手动退出后重试。")
+            }
+            for application in applications {
+                guard application.terminate() else {
+                    throw CodexCacheCleanup.failure("应用未接受退出请求。请结束任务并正常退出后重试。")
+                }
+            }
+            let deadline = Date().addingTimeInterval(40)
+            while try CodexCacheCleanup.isAppRunning(at: appURL) {
+                guard Date() < deadline else {
+                    throw CodexCacheCleanup.failure("Codex 或其后台进程仍未退出，未清理缓存，也未强制结束任务。请正常退出应用后重试。")
+                }
+                try await Task.sleep(for: .milliseconds(400))
+            }
+
+            var removed = 0
+            var cleanupError: String?
+            if clearCache {
+                do {
+                    let home = FileManager.default.homeDirectoryForCurrentUser
+                    removed = try await Task.detached {
+                        try CodexCacheCleanup.clear(home: home, isAppRunning: {
+                            try CodexCacheCleanup.isAppRunning(at: appURL)
+                        })
+                    }.value
+                } catch {
+                    cleanupError = error.localizedDescription
+                }
+            }
+            // Reopen even after a partial cache failure; never strand the user after quitting.
+            let relaunched: NSRunningApplication
+            do {
+                relaunched = try await NSWorkspace.shared.openApplication(
+                    at: appURL, configuration: NSWorkspace.OpenConfiguration()
+                )
+            } catch {
+                throw CodexCacheCleanup.failure("应用已退出，但重新打开失败，请手动打开 \(appURL.lastPathComponent)。\n"
+                    + (cleanupError ?? (clearCache ? "已清理 \(removed) 个缓存目录。" : "未删除缓存。")))
+            }
+            let launchDeadline = Date().addingTimeInterval(20)
+            while !relaunched.isFinishedLaunching && !relaunched.isTerminated && Date() < launchDeadline {
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            guard relaunched.isFinishedLaunching && !relaunched.isTerminated else {
+                throw CodexCacheCleanup.failure("已请求重新打开应用，但尚未确认启动完成，请检查 Codex 窗口。")
+            }
+            message = cleanupError.map { "Codex 已重新打开，但缓存清理未完成：\n\($0)" }
+                ?? (clearCache
+                    ? "已清理 \(removed) 个缓存目录，并重新打开 Codex。"
+                    : "已重新打开 Codex，未删除磁盘缓存。")
+        } catch {
+            message = "操作未完成：" + error.localizedDescription
+        }
     }
 }
 
@@ -1226,15 +1431,16 @@ typealias UsageWatcherFactory = (_ onChange: @escaping () -> Void) -> any CodexA
 final class UsageStore: ObservableObject {
     @Published var snapshot: UsageSnapshot
     @Published private(set) var isTaskActive = false
+    @Published private(set) var isRefreshing = false
     @Published var voiceBroadcastEnabled = false
     @Published var voiceBroadcastIntervalMinutes: Int
 
     private var fallbackTask: (any UsageScheduledTask)?
+    private var activityPollTask: (any UsageScheduledTask)?
     private var debounceTask: (any UsageScheduledTask)?
     private var activityDebounceTask: (any UsageScheduledTask)?
     private var midnightTask: (any UsageScheduledTask)?
     private var voiceTimer: Timer?
-    private var isRefreshing = false
     private var refreshPending = false
     private var isActivityRefreshing = false
     private var activityRefreshPending = false
@@ -1248,12 +1454,14 @@ final class UsageStore: ObservableObject {
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var notifiedLevels = Set<Int>()
     private var lastTaskActivitySuccessAt: Date?
+    private var activityCompletionGeneration: UInt = 0
     private let loader: any UsageLoading
     private let activityLoader: (any TaskActivityLoading)?
     private var watcher: CodexActivityWatching?
     private let createsWatcher: Bool
     private let debounceInterval: TimeInterval
     private let fallbackInterval: TimeInterval
+    private let activityPollInterval: TimeInterval
     private let scheduler: any UsageScheduling
     private let calendar: Calendar
     private let now: @Sendable () -> Date
@@ -1267,6 +1475,7 @@ final class UsageStore: ObservableObject {
         watcher: CodexActivityWatching? = nil,
         debounceInterval: TimeInterval = 0.8,
         fallbackInterval: TimeInterval = 60,
+        activityPollInterval: TimeInterval = 5,
         scheduler: any UsageScheduling = FoundationUsageScheduler(),
         calendar: Calendar = .autoupdatingCurrent,
         now: @escaping @Sendable () -> Date = Date.init,
@@ -1280,6 +1489,7 @@ final class UsageStore: ObservableObject {
         self.createsWatcher = watcher == nil
         self.debounceInterval = debounceInterval
         self.fallbackInterval = fallbackInterval
+        self.activityPollInterval = max(1, activityPollInterval)
         self.scheduler = scheduler
         self.calendar = calendar
         self.now = now
@@ -1331,6 +1541,19 @@ final class UsageStore: ObservableObject {
             }
             self.refreshAfterWakeOrUnlock()
         }
+        if activityLoader != nil {
+            activityPollTask = scheduler.schedule(
+                after: activityPollInterval,
+                repeating: activityPollInterval
+            ) { [weak self] in
+                guard let self,
+                      self.isStarted,
+                      self.lifecycleGeneration == generation else {
+                    return
+                }
+                self.refreshActivity()
+            }
+        }
         scheduleNextLocalMidnight(generation: generation)
     }
 
@@ -1350,6 +1573,8 @@ final class UsageStore: ObservableObject {
         activityDebounceTask = nil
         fallbackTask?.cancel()
         fallbackTask = nil
+        activityPollTask?.cancel()
+        activityPollTask = nil
         midnightTask?.cancel()
         midnightTask = nil
         voiceTimer?.invalidate()
@@ -1419,6 +1644,7 @@ final class UsageStore: ObservableObject {
         isRefreshing = true
         let loader = loader
         let generation = lifecycleGeneration
+        let activityCompletionAtLoad = activityCompletionGeneration
 
         refreshQueue.async { [weak self] in
             let result = loader.load(now: loadDate)
@@ -1437,7 +1663,10 @@ final class UsageStore: ObservableObject {
                 let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
                 let hasFreshQuota = acceptedQuota != nil
                 let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
-                self.applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
+                if self.activityLoader == nil
+                    || self.activityCompletionGeneration == activityCompletionAtLoad {
+                    self.applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
+                }
                 self.snapshot = UsageSnapshot(
                     quota: quota,
                     dailyTokens: tokens,
@@ -1476,6 +1705,7 @@ final class UsageStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, self.lifecycleGeneration == generation else { return }
                 self.applyTaskActivity(isTaskActive, loadedAt: loadDate)
+                self.activityCompletionGeneration &+= 1
                 self.isActivityRefreshing = false
                 if self.activityRefreshPending {
                     self.activityRefreshPending = false
@@ -1540,6 +1770,7 @@ final class UsageStore: ObservableObject {
         debounceTask?.cancel()
         activityDebounceTask?.cancel()
         fallbackTask?.cancel()
+        activityPollTask?.cancel()
         midnightTask?.cancel()
         voiceTimer?.invalidate()
         if isStarted {
@@ -1680,21 +1911,37 @@ protocol QuotaObservationProviding: Sendable {
 
 struct CompositeQuotaProvider: Sendable {
     private let providers: [any QuotaObservationProviding]
+    private let fallbackAge: TimeInterval
 
-    init(providers: [any QuotaObservationProviding] = [
-        CodexLogQuotaProvider(),
-        CodexSessionQuotaProvider()
-    ]) {
+    init(
+        providers: [any QuotaObservationProviding] = [
+            CodexLogQuotaProvider(),
+            CodexSessionQuotaProvider()
+        ],
+        fallbackAge: TimeInterval = 2 * 60
+    ) {
         self.providers = providers
+        self.fallbackAge = max(0, fallbackAge)
     }
 
     func currentObservation(now: Date = Date()) -> QuotaObservation? {
+        var best: QuotaObservation?
         for provider in providers {
-            if let observation = Self.merge(provider.currentWindowObservations(), now: now) {
-                return observation
+            guard let observation = Self.merge(
+                provider.currentWindowObservations(),
+                now: now
+            ) else {
+                continue
+            }
+
+            if best.map({ observation.observedAt > $0.observedAt }) ?? true {
+                best = observation
+            }
+            if observation.observedAt >= now.addingTimeInterval(-fallbackAge) {
+                break
             }
         }
-        return nil
+        return best
     }
 
     static func merge(_ candidates: [ObservedRateLimitWindow], now: Date) -> QuotaObservation? {
@@ -1854,12 +2101,24 @@ struct CodexLogQuotaProvider: QuotaObservationProviding {
     }
 }
 
-struct CodexSessionQuotaProvider: QuotaObservationProviding {
+final class CodexSessionQuotaProvider: QuotaObservationProviding, @unchecked Sendable {
+    private static let oversizedTailBytes: UInt64 = 4 * 1_024 * 1_024
+    private static let oversizedFileRecencyHorizon: TimeInterval = 15 * 60
+    private static let freshObservationAge: TimeInterval = 2 * 60
+
+    private struct CachedFile {
+        let modifiedAt: Date
+        let byteCount: UInt64
+        let records: [RateLimitRecord]
+    }
+
     private let roots: [URL]
     private let maxBytesPerFile: UInt64
     private let maxTotalBytes: UInt64
     private let fileDiscovery: any SessionFileDiscovering
     private let now: @Sendable () -> Date
+    private let cacheLock = NSLock()
+    private var parsedFiles: [String: CachedFile] = [:]
 
     init(
         roots: [URL]? = nil,
@@ -1900,37 +2159,88 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         } catch {
             return nil
         }
-        let filesToScan = filesWithinScanBudget(files)
+        let filesToScan = filesWithinScanBudget(files, now: now)
 
         var records: [RateLimitRecord] = []
         for file in filesToScan {
-            guard let fileRecords = rateLimitRecords(
-                in: file.url,
-                expectedByteCount: file.byteCount,
-                fileModifiedAt: file.modifiedAt,
+            guard let fileRecords = cachedRecords(
+                for: file,
                 now: now,
                 lowerBound: lowerBound
             ) else {
                 return nil
             }
             records.append(contentsOf: fileRecords)
+            if fileRecords.contains(where: {
+                let age = now.timeIntervalSince($0.sortDate)
+                return age >= 0 && age <= Self.freshObservationAge
+            }) {
+                return records
+            }
         }
 
         return records
     }
 
-    private func filesWithinScanBudget(_ files: [SessionFile]) -> [SessionFile] {
+    private func cachedRecords(
+        for file: SessionFile,
+        now: Date,
+        lowerBound: Date
+    ) -> [RateLimitRecord]? {
+        let key = file.url.standardizedFileURL.path
+        cacheLock.lock()
+        if let cached = parsedFiles[key],
+           cached.modifiedAt == file.modifiedAt,
+           cached.byteCount == file.byteCount {
+            let records = cached.records
+            cacheLock.unlock()
+            return records
+        }
+        cacheLock.unlock()
+
+        guard let records = rateLimitRecords(
+            in: file.url,
+            expectedByteCount: file.byteCount,
+            fileModifiedAt: file.modifiedAt,
+            now: now,
+            lowerBound: lowerBound,
+            tailOnly: file.byteCount > maxBytesPerFile
+        ) else {
+            cacheLock.lock()
+            parsedFiles.removeValue(forKey: key)
+            cacheLock.unlock()
+            return nil
+        }
+
+        cacheLock.lock()
+        parsedFiles[key] = CachedFile(
+            modifiedAt: file.modifiedAt,
+            byteCount: file.byteCount,
+            records: records
+        )
+        cacheLock.unlock()
+        return records
+    }
+
+    private func filesWithinScanBudget(_ files: [SessionFile], now: Date) -> [SessionFile] {
         var selected: [SessionFile] = []
         var totalBytes: UInt64 = 0
 
         for file in files {
-            guard file.byteCount <= maxBytesPerFile,
-                  file.byteCount <= maxTotalBytes,
-                  totalBytes <= maxTotalBytes - file.byteCount else {
+            let tailOnly = file.byteCount > maxBytesPerFile
+            guard !tailOnly || now.timeIntervalSince(file.modifiedAt)
+                <= Self.oversizedFileRecencyHorizon else {
+                continue
+            }
+            let scanBytes = tailOnly
+                ? min(file.byteCount, Self.oversizedTailBytes)
+                : file.byteCount
+            guard scanBytes <= maxTotalBytes,
+                  totalBytes <= maxTotalBytes - scanBytes else {
                 continue
             }
             selected.append(file)
-            totalBytes += file.byteCount
+            totalBytes += scanBytes
         }
         return selected
     }
@@ -1969,7 +2279,8 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
         expectedByteCount: UInt64,
         fileModifiedAt: Date,
         now: Date,
-        lowerBound: Date
+        lowerBound: Date,
+        tailOnly: Bool
     ) -> [RateLimitRecord]? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
@@ -1983,10 +2294,13 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             return nil
         }
         guard earlierOffset == expectedByteCount else { return nil }
+        let scanLowerBound = tailOnly
+            ? earlierOffset - min(earlierOffset, Self.oversizedTailBytes)
+            : 0
         var laterFragment = Data()
 
-        while earlierOffset > 0 {
-            let byteCount = Int(min(UInt64(chunkSize), earlierOffset))
+        while earlierOffset > scanLowerBound {
+            let byteCount = Int(min(UInt64(chunkSize), earlierOffset - scanLowerBound))
             earlierOffset -= UInt64(byteCount)
 
             let chunk: Data
@@ -2002,7 +2316,7 @@ struct CodexSessionQuotaProvider: QuotaObservationProviding {
             combined.append(laterFragment)
             let fragments = combined.split(separator: 0x0A, omittingEmptySubsequences: false)
             let firstCompleteIndex: Int
-            if earlierOffset > 0 {
+            if earlierOffset > scanLowerBound {
                 if let firstFragment = fragments.first {
                     laterFragment = Data(firstFragment)
                 } else {

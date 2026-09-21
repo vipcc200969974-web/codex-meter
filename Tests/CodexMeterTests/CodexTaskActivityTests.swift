@@ -532,6 +532,18 @@ final class CodexTaskActivityTests: XCTestCase {
         )
     }
 
+    func testOldOversizedSessionDoesNotBlockRecentActiveSession() throws {
+        try writeLifecycle(.started, turnID: "live", to: activeFile, at: now)
+        let oldFile = activeRoot.appendingPathComponent("rollout-old.jsonl")
+        try createSparseFile(at: oldFile, size: 1_024 * 1_024)
+        try setModificationDate(now.addingTimeInterval(-3_600), for: oldFile)
+
+        XCTAssertTrue(
+            try makeProvider(maxBytesPerFile: 512, maxTotalBytes: 512)
+                .currentActivity(now: now)
+        )
+    }
+
     func testSameIdentityLargerRewriteRebuildsFromLifecycleNearBeginning() throws {
         try writeLifecycle(.started, turnID: "old", to: activeFile, at: now.addingTimeInterval(-10))
         let provider = makeProvider()
@@ -668,6 +680,7 @@ final class CodexTaskActivityTests: XCTestCase {
 
     func testColdActiveFileLargerThanReconstructionBudgetIsRefused() throws {
         try createSparseFile(at: activeFile, size: 1_025)
+        try setModificationDate(now.addingTimeInterval(-60), for: activeFile)
 
         XCTAssertThrowsError(
             try makeProvider(maxBytesPerFile: 1_024, maxTotalBytes: 4_096)
@@ -675,6 +688,19 @@ final class CodexTaskActivityTests: XCTestCase {
         ) {
             XCTAssertEqual($0 as? CodexTaskActivityProviderError, .fileTooLarge)
         }
+    }
+
+    func testRecentlyModifiedOversizedSessionIsActiveWithoutFullReconstruction() throws {
+        try createSparseFile(
+            at: activeFile,
+            size: 16 * 1_024 * 1_024 + 1
+        )
+        try setModificationDate(now, for: activeFile)
+
+        XCTAssertTrue(
+            try makeProvider(maxBytesPerFile: 1_024, maxTotalBytes: 4_096)
+                .currentActivity(now: now)
+        )
     }
 
     func testColdActiveAggregateLargerThanReconstructionBudgetIsRefused() throws {

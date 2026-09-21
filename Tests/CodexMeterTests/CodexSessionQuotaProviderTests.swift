@@ -315,6 +315,45 @@ final class CodexSessionQuotaProviderTests: XCTestCase {
         XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_200))
     }
 
+    func testRecentlyModifiedOversizedSessionTailProvidesNewestQuota() throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let activeRoot = temporaryRoot.appendingPathComponent("sessions")
+        let url = activeRoot.appendingPathComponent("large-active.jsonl")
+        let padding = Data(repeating: 0x20, count: 16 * 1_024 * 1_024)
+        try FileManager.default.createDirectory(at: activeRoot, withIntermediateDirectories: true)
+        try padding.write(to: url)
+        let newest = rateLimitLine(
+            timestamp: 1_200,
+            usedPercent: 52,
+            resetsAt: 2_000,
+            windowMinutes: 10_080
+        )
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((newest + "\n").utf8))
+        try FileManager.default.setAttributes(
+            [.modificationDate: now],
+            ofItemAtPath: url.path
+        )
+
+        let testNow = now
+        let weekly = try XCTUnwrap(
+            CodexSessionQuotaProvider(
+                roots: [activeRoot],
+                maxBytesPerFile: 1_024,
+                maxTotalBytes: 8 * 1_024 * 1_024,
+                now: { testNow }
+            ).currentWindowObservations().first { $0.window.kind == .weekly }
+        )
+
+        XCTAssertEqual(weekly.window.usedPercent, 52)
+        XCTAssertEqual(weekly.observedAt, Date(timeIntervalSince1970: 1_200))
+    }
+
     func testAggregateBudgetKeepsNewestFileThatFits() throws {
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-meter-sessions-\(UUID().uuidString)")

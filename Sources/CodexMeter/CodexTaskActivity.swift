@@ -303,6 +303,8 @@ enum CodexTaskActivityProviderError: Error, Equatable {
 final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Sendable {
     private static let cacheSchemaVersion = 3
     private static let activityHorizon: TimeInterval = 86_400
+    private static let oversizedActivityRecencyHorizon: TimeInterval = 20
+    private static let oversizedActivityMinimumBytes: UInt64 = 16 * 1_024 * 1_024
     private static let orphanedStartHorizon: TimeInterval = 15 * 60
     private static let maxCacheBytes: UInt64 = 4 * 1_024 * 1_024
     private static let readChunkBytes = 4 * 1_024 * 1_024
@@ -451,9 +453,20 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
         var refreshed = didLoadCache ? cursors : loadCache(now: now, lowerBound: lowerBound)
         let candidates = try discoverCandidates(modifiedAtOrAfter: lowerBound)
 
+        if candidates.contains(where: {
+            !$0.isArchived
+                && $0.byteCount >= Self.oversizedActivityMinimumBytes
+                && $0.byteCount > maxBytesPerFile
+                && now.timeIntervalSince($0.modifiedAt) <= Self.oversizedActivityRecencyHorizon
+        }) {
+            return true
+        }
+
         var discoveredKeys = Set<CursorKey>()
         var modifiedAtByKey: [CursorKey: Date] = [:]
         var unreadAggregate: UInt64 = 0
+        var budgetError: CodexTaskActivityProviderError?
+        var processedCandidateCount = 0
         for candidate in candidates {
             let key = candidate.key
             guard refreshed[key] != nil || !candidate.isArchived else {
@@ -467,11 +480,17 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                 try catchUpLegacyCursor(&cursor, from: candidate)
             }
             let unreadByteCount = candidate.byteCount - cursor.offset
-            try validateBudget(
-                unreadByteCount: unreadByteCount,
-                aggregate: &unreadAggregate
-            )
+            do {
+                try validateBudget(
+                    unreadByteCount: unreadByteCount,
+                    aggregate: &unreadAggregate
+                )
+            } catch let error as CodexTaskActivityProviderError {
+                budgetError = budgetError ?? error
+                continue
+            }
             try updatePrepared(&cursor, from: candidate)
+            processedCandidateCount += 1
             cursor.turnStates = cursor.turnStates.filter { $0.value.timestamp >= lowerBound }
             refreshed[key] = cursor
         }
@@ -497,6 +516,9 @@ final class CodexTaskActivityProvider: CodexTaskActivityProviding, @unchecked Se
                     into: &latestStates
                 )
             }
+        }
+        if (latestStates.isEmpty || processedCandidateCount == 0), let budgetError {
+            throw budgetError
         }
         let activeLowerBound = now.addingTimeInterval(-Self.orphanedStartHorizon)
         return latestStates.values.contains {

@@ -73,6 +73,36 @@ final class QuotaObservationSelectionTests: XCTestCase {
         XCTAssertEqual(fallback.invocationCount, 1)
     }
 
+    func testStalePrimaryInvokesFallbackAndUsesNewerObservation() throws {
+        let primary = CountingQuotaProvider(observations: [
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 13, resetsAt: 2_000, windowMinutes: 10_080),
+                observedAt: Date(timeIntervalSince1970: 700),
+                sourceName: "Codex 日志"
+            )
+        ])
+        let fallback = CountingQuotaProvider(observations: [
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 3, resetsAt: 2_000, windowMinutes: 10_080),
+                observedAt: Date(timeIntervalSince1970: 950),
+                sourceName: "Codex 会话"
+            )
+        ])
+
+        let result = try XCTUnwrap(
+            CompositeQuotaProvider(
+                providers: [primary, fallback],
+                fallbackAge: 120
+            ).currentObservation(now: now)
+        )
+
+        XCTAssertEqual(result.windowSet.weekly?.usedPercent, 3)
+        XCTAssertEqual(result.sourceName, "Codex 会话")
+        XCTAssertEqual(result.observedAt, Date(timeIntervalSince1970: 950))
+        XCTAssertEqual(primary.invocationCount, 1)
+        XCTAssertEqual(fallback.invocationCount, 1)
+    }
+
     func testNewerSourceWinsWhenResetWindowChanges() throws {
         let old = ObservedRateLimitWindow(
             window: RateLimitWindow(usedPercent: 80, resetsAt: 1_500, windowMinutes: 300),
