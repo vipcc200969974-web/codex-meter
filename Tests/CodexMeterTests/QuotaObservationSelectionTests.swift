@@ -73,6 +73,30 @@ final class QuotaObservationSelectionTests: XCTestCase {
         XCTAssertEqual(fallback.invocationCount, 1)
     }
 
+    func testObservationLowerBoundDropsPreLoginQuota() throws {
+        let provider = CountingQuotaProvider(observations: [
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 82, resetsAt: 2_000, windowMinutes: 300),
+                observedAt: Date(timeIntervalSince1970: 900),
+                sourceName: "Codex 日志"
+            ),
+            ObservedRateLimitWindow(
+                window: RateLimitWindow(usedPercent: 17, resetsAt: 2_000, windowMinutes: 300),
+                observedAt: Date(timeIntervalSince1970: 1_100),
+                sourceName: "Codex 日志"
+            )
+        ])
+
+        let result = try XCTUnwrap(
+            CompositeQuotaProvider(
+                providers: [provider],
+                observationLowerBound: { Date(timeIntervalSince1970: 1_000) }
+            ).currentObservation(now: now)
+        )
+
+        XCTAssertEqual(result.windowSet.fiveHour?.usedPercent, 17)
+    }
+
     func testStalePrimaryInvokesFallbackAndUsesNewerObservation() throws {
         let primary = CountingQuotaProvider(observations: [
             ObservedRateLimitWindow(

@@ -31,8 +31,10 @@ private enum PanelMetrics {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let usageStore = UsageStore(
-        cachedQuota: QuotaSnapshot.cached(),
-        cacheQuota: { $0.cache() }
+        cachedQuota: QuotaSnapshot.cached(forAccountID: CodexAccountIdentity.current()?.id),
+        accountID: CodexAccountIdentity.current()?.id,
+        accountActivationDate: CodexAccountIdentity.current()?.activationDate,
+        cacheQuota: { $0.cache(forAccountID: CodexAccountIdentity.current()?.id) }
     )
     private var statusItem: NSStatusItem?
     private var statusView: CompactStatusItemView?
@@ -1318,18 +1320,55 @@ struct UsageLoadResult: Sendable {
     let quota: QuotaSnapshot?
     let dailyTokens: DailyTokenUsage?
     let isTaskActive: Bool?
+    let accountID: String?
 
     init(
         quota: QuotaSnapshot?,
         dailyTokens: DailyTokenUsage?,
-        isTaskActive: Bool? = nil
+        isTaskActive: Bool? = nil,
+        accountID: String? = nil
     ) {
         self.quota = quota
         self.dailyTokens = dailyTokens
         self.isTaskActive = isTaskActive
+        self.accountID = accountID
     }
 
     static let empty = UsageLoadResult(quota: nil, dailyTokens: nil)
+}
+
+struct CodexAccountIdentity: Sendable, Equatable {
+    let id: String
+    let activationDate: Date?
+
+    static func current() -> CodexAccountIdentity? {
+        let authURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/auth.json")
+        guard let data = try? Data(contentsOf: authURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = object["tokens"] as? [String: Any],
+              let accountID = tokens["account_id"] as? String,
+              !accountID.isEmpty else {
+            return nil
+        }
+
+        let fileDate = (try? authURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let refreshDate = (object["last_refresh"] as? String).flatMap(parseDate)
+        let activationDate = [refreshDate, fileDate].compactMap { $0 }.max()
+        return CodexAccountIdentity(id: accountID, activationDate: activationDate)
+    }
+
+    private static func parseDate(_ value: String) -> Date? {
+        let fractionalFormatter = ISO8601DateFormatter()
+        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractionalFormatter.date(from: value) {
+            return date
+        }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
 }
 
 protocol UsageLoading: Sendable {
@@ -1346,7 +1385,9 @@ final class LocalUsageLoader: UsageLoading, TaskActivityLoading, @unchecked Send
     private let taskActivityProvider: any CodexTaskActivityProviding
 
     init(
-        quotaProvider: CompositeQuotaProvider = CompositeQuotaProvider(),
+        quotaProvider: CompositeQuotaProvider = CompositeQuotaProvider(
+            observationLowerBound: { CodexAccountIdentity.current()?.activationDate }
+        ),
         tokenProvider: any DailyTokenUsageProviding = DailyTokenUsageProvider(),
         taskActivityProvider: any CodexTaskActivityProviding = CodexTaskActivityProvider()
     ) {
@@ -1356,12 +1397,14 @@ final class LocalUsageLoader: UsageLoading, TaskActivityLoading, @unchecked Send
     }
 
     func load(now: Date) -> UsageLoadResult {
+        let account = CodexAccountIdentity.current()
         let quota = quotaProvider.currentObservation(now: now).map(QuotaSnapshot.init(observation:))
         let tokens = try? tokenProvider.currentUsage(now: now)
         return UsageLoadResult(
             quota: quota,
             dailyTokens: tokens,
-            isTaskActive: loadActivity(now: now)
+            isTaskActive: loadActivity(now: now),
+            accountID: account?.id
         )
     }
 
@@ -1467,9 +1510,13 @@ final class UsageStore: ObservableObject {
     private let now: @Sendable () -> Date
     private let watcherFactory: UsageWatcherFactory
     private let cacheQuota: (QuotaSnapshot) -> Void
+    private var accountID: String?
+    private var accountActivationDate: Date?
 
     init(
         cachedQuota: QuotaSnapshot? = nil,
+        accountID: String? = CodexAccountIdentity.current()?.id,
+        accountActivationDate: Date? = CodexAccountIdentity.current()?.activationDate,
         cacheQuota: @escaping (QuotaSnapshot) -> Void = { _ in },
         loader: any UsageLoading = LocalUsageLoader(),
         watcher: CodexActivityWatching? = nil,
@@ -1495,6 +1542,8 @@ final class UsageStore: ObservableObject {
         self.now = now
         self.watcherFactory = watcherFactory
         self.cacheQuota = cacheQuota
+        self.accountID = accountID
+        self.accountActivationDate = accountActivationDate
         let cachedQuota = cachedQuota ?? .unavailable()
         self.snapshot = UsageSnapshot(
             quota: cachedQuota,
@@ -1636,6 +1685,7 @@ final class UsageStore: ObservableObject {
 
     func refresh() {
         let loadDate = now()
+        adoptAccountIfNeeded(CodexAccountIdentity.current(), at: loadDate)
         let loadDay = resetDailyTokensIfDayChanged(at: loadDate)
         guard !isRefreshing else {
             refreshPending = true
@@ -1652,17 +1702,36 @@ final class UsageStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, self.lifecycleGeneration == generation else { return }
                 let currentDay = self.resetDailyTokensIfDayChanged(at: self.now())
+                let accountBeforeResult = self.accountID
                 let old = self.snapshot
                 let acceptedQuota = result.quota.flatMap { candidate in
-                    old.quota.isUnavailable || candidate.lastUpdated >= old.quota.lastUpdated
+                    let accountMatches = result.accountID == nil
+                        || self.accountID == nil
+                        || result.accountID == self.accountID
+                    let isAfterAccountActivation = self.accountActivationDate.map {
+                        candidate.lastUpdated >= $0
+                    } ?? true
+                    accountMatches
+                        && isAfterAccountActivation
+                        && (old.quota.isUnavailable || candidate.lastUpdated >= old.quota.lastUpdated)
                         ? candidate
                         : nil
                 }
                 let quota = acceptedQuota ?? old.quota
                 let isCurrentDayLoad = loadDay == currentDay
-                let tokens = isCurrentDayLoad ? (result.dailyTokens ?? old.dailyTokens) : old.dailyTokens
+                let accountMatches = result.accountID == nil
+                    || self.accountID == nil
+                    || result.accountID == self.accountID
+                let accountChangedDuringLoad = result.accountID != nil
+                    && accountBeforeResult != result.accountID
+                let tokens = accountMatches && !accountChangedDuringLoad && isCurrentDayLoad
+                    ? (result.dailyTokens ?? old.dailyTokens)
+                    : old.dailyTokens
                 let hasFreshQuota = acceptedQuota != nil
-                let hasFreshTokens = isCurrentDayLoad && result.dailyTokens != nil
+                let hasFreshTokens = accountMatches
+                    && !accountChangedDuringLoad
+                    && isCurrentDayLoad
+                    && result.dailyTokens != nil
                 if self.activityLoader == nil
                     || self.activityCompletionGeneration == activityCompletionAtLoad {
                     self.applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
@@ -1687,6 +1756,18 @@ final class UsageStore: ObservableObject {
                 }
             }
         }
+    }
+
+    private func adoptAccountIfNeeded(_ identity: CodexAccountIdentity?, at date: Date) {
+        guard let identity, identity.id != accountID else { return }
+        accountID = identity.id
+        accountActivationDate = identity.activationDate ?? date
+        snapshot = UsageSnapshot(
+            quota: .unavailable(),
+            dailyTokens: .zero,
+            dailyTokenDay: calendar.startOfDay(for: date),
+            freshness: .unavailable
+        )
     }
 
     private func refreshActivity() {
@@ -1912,23 +1993,29 @@ protocol QuotaObservationProviding: Sendable {
 struct CompositeQuotaProvider: Sendable {
     private let providers: [any QuotaObservationProviding]
     private let fallbackAge: TimeInterval
+    private let observationLowerBound: @Sendable () -> Date?
 
     init(
         providers: [any QuotaObservationProviding] = [
             CodexLogQuotaProvider(),
             CodexSessionQuotaProvider()
         ],
-        fallbackAge: TimeInterval = 2 * 60
+        fallbackAge: TimeInterval = 2 * 60,
+        observationLowerBound: @escaping @Sendable () -> Date? = { nil }
     ) {
         self.providers = providers
         self.fallbackAge = max(0, fallbackAge)
+        self.observationLowerBound = observationLowerBound
     }
 
     func currentObservation(now: Date = Date()) -> QuotaObservation? {
         var best: QuotaObservation?
+        let lowerBound = observationLowerBound()
         for provider in providers {
             guard let observation = Self.merge(
-                provider.currentWindowObservations(),
+                provider.currentWindowObservations().filter { observation in
+                    lowerBound.map { bound in observation.observedAt >= bound } ?? true
+                },
                 now: now
             ) else {
                 continue
@@ -2941,10 +3028,16 @@ struct QuotaSnapshot: Sendable {
     }
 
     static func cached() -> QuotaSnapshot? {
+        cached(forAccountID: CodexAccountIdentity.current()?.id)
+    }
+
+    static func cached(forAccountID accountID: String?) -> QuotaSnapshot? {
+        guard let accountID else { return nil }
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: CacheKey.mainKind) != nil,
               defaults.object(forKey: CacheKey.mainRemainingPercent) != nil,
               defaults.object(forKey: CacheKey.mainResetDate) != nil,
+              defaults.string(forKey: CacheKey.accountID) == accountID,
               let mainKind = QuotaWindowKind(rawValue: defaults.integer(forKey: CacheKey.mainKind)) else {
             return nil
         }
@@ -2975,9 +3068,15 @@ struct QuotaSnapshot: Sendable {
     }
 
     func cache() {
+        cache(forAccountID: CodexAccountIdentity.current()?.id)
+    }
+
+    func cache(forAccountID accountID: String?) {
         guard let mainWindow else { return }
+        guard let accountID else { return }
 
         let defaults = UserDefaults.standard
+        defaults.set(accountID, forKey: CacheKey.accountID)
         defaults.set(mainWindow.kind.rawValue, forKey: CacheKey.mainKind)
         defaults.set(mainWindow.remainingPercent, forKey: CacheKey.mainRemainingPercent)
         defaults.set(mainWindow.resetDate.timeIntervalSince1970, forKey: CacheKey.mainResetDate)
@@ -3082,6 +3181,7 @@ struct QuotaSnapshot: Sendable {
 }
 
 private enum CacheKey {
+    static let accountID = "quota.accountID"
     static let mainKind = "quota.main.kind"
     static let mainRemainingPercent = "quota.main.remainingPercent"
     static let mainResetDate = "quota.main.resetDate"
