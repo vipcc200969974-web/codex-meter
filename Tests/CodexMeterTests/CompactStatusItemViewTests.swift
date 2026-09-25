@@ -42,20 +42,19 @@ final class CompactStatusItemViewTests: XCTestCase {
         XCTAssertEqual(layout.activityDividerFrame.maxX + 5, layout.ringFrame.minX)
     }
 
-    func testActivityGearPathHasTeethAndHub() {
-        let path = StatusActivityGearPath.make(
+    func testActivityCatPathHasFaceFeatures() {
+        let path = StatusCatPath.make(
             in: NSRect(x: 0, y: 0, width: 14, height: 14),
-            angleDegrees: 90
+            verticalOffset: 0
         )
 
-        XCTAssertEqual(path.lineWidth, 2.0, accuracy: 0.01)
+        XCTAssertEqual(path.lineWidth, StatusCatPath.lineWidth, accuracy: 0.01)
         XCTAssertEqual(path.lineJoinStyle, .round)
         XCTAssertEqual(path.lineCapStyle, .round)
-        XCTAssertEqual(StatusActivityGearPath.toothCount, 6)
-        XCTAssertGreaterThanOrEqual(path.elementCount, StatusActivityGearPath.toothCount * 4 + 2)
+        XCTAssertGreaterThanOrEqual(path.elementCount, 10)
     }
 
-    func testIdleLaunchKeepsTopFacingRingWithoutTimer() {
+    func testIdleLaunchKeepsCatStillWithoutTimer() {
         let factory = SpyStatusAnimationFactory()
         let view = CompactStatusItemView(animationFactory: factory.make)
 
@@ -68,7 +67,7 @@ final class CompactStatusItemViewTests: XCTestCase {
             isTaskActive: false
         )
 
-        XCTAssertEqual(view.ringAngleDegrees, 90)
+        XCTAssertEqual(view.catVerticalOffset, 0)
         XCTAssertEqual(factory.createdCount, 0)
         XCTAssertEqual(factory.cancelledCount, 0)
     }
@@ -89,7 +88,7 @@ final class CompactStatusItemViewTests: XCTestCase {
         XCTAssertEqual(factory.cancelledCount, 1)
     }
 
-    func testRefreshingStateStartsAnimationWithoutTaskActivity() {
+    func testRefreshingStateKeepsCatStillWithoutTaskActivity() {
         let factory = SpyStatusAnimationFactory()
         let view = CompactStatusItemView(animationFactory: factory.make)
 
@@ -103,10 +102,10 @@ final class CompactStatusItemViewTests: XCTestCase {
             isRefreshing: true
         )
 
-        XCTAssertEqual(factory.createdCount, 1)
+        XCTAssertEqual(factory.createdCount, 0)
     }
 
-    func testRefreshingStateStopsAnimationWhenRefreshFinishes() {
+    func testRefreshingStateDoesNotStartOrStopCatAnimation() {
         let factory = SpyStatusAnimationFactory()
         let view = CompactStatusItemView(animationFactory: factory.make)
 
@@ -129,22 +128,23 @@ final class CompactStatusItemViewTests: XCTestCase {
             isRefreshing: false
         )
 
-        XCTAssertEqual(factory.cancelledCount, 1)
+        XCTAssertEqual(factory.createdCount, 0)
+        XCTAssertEqual(factory.cancelledCount, 0)
     }
 
-    func testTickAdvancesThirtyDegreesAndStoppedViewIgnoresLateTick() {
+    func testTickMovesCatAndStoppedViewIgnoresLateTick() {
         let factory = SpyStatusAnimationFactory()
         let view = CompactStatusItemView(animationFactory: factory.make)
         update(view, isTaskActive: true)
 
         factory.fireLast()
 
-        XCTAssertEqual(view.ringAngleDegrees, 120)
+        XCTAssertNotEqual(view.catVerticalOffset, 0)
 
         update(view, isTaskActive: false)
         factory.fireLast()
 
-        XCTAssertEqual(view.ringAngleDegrees, 120)
+        XCTAssertEqual(view.catVerticalOffset, 0)
     }
 
     func testDeinitCancelsActiveAnimation() {

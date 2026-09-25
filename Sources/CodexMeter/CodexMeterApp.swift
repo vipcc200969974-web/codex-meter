@@ -328,54 +328,70 @@ private final class TimerStatusItemAnimationTask: NSObject, StatusItemAnimationT
     }
 }
 
-enum StatusActivityGearPath {
-    static let toothCount = 6
-    static let lineWidth: CGFloat = 2.0
+enum StatusCatPath {
+    static let lineWidth: CGFloat = 1.55
 
-    static func make(in frame: NSRect, angleDegrees: CGFloat) -> NSBezierPath {
+    static func make(in frame: NSRect, verticalOffset: CGFloat = 0) -> NSBezierPath {
         let path = NSBezierPath()
         path.lineWidth = lineWidth
         path.lineJoinStyle = .round
         path.lineCapStyle = .round
 
-        let center = NSPoint(x: frame.midX, y: frame.midY)
-        let radius = min(frame.width, frame.height) / 2 - lineWidth / 2
-        let rootRadius = radius * 0.68
-        let sector = 360 / CGFloat(toothCount)
-        let points: [(CGFloat, CGFloat)] = [
-            (-0.50, rootRadius),
-            (-0.34, rootRadius),
-            (-0.28, radius),
-            (0.28, radius),
-            (0.34, rootRadius),
-            (0.50, rootRadius)
-        ]
+        let bounds = frame.offsetBy(dx: 0, dy: verticalOffset)
+        let left = bounds.minX + 1.8
+        let right = bounds.maxX - 1.8
+        let bottom = bounds.minY + 1.4
+        let cheek = bounds.minY + 5.0
+        let earBase = bounds.minY + 8.0
+        let earTip = bounds.maxY - 1.0
 
-        for tooth in 0..<toothCount {
-            for (offset, pointRadius) in points {
-                let angle = (angleDegrees + CGFloat(tooth) * sector + offset * sector) * .pi / 180
-                let point = NSPoint(
-                    x: center.x + cos(angle) * pointRadius,
-                    y: center.y + sin(angle) * pointRadius
-                )
-                if path.elementCount == 0 {
-                    path.move(to: point)
-                } else {
-                    path.line(to: point)
-                }
-            }
-        }
+        path.move(to: NSPoint(x: left, y: cheek))
+        path.curve(
+            to: NSPoint(x: left, y: earBase),
+            controlPoint1: NSPoint(x: left, y: cheek + 1.1),
+            controlPoint2: NSPoint(x: left, y: earBase - 0.5)
+        )
+        path.line(to: NSPoint(x: left, y: earTip))
+        path.line(to: NSPoint(x: bounds.midX - 1.8, y: earBase + 0.1))
+        path.curve(
+            to: NSPoint(x: bounds.midX + 1.8, y: earBase + 0.1),
+            controlPoint1: NSPoint(x: bounds.midX - 0.7, y: bounds.maxY - 2.5),
+            controlPoint2: NSPoint(x: bounds.midX + 0.7, y: bounds.maxY - 2.5)
+        )
+        path.line(to: NSPoint(x: right, y: earTip))
+        path.line(to: NSPoint(x: right, y: earBase))
+        path.curve(
+            to: NSPoint(x: right, y: cheek),
+            controlPoint1: NSPoint(x: right, y: earBase - 0.5),
+            controlPoint2: NSPoint(x: right, y: cheek + 1.1)
+        )
+        path.curve(
+            to: NSPoint(x: left, y: cheek),
+            controlPoint1: NSPoint(x: right, y: bottom - 0.1),
+            controlPoint2: NSPoint(x: left, y: bottom - 0.1)
+        )
         path.close()
 
-        let hubRadius = rootRadius * 0.42
-        path.appendOval(
-            in: NSRect(
-                x: center.x - hubRadius,
-                y: center.y - hubRadius,
-                width: hubRadius * 2,
-                height: hubRadius * 2
-            )
+        let eyeSize: CGFloat = 1.15
+        path.appendOval(in: NSRect(x: bounds.minX + 4.0, y: bounds.minY + 4.5, width: eyeSize, height: eyeSize))
+        path.appendOval(in: NSRect(x: bounds.maxX - 5.15, y: bounds.minY + 4.5, width: eyeSize, height: eyeSize))
+
+        let mouth = NSBezierPath()
+        mouth.lineWidth = lineWidth * 0.85
+        mouth.lineCapStyle = .round
+        mouth.move(to: NSPoint(x: bounds.midX, y: bounds.minY + 4.4))
+        mouth.curve(
+            to: NSPoint(x: bounds.midX - 1.2, y: bounds.minY + 3.3),
+            controlPoint1: NSPoint(x: bounds.midX - 0.2, y: bounds.minY + 3.8),
+            controlPoint2: NSPoint(x: bounds.midX - 0.8, y: bounds.minY + 3.1)
         )
+        mouth.move(to: NSPoint(x: bounds.midX, y: bounds.minY + 4.4))
+        mouth.curve(
+            to: NSPoint(x: bounds.midX + 1.2, y: bounds.minY + 3.3),
+            controlPoint1: NSPoint(x: bounds.midX + 0.2, y: bounds.minY + 3.8),
+            controlPoint2: NSPoint(x: bounds.midX + 0.8, y: bounds.minY + 3.1)
+        )
+        path.append(mouth)
         return path
     }
 }
@@ -393,7 +409,8 @@ final class CompactStatusItemView: NSView {
     private var isTaskActive = false
     private var isRefreshing = false
     private var animationTask: (any StatusItemAnimationTask)?
-    private(set) var ringAngleDegrees: CGFloat = 90
+    private(set) var catVerticalOffset: CGFloat = 0
+    private var catPhase: CGFloat = 0
 
     init(animationFactory: @escaping StatusItemAnimationFactory = makeStatusItemAnimation) {
         self.animationFactory = animationFactory
@@ -493,12 +510,12 @@ final class CompactStatusItemView: NSView {
         }
         drawDivider(in: layout.activityDividerFrame)
 
-        let gearPath = StatusActivityGearPath.make(
+        let catPath = StatusCatPath.make(
             in: layout.ringFrame,
-            angleDegrees: ringAngleDegrees
+            verticalOffset: catVerticalOffset
         )
         color.setStroke()
-        gearPath.stroke()
+        catPath.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -510,18 +527,20 @@ final class CompactStatusItemView: NSView {
     }
 
     private func updateAnimation() {
-        if isTaskActive || isRefreshing {
+        if isTaskActive {
             guard animationTask == nil else { return }
             animationTask = animationFactory(1.0 / 12.0) { [weak self] in
-                guard let self, self.isTaskActive || self.isRefreshing else { return }
-                self.ringAngleDegrees = (self.ringAngleDegrees + 30)
-                    .truncatingRemainder(dividingBy: 360)
+                guard let self, self.isTaskActive else { return }
+                self.catPhase += .pi / 8
+                self.catVerticalOffset = sin(self.catPhase) * 1.6
                 self.needsDisplay = true
                 self.display()
             }
         } else {
             animationTask?.cancel()
             animationTask = nil
+            catPhase = 0
+            catVerticalOffset = 0
         }
     }
 
@@ -927,33 +946,36 @@ private extension View {
 
 struct RefreshIconButton: View {
     let action: () -> Void
-    @State private var isPressed = false
-    @State private var isHovered = false
+    @StateObject private var interaction = PanelInteractionState()
 
     var body: some View {
         Button {
             action()
         } label: {
-            PanelIconFrame(systemImage: "arrow.clockwise", isPressed: isPressed, isHovered: isHovered)
+            PanelIconFrame(
+                systemImage: "arrow.clockwise",
+                isPressed: interaction.isPressed,
+                isHovered: interaction.isHovered
+            )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.08)) {
-                isHovered = hovering
+                interaction.isHovered = hovering
             }
         }
         .simultaneousGesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { _ in
-                    if isPressed == false {
+                    if interaction.isPressed == false {
                         withAnimation(.easeOut(duration: 0.035)) {
-                            isPressed = true
+                            interaction.isPressed = true
                         }
                     }
                 }
                 .onEnded { _ in
                     withAnimation(.spring(response: 0.12, dampingFraction: 0.72)) {
-                        isPressed = false
+                        interaction.isPressed = false
                     }
                 }
         )
@@ -964,23 +986,23 @@ struct RefreshIconButton: View {
 struct CodexCleanupButton: View {
     let isTaskActive: Bool
     @ObservedObject private var cleanup = CodexCleanupController.shared
-    @State private var isShowingOptions = false
+    @StateObject private var interaction = PanelInteractionState()
 
     var body: some View {
-        Button { isShowingOptions.toggle() } label: {
+        Button { interaction.isShowingOptions.toggle() } label: {
             PanelIconFrame(systemImage: cleanup.isRunning ? "hourglass" : "sparkles")
         }
         .buttonStyle(.plain)
         .help("清理 Codex 缓存与内存")
         .accessibilityLabel("清理 Codex 缓存与内存")
-        .popover(isPresented: $isShowingOptions, arrowEdge: .top) {
+        .popover(isPresented: $interaction.isShowingOptions, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("清理 Codex").font(.headline)
                 Button {
                     let url = URL(string: "codex://settings/browser-use")!
                     if NSWorkspace.shared.open(url) {
                         cleanup.message = "已打开官方浏览器设置。请选择清除缓存的图片和文件，无需重启。"
-                        isShowingOptions = false
+                        interaction.isShowingOptions = false
                     } else {
                         cleanup.message = "无法打开清理页，请在 Codex 设置 → 浏览器中清除缓存的图片和文件。"
                     }
@@ -1110,40 +1132,50 @@ struct PanelIconFrame: View {
     }
 }
 
+@MainActor
+final class PanelInteractionState: ObservableObject {
+    @Published var isPressed = false
+    @Published var isHovered = false
+    @Published var isShowingOptions = false
+    @Published var isShowingActions = false
+}
+
 struct MoreActionsMenu: View {
     @ObservedObject var store: UsageStore
-    @State private var isShowingActions = false
-    @State private var isPressed = false
-    @State private var isHovered = false
+    @StateObject private var interaction = PanelInteractionState()
     
     var body: some View {
         Button {
-            isShowingActions.toggle()
+            interaction.isShowingActions.toggle()
         } label: {
-            PanelIconFrame(systemImage: "ellipsis", isPressed: isPressed || isShowingActions, isHovered: isHovered || isShowingActions)
+            PanelIconFrame(
+                systemImage: "ellipsis",
+                isPressed: interaction.isPressed || interaction.isShowingActions,
+                isHovered: interaction.isHovered || interaction.isShowingActions
+            )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.08)) {
-                isHovered = hovering
+                interaction.isHovered = hovering
             }
         }
         .simultaneousGesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { _ in
-                    if isPressed == false {
+                    if interaction.isPressed == false {
                         withAnimation(.easeOut(duration: 0.035)) {
-                            isPressed = true
+                            interaction.isPressed = true
                         }
                     }
                 }
                 .onEnded { _ in
                     withAnimation(.spring(response: 0.12, dampingFraction: 0.72)) {
-                        isPressed = false
+                        interaction.isPressed = false
                     }
                 }
         )
-        .popover(isPresented: $isShowingActions, arrowEdge: .top) {
+        .popover(isPresented: $interaction.isShowingActions, arrowEdge: .top) {
             ActionsPopover(store: store)
                 .frame(width: 224)
         }
@@ -1523,7 +1555,7 @@ final class UsageStore: ObservableObject {
         debounceInterval: TimeInterval = 0.8,
         fallbackInterval: TimeInterval = 60,
         activityPollInterval: TimeInterval = 5,
-        scheduler: any UsageScheduling = FoundationUsageScheduler(),
+        scheduler: (any UsageScheduling)? = nil,
         calendar: Calendar = .autoupdatingCurrent,
         now: @escaping @Sendable () -> Date = Date.init,
         watcherFactory: @escaping UsageWatcherFactory = {
@@ -1537,7 +1569,7 @@ final class UsageStore: ObservableObject {
         self.debounceInterval = debounceInterval
         self.fallbackInterval = fallbackInterval
         self.activityPollInterval = max(1, activityPollInterval)
-        self.scheduler = scheduler
+        self.scheduler = scheduler ?? FoundationUsageScheduler()
         self.calendar = calendar
         self.now = now
         self.watcherFactory = watcherFactory
@@ -1695,66 +1727,82 @@ final class UsageStore: ObservableObject {
         let loader = loader
         let generation = lifecycleGeneration
         let activityCompletionAtLoad = activityCompletionGeneration
+        let applyResult: @MainActor @Sendable (UsageLoadResult) -> Void = { [weak self] result in
+            self?.applyRefreshResult(
+                result,
+                loadDate: loadDate,
+                loadDay: loadDay,
+                generation: generation,
+                activityCompletionAtLoad: activityCompletionAtLoad
+            )
+        }
 
-        refreshQueue.async { [weak self] in
+        refreshQueue.async {
             let result = loader.load(now: loadDate)
+            DispatchQueue.main.async { applyResult(result) }
+        }
+    }
 
-            DispatchQueue.main.async {
-                guard let self, self.lifecycleGeneration == generation else { return }
-                let currentDay = self.resetDailyTokensIfDayChanged(at: self.now())
-                let accountBeforeResult = self.accountID
-                let old = self.snapshot
-                let acceptedQuota = result.quota.flatMap { candidate in
-                    let accountMatches = result.accountID == nil
-                        || self.accountID == nil
-                        || result.accountID == self.accountID
-                    let isAfterAccountActivation = self.accountActivationDate.map {
-                        candidate.lastUpdated >= $0
-                    } ?? true
-                    accountMatches
-                        && isAfterAccountActivation
-                        && (old.quota.isUnavailable || candidate.lastUpdated >= old.quota.lastUpdated)
-                        ? candidate
-                        : nil
-                }
-                let quota = acceptedQuota ?? old.quota
-                let isCurrentDayLoad = loadDay == currentDay
-                let accountMatches = result.accountID == nil
-                    || self.accountID == nil
-                    || result.accountID == self.accountID
-                let accountChangedDuringLoad = result.accountID != nil
-                    && accountBeforeResult != result.accountID
-                let tokens = accountMatches && !accountChangedDuringLoad && isCurrentDayLoad
-                    ? (result.dailyTokens ?? old.dailyTokens)
-                    : old.dailyTokens
-                let hasFreshQuota = acceptedQuota != nil
-                let hasFreshTokens = accountMatches
-                    && !accountChangedDuringLoad
-                    && isCurrentDayLoad
-                    && result.dailyTokens != nil
-                if self.activityLoader == nil
-                    || self.activityCompletionGeneration == activityCompletionAtLoad {
-                    self.applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
-                }
-                self.snapshot = UsageSnapshot(
-                    quota: quota,
-                    dailyTokens: tokens,
-                    dailyTokenDay: currentDay,
-                    freshness: hasFreshQuota && hasFreshTokens ? .live : (quota.isUnavailable ? .unavailable : .stale)
-                )
-                if let acceptedQuota {
-                    self.cacheQuota(acceptedQuota)
-                }
-                if !isCurrentDayLoad {
-                    self.refreshPending = true
-                }
-                self.isRefreshing = false
-                self.finishRefreshSideEffects()
-                if self.refreshPending {
-                    self.refreshPending = false
-                    self.refresh()
-                }
-            }
+    private func applyRefreshResult(
+        _ result: UsageLoadResult,
+        loadDate: Date,
+        loadDay: Date,
+        generation: UInt,
+        activityCompletionAtLoad: UInt
+    ) {
+        guard lifecycleGeneration == generation else { return }
+        let currentDay = resetDailyTokensIfDayChanged(at: now())
+        let accountBeforeResult = accountID
+        let old = snapshot
+        let acceptedQuota = result.quota.flatMap { candidate in
+            let accountMatches = result.accountID == nil
+                || accountID == nil
+                || result.accountID == accountID
+            let isAfterAccountActivation = accountActivationDate.map {
+                candidate.lastUpdated >= $0
+            } ?? true
+            return accountMatches
+                && isAfterAccountActivation
+                && (old.quota.isUnavailable || candidate.lastUpdated >= old.quota.lastUpdated)
+                ? candidate
+                : nil
+        }
+        let quota = acceptedQuota ?? old.quota
+        let isCurrentDayLoad = loadDay == currentDay
+        let accountMatches = result.accountID == nil
+            || accountID == nil
+            || result.accountID == accountID
+        let accountChangedDuringLoad = result.accountID != nil
+            && accountBeforeResult != result.accountID
+        let tokens = accountMatches && !accountChangedDuringLoad && isCurrentDayLoad
+            ? (result.dailyTokens ?? old.dailyTokens)
+            : old.dailyTokens
+        let hasFreshQuota = acceptedQuota != nil
+        let hasFreshTokens = accountMatches
+            && !accountChangedDuringLoad
+            && isCurrentDayLoad
+            && result.dailyTokens != nil
+        if activityLoader == nil
+            || activityCompletionGeneration == activityCompletionAtLoad {
+            applyTaskActivity(result.isTaskActive, loadedAt: loadDate)
+        }
+        snapshot = UsageSnapshot(
+            quota: quota,
+            dailyTokens: tokens,
+            dailyTokenDay: currentDay,
+            freshness: hasFreshQuota && hasFreshTokens ? .live : (quota.isUnavailable ? .unavailable : .stale)
+        )
+        if let acceptedQuota {
+            cacheQuota(acceptedQuota)
+        }
+        if !isCurrentDayLoad {
+            refreshPending = true
+        }
+        isRefreshing = false
+        finishRefreshSideEffects()
+        if refreshPending {
+            refreshPending = false
+            refresh()
         }
     }
 
@@ -1779,20 +1827,20 @@ final class UsageStore: ObservableObject {
         }
         isActivityRefreshing = true
         let generation = lifecycleGeneration
-
-        activityRefreshQueue.async { [weak self] in
-            let isTaskActive = activityLoader.loadActivity(now: loadDate)
-
-            DispatchQueue.main.async {
-                guard let self, self.lifecycleGeneration == generation else { return }
-                self.applyTaskActivity(isTaskActive, loadedAt: loadDate)
-                self.activityCompletionGeneration &+= 1
-                self.isActivityRefreshing = false
-                if self.activityRefreshPending {
-                    self.activityRefreshPending = false
-                    self.refreshActivity()
-                }
+        let applyActivity: @MainActor @Sendable (Bool?) -> Void = { [weak self] isTaskActive in
+            guard let self, self.lifecycleGeneration == generation else { return }
+            self.applyTaskActivity(isTaskActive, loadedAt: loadDate)
+            self.activityCompletionGeneration &+= 1
+            self.isActivityRefreshing = false
+            if self.activityRefreshPending {
+                self.activityRefreshPending = false
+                self.refreshActivity()
             }
+        }
+
+        activityRefreshQueue.async {
+            let isTaskActive = activityLoader.loadActivity(now: loadDate)
+            DispatchQueue.main.async { applyActivity(isTaskActive) }
         }
     }
 
