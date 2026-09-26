@@ -1,4 +1,3 @@
-import CoreServices
 import Foundation
 
 struct CodexActivityPaths: Sendable {
@@ -20,22 +19,19 @@ protocol CodexActivityWatching: AnyObject {
 }
 
 final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
+    private struct FileStamp: Equatable {
+        let path: String
+        let size: Int64
+        let modifiedAt: TimeInterval
+    }
+
     private let paths: CodexActivityPaths
     private let queue = DispatchQueue(label: "com.codexmeter.activity-watcher", qos: .utility)
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let onChange: () -> Void
-    private var stream: FSEventStreamRef?
+    private var pollTimer: DispatchSourceTimer?
+    private var lastSignature: [FileStamp] = []
     private var isRunning = false
-
-    private static let streamCallback: FSEventStreamCallback = {
-        _, info, eventCount, eventPaths, _, _ in
-        guard let info else { return }
-        let watcher = Unmanaged<CodexActivityWatcher>
-            .fromOpaque(info)
-            .takeUnretainedValue()
-        let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
-        watcher.handleEventPaths(Array(paths.prefix(eventCount)))
-    }
 
     /// Creates a watcher whose `onChange` callback runs synchronously on the
     /// watcher's private serial queue. Lifecycle methods are callback-safe.
@@ -81,60 +77,61 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
         tearDown()
         guard directoryExists(at: paths.codexRoot) else { return }
 
-        var context = FSEventStreamContext(
-            version: 0,
-            info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil,
-            release: nil,
-            copyDescription: nil
+        lastSignature = currentSignature()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(
+            deadline: .now() + .milliseconds(250),
+            repeating: .milliseconds(250),
+            leeway: .milliseconds(100)
         )
-        let flags = FSEventStreamCreateFlags(
-            kFSEventStreamCreateFlagFileEvents
-                | kFSEventStreamCreateFlagNoDefer
-                | kFSEventStreamCreateFlagUseCFTypes
-        )
-        guard let stream = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            Self.streamCallback,
-            &context,
-            [paths.codexRoot.standardizedFileURL.path] as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.2,
-            flags
-        ) else {
-            return
+        timer.setEventHandler { [weak self] in
+            self?.pollForChanges()
         }
-
-        FSEventStreamSetDispatchQueue(stream, queue)
-        guard FSEventStreamStart(stream) else {
-            FSEventStreamSetDispatchQueue(stream, nil)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            return
-        }
-        self.stream = stream
+        timer.resume()
+        pollTimer = timer
     }
 
-    private func handleEventPaths(_ eventPaths: [String]) {
-        guard eventPaths.contains(where: shouldRefresh(for:)) else { return }
+    private func pollForChanges() {
+        let signature = currentSignature()
+        guard signature != lastSignature else { return }
+        lastSignature = signature
         onChange()
     }
 
-    private func shouldRefresh(for eventPath: String) -> Bool {
-        let eventPath = URL(fileURLWithPath: eventPath).standardizedFileURL.path
-        let sessionsPrefix = paths.sessionsRoot.standardizedFileURL.path + "/"
-        let archivedPrefix = paths.archivedSessionsRoot.standardizedFileURL.path + "/"
-        if eventPath.hasSuffix(".jsonl"),
-           eventPath.hasPrefix(sessionsPrefix) || eventPath.hasPrefix(archivedPrefix) {
-            return true
+    private func currentSignature() -> [FileStamp] {
+        var stamps: [FileStamp] = []
+        let roots = [paths.sessionsRoot, paths.archivedSessionsRoot]
+        for root in roots where directoryExists(at: root) {
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+            ) else { continue }
+            for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+                appendStamp(for: url, to: &stamps)
+            }
         }
 
-        let databasePath = paths.codexRoot
-            .appendingPathComponent("logs_2.sqlite")
-            .standardizedFileURL.path
-        return eventPath == databasePath
-            || eventPath == databasePath + "-wal"
-            || eventPath == databasePath + "-shm"
+        let database = paths.codexRoot.appendingPathComponent("logs_2.sqlite")
+        for suffix in ["", "-wal", "-shm"] {
+            let url = suffix.isEmpty
+                ? database
+                : URL(fileURLWithPath: database.path + suffix)
+            appendStamp(for: url, to: &stamps)
+        }
+        return stamps.sorted { $0.path < $1.path }
+    }
+
+    private func appendStamp(for url: URL, to stamps: inout [FileStamp]) {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        ), values.isRegularFile == true else { return }
+        stamps.append(
+            FileStamp(
+                path: url.standardizedFileURL.path,
+                size: Int64(values.fileSize ?? 0),
+                modifiedAt: values.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0
+            )
+        )
     }
 
     private func directoryExists(at url: URL) -> Bool {
@@ -151,11 +148,9 @@ final class CodexActivityWatcher: CodexActivityWatching, @unchecked Sendable {
     }
 
     private func tearDown() {
-        guard let stream else { return }
-        FSEventStreamStop(stream)
-        FSEventStreamSetDispatchQueue(stream, nil)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        self.stream = nil
+        pollTimer?.setEventHandler {}
+        pollTimer?.cancel()
+        pollTimer = nil
+        lastSignature = []
     }
 }

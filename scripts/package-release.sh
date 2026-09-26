@@ -28,12 +28,18 @@ STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-meter-dmg.XXXXXX")"
 trap 'rm -rf "$STAGING_DIR"' EXIT
 ditto "$APP_DIR" "$STAGING_DIR/Codex Meter.app"
 ln -s /Applications "$STAGING_DIR/Applications"
-hdiutil create \
+if ! hdiutil create \
   -volname "Codex Meter" \
   -srcfolder "$STAGING_DIR" \
   -ov \
   -format UDZO \
-  "$DMG_PATH" >/dev/null
+  "$DMG_PATH" >/dev/null 2>&1; then
+  hdiutil makehybrid \
+    -o "$DMG_PATH" \
+    -hfs \
+    -default-volume-name "Codex Meter" \
+    "$STAGING_DIR" >/dev/null
+fi
 
 echo "version=$VERSION"
 echo "build=$BUILD_NUMBER"
